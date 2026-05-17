@@ -191,12 +191,17 @@ function (k::CPUKernel)(args...; blocks)
                 error("CPUKernel: too many runtime args")
             k.param_kinds[param_idx] === :memref ||
                 error("CPUKernel: param #$param_idx expected scalar, got array")
-            if !is_spmd
+            # Alignment check: cuTile-mode always checks (per-arg from
+            # ArraySpec); SPMD-mode checks only when the user requested an
+            # alignment > Julia's default 16 (param_alignments populated).
+            if !is_spmd || align_idx ≤ length(k.param_alignments)
                 align = k.param_alignments[align_idx]
                 pointer_aligned(a, align) || error(
                     "CPUKernel: array arg #$(align_idx) (pointer $(repr(pointer(a)))) is not " *
-                    "aligned to $(align) bytes required by ArraySpec. " *
-                    "Allocate with `cuTileCPU.aligned_array(...; alignment=$(align))`.")
+                    "aligned to $(align) bytes" *
+                    (is_spmd ? " required by spmd_function(...; alignment=$(align))" :
+                               " required by ArraySpec") *
+                    ". Allocate with `cuTileCPU.aligned_array(...; alignment=$(align))`.")
             end
             push!(descs, pack_memref_descriptor(a))
             push!(pin_targets, a)
@@ -427,26 +432,41 @@ end
 # at launch time (a placeholder; pass any Int).
 #
 # MVP limitations:
-#   • Array args are passed as plain `Vector{T}` (no alignment requirement).
 #   • The grid size must be a multiple of `lane_width` (no boundary mask).
 #   • Only the contiguous `a[i]` pattern is lowered to `vector.transfer_*`;
 #     anything more elaborate falls through to `vector.gather`/scatter.
-const _spmd_kernel_cache = Dict{Tuple{Any, Type, Int, Bool, Int}, CPUKernel}()
+#
+# Alignment hints: SPMD accepts an optional `alignment` kwarg. When >16,
+# each array arg gets a `memref.assume_alignment %arg, N` at func entry and
+# a `strided<[1, ?, …]>` layout in the memref type — the same alignment-
+# proof machinery the cuTile path inherits from `ArraySpec`. At DRAM-scale
+# memory-bandwidth-bound workloads this is the difference between
+# `vmovaps` and `vmovups` in the inner loop. Users must pass buffers that
+# actually meet the alignment (e.g. via `aligned_array(T, n; alignment=N)`);
+# the launcher checks at launch time.
+const _spmd_kernel_cache = Dict{Tuple{Any, Type, Int, Bool, Int, Int}, CPUKernel}()
 
 """
-    spmd_function(f, argtypes::Type; lane_width=16, serial=false) -> CPUKernel
+    spmd_function(f, argtypes::Type; lane_width=16, alignment=16, serial=false) -> CPUKernel
 
 Compile `f` in SPMD ("ISPC-style") mode: the trailing scalar arg is treated
 as a *lane index* and the body is lifted to a `lane_width`-wide vector. See
 the module-level docstring for details.
 
-Compilation is cached on `(f, argtypes, lane_width, serial)`.
+`alignment` (bytes) is an optional hint emitted as `memref.assume_alignment`
+on each array arg. The default of 16 matches what Julia's GC guarantees for
+`Vector{T}`; pass 64/128 to get aligned vector loads at DRAM scale, but the
+caller must then supply buffers that actually meet the alignment (use
+[`aligned_array`](@ref)).
+
+Compilation is cached on `(f, argtypes, lane_width, alignment, serial)`.
 """
 function spmd_function(@nospecialize(f), argtypes::Type;
                        lane_width::Int=16,
+                       alignment::Int=16,
                        kernel_name=string(nameof(f), "_spmd"),
                        serial::Bool=false)
-    key = (f, argtypes, 1, serial, lane_width)
+    key = (f, argtypes, 1, serial, lane_width, alignment)
     haskey(_spmd_kernel_cache, key) && return _spmd_kernel_cache[key]::CPUKernel
 
     sci, rettype, _, _ = _structured_with_analyses(f, argtypes)
@@ -454,7 +474,7 @@ function spmd_function(@nospecialize(f), argtypes::Type;
         error("spmd_function: kernel must return Nothing, got $rettype")
 
     mod, param_julia_types, mlir_ctx, param_kinds =
-        lower_to_mlir_spmd(sci, argtypes; kernel_name, lane_width)
+        lower_to_mlir_spmd(sci, argtypes; kernel_name, lane_width, alignment)
 
     mlir_text = String("")
     @with_context mlir_ctx begin
@@ -466,9 +486,15 @@ function spmd_function(@nospecialize(f), argtypes::Type;
     h = Libdl.dlopen(so_path)
     fn = Libdl.dlsym(h, Symbol("_mlir_ciface_" * kernel_name))
 
+    # Per-arg alignment for runtime check at launch. SPMD has the same
+    # alignment for every memref arg (`alignment` kwarg) when > 16; below
+    # that we skip the check (Julia's GC guarantees 16 already).
+    nmemref = count(==(:memref), param_kinds)
+    alignments = alignment > 16 ? fill(alignment, nmemref) : Int[]
+
     k = CPUKernel{typeof(f), argtypes}(f, so_path, h, fn,
                                        param_julia_types, param_kinds,
-                                       1, Int[], :spmd)
+                                       1, alignments, :spmd)
     _spmd_kernel_cache[key] = k
     return k
 end

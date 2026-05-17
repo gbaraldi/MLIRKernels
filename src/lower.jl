@@ -573,7 +573,8 @@ end
 # `n`, so any masking has to come from a separate kernel signature with a
 # length scalar.
 function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
-                            kernel_name::String, lane_width::Int=16)
+                            kernel_name::String, lane_width::Int=16,
+                            alignment::Int=16)
     ctx = Reactant.ReactantContext()
     mod_ref = Ref{IR.Module}()
     param_julia_types = Type[]
@@ -620,11 +621,24 @@ function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
                 if AT_wide <: AbstractArray
                     eT = eltype(AT_wide)
                     N  = ndims(AT_wide)
-                    # SPMD memref: plain dynamic shape, no strided layout,
-                    # no alignment requirement.
                     elem = mlir_elem_type(eT)
                     shape = fill(Int(IR.dynsize()), N)
-                    mr = IR.MemRefType(elem, shape, IR.Attribute(), IR.Attribute())
+                    # Layout: with alignment > 16 we also encode a
+                    # `strided<[1, ?, …]>` layout (unit stride on the
+                    # fastest dim). This + `memref.assume_alignment` is
+                    # what the cuTile path emits to get aligned vector
+                    # loads at DRAM scale.
+                    layout = if alignment > 16
+                        strides_mlir = Vector{String}(undef, N)
+                        for k in 1:N
+                            mlir_dim = N - k + 1
+                            strides_mlir[mlir_dim] = (k == 1) ? "1" : "?"
+                        end
+                        parse(IR.Attribute, "strided<[" * join(strides_mlir, ", ") * "]>")
+                    else
+                        IR.Attribute()
+                    end
+                    mr = IR.MemRefType(elem, shape, layout, IR.Attribute())
                     push!(param_mlir_types, mr)
                     push!(param_arg_slots, i)
                     push!(param_julia_types, AT_wide)
@@ -666,14 +680,33 @@ function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
             IR.setattr!(funcop, "llvm.emit_c_interface", IR.UnitAttribute())
             push!(IR.body(mod), funcop)
 
+            # Raw entry-block arg Values, pre-assume.
+            raw_arg_vals = Dict{Int, IR.Value}()
             for (k, slot) in enumerate(param_arg_slots)
-                lc.arg_vals[slot] = IR.argument(entry, k)
+                raw_arg_vals[slot] = IR.argument(entry, k)
+                lc.arg_vals[slot] = raw_arg_vals[slot]
             end
             grid_val = IR.argument(entry, grid_param_offset + 1)
 
             @with_block entry begin
                 c0 = IR.result(_arith.constant(; value=IR.Attribute(Int(0), idx_t)))
                 c1 = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
+
+                # Alignment hints: when alignment > 16, wrap each memref arg
+                # in a `memref.assume_alignment` and use the wrapped Value
+                # downstream. Lowers to `llvm.assume` on the base pointer
+                # so LLVM emits aligned vector load/stores. Skipped at
+                # alignment=16 (Julia GC's default) to keep the IR clean.
+                if alignment > 16
+                    align_attr = IR.Attribute(alignment, IR.Type(Int32))
+                    for (k, slot) in enumerate(param_arg_slots)
+                        param_kinds[k] === :memref || continue
+                        aligned = IR.result(_memref.assume_alignment(
+                            raw_arg_vals[slot]; alignment=align_attr,
+                        ))
+                        lc.arg_vals[slot] = aligned
+                    end
+                end
 
                 par_region = IR.Region()
                 par_block = IR.Block([idx_t], [IR.Location()])

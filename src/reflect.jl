@@ -15,11 +15,11 @@ tuple of runtime values (in which case `cuTileconvert` is applied).
 """
 function code_mlir(@nospecialize(f), argtypes::Type;
                    kernel_name::String=string(nameof(f)), n_grid_dims::Int=1,
-                   spmd::Bool=false, lane_width::Int=16)
+                   spmd::Bool=false, lane_width::Int=16, alignment::Int=16)
     sci, rettype, divby_info, bounds_info = _structured_with_analyses(f, argtypes)
     if spmd
         mod, _, mlir_ctx, _ = lower_to_mlir_spmd(sci, argtypes;
-                                                  kernel_name, lane_width)
+                                                  kernel_name, lane_width, alignment)
     else
         mod, _, mlir_ctx, _ = lower_to_mlir(sci, argtypes; kernel_name, n_grid_dims,
                                             divby_info, bounds_info)
@@ -52,12 +52,19 @@ MLIR, ready for `mlir-translate --mlir-to-llvmir`.
 """
 function code_mlir_lowered(@nospecialize(f), argtypes::Type;
                            kernel_name::String=string(nameof(f)),
-                           n_grid_dims::Int=1, passes=DEFAULT_PASSES)
-    mlir = code_mlir(f, argtypes; kernel_name, n_grid_dims)
+                           n_grid_dims::Int=1, passes=DEFAULT_PASSES,
+                           spmd::Bool=false, lane_width::Int=16,
+                           alignment::Int=16)
+    mlir = code_mlir(f, argtypes; kernel_name, n_grid_dims,
+                     spmd, lane_width, alignment)
     return lower_mlir_text(mlir; passes)
 end
 
-function code_mlir_lowered(@nospecialize(f), args::Tuple; kwargs...)
+function code_mlir_lowered(@nospecialize(f), args::Tuple; spmd::Bool=false, kwargs...)
+    if spmd
+        tt = all(a -> a isa Type, args) ? Tuple{args...} : Tuple{map(Core.Typeof, args)...}
+        return code_mlir_lowered(f, tt; spmd=true, kwargs...)
+    end
     converted = map(_cpu_convert, args)
     tt = Tuple{map(Core.Typeof, converted)...}
     return code_mlir_lowered(f, tt; kwargs...)
@@ -69,15 +76,24 @@ end
 The LLVM IR (textual `.ll`) emitted for `f`. Produced by running the lowering
 pipeline through `mlir-translate --mlir-to-llvmir`. Equivalent to
 `Base.code_llvm` in spirit, but for the cuTile-CPU pipeline.
+
+Accepts the same SPMD-mode kwargs (`spmd`, `lane_width`, `alignment`) as
+`code_mlir`.
 """
 function code_llvm(@nospecialize(f), argtypes::Type;
                    kernel_name::String=string(nameof(f)),
-                   n_grid_dims::Int=1, passes=DEFAULT_PASSES)
-    lowered = code_mlir_lowered(f, argtypes; kernel_name, n_grid_dims, passes)
+                   n_grid_dims::Int=1, passes=DEFAULT_PASSES,
+                   spmd::Bool=false, lane_width::Int=16, alignment::Int=16)
+    lowered = code_mlir_lowered(f, argtypes; kernel_name, n_grid_dims, passes,
+                                spmd, lane_width, alignment)
     return translate_to_llvmir(lowered)
 end
 
-function code_llvm(@nospecialize(f), args::Tuple; kwargs...)
+function code_llvm(@nospecialize(f), args::Tuple; spmd::Bool=false, kwargs...)
+    if spmd
+        tt = all(a -> a isa Type, args) ? Tuple{args...} : Tuple{map(Core.Typeof, args)...}
+        return code_llvm(f, tt; spmd=true, kwargs...)
+    end
     converted = map(_cpu_convert, args)
     tt = Tuple{map(Core.Typeof, converted)...}
     return code_llvm(f, tt; kwargs...)

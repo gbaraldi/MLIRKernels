@@ -2086,4 +2086,41 @@ end
         @test !occursin("strided<", mlir)
     end
 
+    @testset "SPMD: vadd with alignment=128" begin
+        # Same kernel as the basic SPMD vadd test, but with the explicit
+        # `alignment=128` kwarg. The walker emits memref.assume_alignment
+        # and a strided<[1]> layout — matching what the cuTile (TileArray)
+        # path gets from ArraySpec. Closes the DRAM-scale perf gap between
+        # SPMD and tile (see bench/bench_spmd.jl). Caller is responsible
+        # for supplying aligned buffers (aligned_array).
+        n = 1024
+        lane_width = 16
+        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        c = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        copyto!(a, rand(Float32, n))
+        copyto!(b, rand(Float32, n))
+
+        k = cuTileCPU.spmd_function(vadd_spmd,
+            (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
+            lane_width, alignment=128)
+        k(a, b, c, 0; blocks = cld(n, lane_width))
+        @test c ≈ a .+ b
+
+        # MLIR should now contain the alignment hint AND a strided<[1]>
+        # layout on the memref args.
+        mlir = cuTileCPU.code_mlir(vadd_spmd,
+            (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
+            spmd=true, lane_width, alignment=128)
+        @test occursin("memref.assume_alignment", mlir)
+        @test occursin("strided<[1]>", mlir)
+
+        # And the launcher must reject a misaligned buffer.
+        bad = Vector{Float32}(undef, n)   # 16-byte aligned, not 128
+        if UInt(pointer(bad)) % 128 != 0
+            @test_throws ErrorException k(bad, b, c, 0;
+                                          blocks = cld(n, lane_width))
+        end
+    end
+
 end
