@@ -4,6 +4,9 @@
 test/Manifest.toml
 bench/Manifest.toml
 
+# LLVM IR dumps (regeneratable via bench/dump_llvm.jl)
+bench/llvm_dump/
+
 # Julia coverage/profiling
 *.cov
 *.mem

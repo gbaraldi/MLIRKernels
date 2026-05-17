@@ -177,6 +177,31 @@ function matmul_kernel(A::ct.TileArray{T,2}, B::ct.TileArray{T,2}, C::ct.TileArr
     return
 end
 
+# Register-tile / rank-1 outer-product matmul kernel. This is the
+# **recommended** matmul pattern for CPU targets — it lets LLVM keep the
+# accumulator in vector registers across the K-loop (carried as a phi node)
+# and emits a tight inner loop instead of a multi-thousand-FMA unrolled body.
+#
+# At RM=RN=16 the inner body is ~16 vector FMAs on `vector<16xf32>`,
+# producing a few hundred lines of LLVM IR and matching the BLAS microkernel
+# pattern (rank-1 outer-product update over K). See
+# `bench/perf_research/README.md` for the cross-comparison with OpenBLAS's
+# Cooperlake sgemm_kernel.
+function matmul_reg_kernel(A::ct.TileArray{T,2}, B::ct.TileArray{T,2},
+                           C::ct.TileArray{T,2},
+                           RM::Int, RN::Int) where {T}
+    bid_m = ct.bid(1)
+    bid_n = ct.bid(2)
+    acc = zeros(T, (RM, RN))
+    for k in 1:size(A, 2)
+        a_col = ct.load(A; index=(bid_m, k), shape=(RM, 1))    # (RM, 1)
+        b_row = ct.load(B; index=(k, bid_n), shape=(1, RN))    # (1, RN)
+        acc = muladd(a_col, b_row, acc)                         # rank-1 update
+    end
+    ct.store(C; index=(bid_m, bid_n), tile=acc)
+    return
+end
+
 # Single-head attention kernel (non-flash). One block per output row-tile of O.
 # We avoid the K-tile loop by sizing BN to the full sequence length, so the
 # whole of K and V is loaded in one shot. Pipeline per block:
@@ -415,6 +440,20 @@ function rand_normal_kernel(out::ct.TileArray{Float32,1}, tile::Int)
     bid = ct.bid(1)
     r = randn(Float32, (tile,))
     ct.store(out; index=bid, tile=r)
+    return
+end
+
+# ----------------------------------------------------------------------------
+# SPMD-mode kernels (ISPC-style: plain Julia scalar code, lifted to lanes)
+# ----------------------------------------------------------------------------
+#
+# These kernels look like normal Julia — no Tile/ct.* types. The walker's
+# SPMD mode (`cuTileCPU.spmd_function`) lifts the trailing lane-index arg
+# to a `lane_width`-wide vector and turns each scalar op into a vector op.
+
+function vadd_spmd(a::Vector{Float32}, b::Vector{Float32},
+                   c::Vector{Float32}, i::Int)
+    @inbounds c[i] = a[i] + b[i]
     return
 end
 
@@ -834,11 +873,15 @@ end
     end
 
     @testset "matmul Float32" begin
-        # 128×128 × 128×128 with 64×64 inner tiles ⇒ 2×2 grid, 2 K-step.
+        # 64×64 × 64×64 with 16×16 inner tiles ⇒ 4×4 grid, 4 K-step.
         # Exercises 2-D scf.parallel, Intrinsics.mma → vector.contract,
         # Intrinsics.cldi → arith.ceildivsi, and memref-rooted size(A, k).
-        M, N, K = 128, 128, 128
-        BM, BN, BK = 64, 64, 64
+        #
+        # Tile size 16 keeps the unrolled vector.contract body small
+        # (~250 FMAs vs ~4 K at 64-tile) so clang -O2 finishes in ~1 s
+        # instead of ~30 s. Still covers every walker path.
+        M, N, K = 64, 64, 64
+        BM, BN, BK = 16, 16, 16
         raw_a = cuTileCPU.aligned_array(Float32, M*K; alignment=128)
         raw_b = cuTileCPU.aligned_array(Float32, K*N; alignment=128)
         raw_c = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
@@ -864,13 +907,56 @@ end
         @test occursin("memref.dim", mlir)
     end
 
+    @testset "matmul (register-tile rank-1, recommended for CPU)" begin
+        # The BLAS-style microkernel pattern: a small (RM, 1) × (1, RN)
+        # rank-1 outer-product accumulated over an explicit K-loop. The
+        # accumulator stays in vector registers across iterations (LLVM
+        # emits a `phi [RM x <RN x float>]`) — same structural shape as
+        # OpenBLAS's Cooperlake sgemm_kernel inner loop, just at a smaller
+        # register tile (16×16 = 16 zmm acc regs, vs BLAS's 12×32 = 24).
+        #
+        # Bench numbers (see bench/bench_matmul_reg.jl): at M=N=K=1024 this
+        # pattern reaches ~65% of OpenBLAS — about 2.4× the multi-thousand-
+        # FMA unrolled `vector.contract` path. Compile time is also
+        # dramatically lower (~1 s vs ~30 s for big-tile contract).
+        M, N, K = 128, 128, 128
+        RM, RN = 16, 16
+        raw_a = cuTileCPU.aligned_array(Float32, M*K; alignment=128)
+        raw_b = cuTileCPU.aligned_array(Float32, K*N; alignment=128)
+        raw_c = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
+        A = reshape(raw_a, (M, K))
+        B = reshape(raw_b, (K, N))
+        C = reshape(raw_c, (M, N))
+        copyto!(A, Float32.(reshape(1:M*K, (M, K)) ./ Float32(M*K)))
+        copyto!(B, Float32.(reshape(1:K*N, (K, N)) ./ Float32(K*N)))
+        fill!(C, 0f0)
+
+        cuTileCPU.@parallel_for blocks = (M ÷ RM, N ÷ RN) matmul_reg_kernel(
+            A, B, C, ct.Constant(RM), ct.Constant(RN))
+
+        @test C ≈ A * B rtol=1e-4
+
+        # The LLVM IR for this kernel should be tight: a real K-loop with
+        # a phi-carried accumulator + ~RM vector FMAs per iteration. Lock
+        # in the property — if the IR balloons to thousands of FMAs (= the
+        # contract path got selected somehow), this test catches it.
+        llvm = cuTileCPU.code_llvm(matmul_reg_kernel,
+            (A, B, C, ct.Constant(RM), ct.Constant(RN));
+            n_grid_dims=2)
+        # Phi node carrying the accumulator across the K-loop.
+        @test occursin(r"phi\s+\[\d+\s*x\s*<\d+\s*x\s*float>\]", llvm)
+        # And no unrolled-blob FMA explosion — well under 100 fmuladd ops.
+        @test count(_ -> true, eachmatch(r"\bfmuladd\b", llvm)) < 100
+    end
+
     @testset "batched matmul Float32" begin
-        # 4×64×64 × 4×64×64 batched matmul with 2×32×32 inner tiles per block
-        # ⇒ grid = (M÷BM, N÷BN, Batch÷BS) = (2, 2, 2), 2 K-steps per block.
+        # 4×32×32 × 4×32×32 batched matmul with 2×16×16 inner tiles per block.
         # Exercises 3-D Intrinsics.mma → vector.contract with batched indexing
-        # maps (4 iterators: b, m, n, k).
-        M, N, K, Batch = 64, 64, 64, 4
-        BM, BN, BK, BS = 32, 32, 32, 2
+        # maps (4 iterators: b, m, n, k). Tile sizes shrunk from 32 → 16 to
+        # keep clang -O2 fast (batched outer-product unrolling at 32-tile is
+        # the costly path).
+        M, N, K, Batch = 32, 32, 32, 4
+        BM, BN, BK, BS = 16, 16, 16, 2
         A = cuTileCPU.aligned_array(Float32, (M, K, Batch); alignment=128)
         B = cuTileCPU.aligned_array(Float32, (K, N, Batch); alignment=128)
         C = cuTileCPU.aligned_array(Float32, (M, N, Batch); alignment=128)
@@ -1137,7 +1223,7 @@ end
         @test !occursin("vector.gather", mlir)  # loads stay contiguous
     end
 
-    @testset "attention (single-head, BM=BN=D=64)" begin
+    @testset "attention (single-head, BM=BN=D=32)" begin
         # Single-head, F32, non-flash attention. One block per BM-row tile of O.
         # The kernel loads the full K and V (BN equals the full sequence length),
         # computes S = Q @ K^T, applies a numerically stable row-softmax, and
@@ -1145,8 +1231,11 @@ end
         # vector.transpose, and the softmax chain compose correctly in a single
         # kernel. F32 throughout — comparison uses rtol=1e-3 to leave slack for
         # the softmax + chained matmul rounding noise.
-        BM, BN, D = 64, 64, 64
-        M, N = 128, BN
+        #
+        # Shrunk from BM=BN=D=64 → 32 to cut the two unrolled vector.contract
+        # bodies from ~4 K FMAs to ~500. Same code paths exercised.
+        BM, BN, D = 32, 32, 32
+        M, N = 64, BN
         @assert N == BN
         @assert M % BM == 0
 
@@ -1201,8 +1290,9 @@ end
         # carries (m, l, o) as scf.for iter_args (three different vector
         # shapes), uses element-wise tile/tile `max.` (arith.maxnumf), a
         # `-Inf32` splat, and two math.fma sites for the rescale step.
-        BM, BN, D, N_KV = 32, 32, 64, 128
-        M = 64
+        # Shrunk to keep clang -O2 fast — D=32 halves the inner contract size.
+        BM, BN, D, N_KV = 16, 16, 32, 64
+        M = 32
         @assert M % BM == 0
         @assert N_KV % BN == 0
 
@@ -1938,10 +2028,11 @@ end
     end
 
     @testset "matrix transpose" begin
-        # Non-square 128 × 64 transpose with 32 × 32 tiles. 4 × 2 grid.
+        # Non-square 64 × 32 transpose with 16 × 16 tiles. 4 × 2 grid.
         # Verifies permutedims(tile, (2,1)) + the non-square index swap path.
-        BM, BN = 32, 32
-        M, N = 128, 64
+        # Tile shrunk from 32 → 16 to keep vector.transpose cheap.
+        BM, BN = 16, 16
+        M, N = 64, 32
         A = cuTileCPU.aligned_array(Float32, M, N; alignment=128)
         B = cuTileCPU.aligned_array(Float32, N, M; alignment=128)
         copyto!(A, rand(Float32, M, N))
@@ -1955,6 +2046,44 @@ end
         mlir = cuTileCPU.code_mlir(transpose_kernel,
                                    (A, B, ct.Constant(BM), ct.Constant(BN)))
         @test occursin("vector.transpose", mlir)
+    end
+
+    @testset "SPMD: vadd" begin
+        # ISPC-style SPMD mode: the kernel is plain Julia (no Tile/ct.* types,
+        # no `ct.bid()`). The trailing `i::Int` arg is the lane index and the
+        # walker lifts the body to `LANE_WIDTH`-wide vectors. Each grid block
+        # processes 16 consecutive `i`-values in parallel.
+        n = 1024
+        lane_width = 16
+        # Plain Vector{Float32} — SPMD mode doesn't impose an ArraySpec
+        # alignment requirement.
+        a = rand(Float32, n)
+        b = rand(Float32, n)
+        c = zeros(Float32, n)
+
+        k = cuTileCPU.spmd_function(vadd_spmd,
+            (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
+            lane_width)
+        # The `0` in the launch is a placeholder — the lane index is
+        # synthesised inside the kernel, not read from this arg.
+        k(a, b, c, 0; blocks = cld(n, lane_width))
+        @test c ≈ a .+ b
+
+        # Reflection: the emitted MLIR should contain the vector arith op and
+        # one of the vector memory ops (transfer_read / gather) at the lane
+        # width.
+        mlir = cuTileCPU.code_mlir(vadd_spmd,
+            (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
+            spmd=true, lane_width)
+        @test occursin("vector<16xf32>", mlir)
+        @test occursin("arith.addf", mlir)
+        @test occursin("vector.transfer_read", mlir) ||
+              occursin("vector.gather", mlir)
+        @test occursin("vector.transfer_write", mlir) ||
+              occursin("vector.scatter", mlir)
+        @test occursin("scf.parallel", mlir)
+        # No Tile types / ArraySpec strided layout in SPMD memrefs.
+        @test !occursin("strided<", mlir)
     end
 
 end

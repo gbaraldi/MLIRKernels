@@ -14,16 +14,31 @@ Like cuTile's `code_tiled`, accepts either a `Tuple{T1, T2, …}` type or a
 tuple of runtime values (in which case `cuTileconvert` is applied).
 """
 function code_mlir(@nospecialize(f), argtypes::Type;
-                   kernel_name::String=string(nameof(f)), n_grid_dims::Int=1)
+                   kernel_name::String=string(nameof(f)), n_grid_dims::Int=1,
+                   spmd::Bool=false, lane_width::Int=16)
     sci, rettype, divby_info, bounds_info = _structured_with_analyses(f, argtypes)
-    mod, _, mlir_ctx, _ = lower_to_mlir(sci, argtypes; kernel_name, n_grid_dims,
-                                        divby_info, bounds_info)
+    if spmd
+        mod, _, mlir_ctx, _ = lower_to_mlir_spmd(sci, argtypes;
+                                                  kernel_name, lane_width)
+    else
+        mod, _, mlir_ctx, _ = lower_to_mlir(sci, argtypes; kernel_name, n_grid_dims,
+                                            divby_info, bounds_info)
+    end
     @with_context mlir_ctx begin
         return sprint(show, mod)
     end
 end
 
-function code_mlir(@nospecialize(f), args::Tuple; kwargs...)
+function code_mlir(@nospecialize(f), args::Tuple; spmd::Bool=false, kwargs...)
+    if spmd
+        # Accept either a tuple of Julia *types* or a tuple of values.
+        tt = if all(a -> a isa Type, args)
+            Tuple{args...}
+        else
+            Tuple{map(Core.Typeof, args)...}
+        end
+        return code_mlir(f, tt; spmd=true, kwargs...)
+    end
     converted = map(_cpu_convert, args)
     tt = Tuple{map(Core.Typeof, converted)...}
     return code_mlir(f, tt; kwargs...)

@@ -54,6 +54,10 @@ struct CPUKernel{F, TT}
     # Per-memref-arg required alignment (parallel to memref entries of
     # param_types). Empty for scalar params.
     param_alignments::Vector{Int}
+    # :cuTile (default — kernels with TileArray args + KernelState seed)
+    # or :spmd  (scalar-typed Julia kernels lifted to vector lanes; no
+    #            alignment check, no seed param, see `spmd_function`).
+    kind::Symbol
 end
 
 # Compilation cache: (f, tt, n_grid_dims, serial) → CPUKernel. The `serial`
@@ -128,7 +132,7 @@ function cpu_function(@nospecialize(f), argtypes::Type;
     end
     k = CPUKernel{typeof(f), argtypes}(f, so_path, h, fn,
                                        param_julia_types, param_kinds,
-                                       n_grid_dims, alignments)
+                                       n_grid_dims, alignments, :cuTile)
     _kernel_cache[key] = k
     return k
 end
@@ -159,27 +163,41 @@ function (k::CPUKernel)(args...; blocks)
         error("CPUKernel: kernel was compiled for $(k.n_grid_dims) grid dim(s), " *
               "launch passed $(length(grid))")
 
+    is_spmd = k.kind === :spmd
+
     # Walk runtime args, matching them against the kernel's expected param
     # kinds. AbstractArray → memref descriptor. Constants are dropped. Scalar
     # Numbers → typed scalar arg.
+    #
+    # SPMD-mode special case: the trailing `i::Int` lane index is *not* a
+    # runtime arg — it's synthesised inside the func per grid step. The
+    # user's invocation still passes it (matching the source-level kernel
+    # signature) but we silently drop it from the host-side ccall.
     descs = Vector{Vector{Int}}()
     scalar_vals = Any[]
     scalar_types = Type[]
     pin_targets = Any[]
     param_idx = 1
     align_idx = 1
-    for a in args
+    last_arg_idx = lastindex(args)
+    for (ai, a) in enumerate(args)
         a isa ct.Constant && continue
+        # SPMD: drop the trailing scalar (the lane index `i::Int`).
+        if is_spmd && a isa Integer && ai == last_arg_idx
+            continue
+        end
         if a isa AbstractArray
             param_idx ≤ length(k.param_kinds) ||
                 error("CPUKernel: too many runtime args")
             k.param_kinds[param_idx] === :memref ||
                 error("CPUKernel: param #$param_idx expected scalar, got array")
-            align = k.param_alignments[align_idx]
-            pointer_aligned(a, align) || error(
-                "CPUKernel: array arg #$(align_idx) (pointer $(repr(pointer(a)))) is not " *
-                "aligned to $(align) bytes required by ArraySpec. " *
-                "Allocate with `cuTileCPU.aligned_array(...; alignment=$(align))`.")
+            if !is_spmd
+                align = k.param_alignments[align_idx]
+                pointer_aligned(a, align) || error(
+                    "CPUKernel: array arg #$(align_idx) (pointer $(repr(pointer(a)))) is not " *
+                    "aligned to $(align) bytes required by ArraySpec. " *
+                    "Allocate with `cuTileCPU.aligned_array(...; alignment=$(align))`.")
+            end
             push!(descs, pack_memref_descriptor(a))
             push!(pin_targets, a)
             align_idx += 1
@@ -225,7 +243,13 @@ function (k::CPUKernel)(args...; blocks)
     # still has to pass it to match the ABI.
     seed = Base.rand(UInt32)
     GC.@preserve descs pin_targets begin
-        _ccall_launch(k.fn, desc_ptrs, Tuple(scalar_vals), Tuple(scalar_types), seed, grid)
+        if is_spmd
+            _ccall_launch_spmd(k.fn, desc_ptrs, Tuple(scalar_vals),
+                               Tuple(scalar_types), grid)
+        else
+            _ccall_launch(k.fn, desc_ptrs, Tuple(scalar_vals),
+                          Tuple(scalar_types), seed, grid)
+        end
     end
     rescale && ccall((:omp_set_num_threads, LIBOMP), Cvoid, (Cint,), Cint(MAX_THREADS))
     return nothing
@@ -359,4 +383,104 @@ end
     return quote
         ccall(fn, Cvoid, $types_expr, $(desc_args...), $(scalar_args...), seed, $(grid_args...))
     end
+end
+
+# SPMD ccall variant: no `seed` parameter (SPMD kernels don't take the
+# implicit `KernelState.seed`). Otherwise identical layout to `_ccall_launch`.
+@generated function _ccall_launch_spmd(fn::Ptr{Cvoid},
+                                       descs::NTuple{Nm, Ptr{Int}},
+                                       scalar_vals::Tuple,
+                                       scalar_types::Tuple,
+                                       grid::NTuple{Ng, Int}) where {Nm, Ng}
+    Ns = length(scalar_vals.parameters)
+    desc_args = [:(descs[$i]) for i in 1:Nm]
+    scalar_args = [:(scalar_vals[$i]) for i in 1:Ns]
+    grid_args = [:(grid[$i]) for i in 1:Ng]
+    scalar_t_lits = [scalar_vals.parameters[i] for i in 1:Ns]
+    types_expr = Expr(:tuple,
+                      fill(:(Ptr{Int}), Nm)...,
+                      scalar_t_lits...,
+                      fill(:(Int), Ng)...)
+    return quote
+        ccall(fn, Cvoid, $types_expr, $(desc_args...), $(scalar_args...), $(grid_args...))
+    end
+end
+
+# ============================================================================
+# SPMD ("ISPC-style" scalar-typed kernels)
+# ============================================================================
+#
+# `spmd_function(f, argtypes; lane_width=16)` is the SPMD analogue of
+# `cpu_function`. The kernel writes plain Julia (no `Tile`/`ct.*` types):
+#
+#     function vadd_spmd(a, b, c, i::Int)
+#         @inbounds c[i] = a[i] + b[i]
+#         return
+#     end
+#
+# Each grid block processes `lane_width` consecutive lane indices i in
+# `bid*W+1 : bid*W+W` simultaneously, by lifting every op on the lane index
+# to a `vector<lane_width × eT>`. The host-side launch grid is
+# `cld(n, lane_width)` blocks; the kernel signature still names `i::Int` so
+# the caller's invocation reads naturally, but the actual lane index value
+# is synthesised inside the func and the user-supplied `i` arg is *ignored*
+# at launch time (a placeholder; pass any Int).
+#
+# MVP limitations:
+#   • Array args are passed as plain `Vector{T}` (no alignment requirement).
+#   • The grid size must be a multiple of `lane_width` (no boundary mask).
+#   • Only the contiguous `a[i]` pattern is lowered to `vector.transfer_*`;
+#     anything more elaborate falls through to `vector.gather`/scatter.
+const _spmd_kernel_cache = Dict{Tuple{Any, Type, Int, Bool, Int}, CPUKernel}()
+
+"""
+    spmd_function(f, argtypes::Type; lane_width=16, serial=false) -> CPUKernel
+
+Compile `f` in SPMD ("ISPC-style") mode: the trailing scalar arg is treated
+as a *lane index* and the body is lifted to a `lane_width`-wide vector. See
+the module-level docstring for details.
+
+Compilation is cached on `(f, argtypes, lane_width, serial)`.
+"""
+function spmd_function(@nospecialize(f), argtypes::Type;
+                       lane_width::Int=16,
+                       kernel_name=string(nameof(f), "_spmd"),
+                       serial::Bool=false)
+    key = (f, argtypes, 1, serial, lane_width)
+    haskey(_spmd_kernel_cache, key) && return _spmd_kernel_cache[key]::CPUKernel
+
+    sci, rettype, _, _ = _structured_with_analyses(f, argtypes)
+    rettype === Nothing ||
+        error("spmd_function: kernel must return Nothing, got $rettype")
+
+    mod, param_julia_types, mlir_ctx, param_kinds =
+        lower_to_mlir_spmd(sci, argtypes; kernel_name, lane_width)
+
+    mlir_text = String("")
+    @with_context mlir_ctx begin
+        mlir_text = sprint(show, mod)
+    end
+
+    passes = serial ? SERIAL_PASSES : DEFAULT_PASSES
+    so_path = compile_to_so(mlir_text; kernel_name, passes)
+    h = Libdl.dlopen(so_path)
+    fn = Libdl.dlsym(h, Symbol("_mlir_ciface_" * kernel_name))
+
+    k = CPUKernel{typeof(f), argtypes}(f, so_path, h, fn,
+                                       param_julia_types, param_kinds,
+                                       1, Int[], :spmd)
+    _spmd_kernel_cache[key] = k
+    return k
+end
+
+# Tuple overload: accepts either a tuple of Julia *types* (e.g.
+# `(Vector{Float32}, Int)`) or a tuple of runtime *values*. SPMD doesn't
+# apply `cuTileconvert`; args stay as their plain Julia types.
+function spmd_function(@nospecialize(f), args::Tuple; kwargs...)
+    if all(a -> a isa Type, args)
+        tt = Tuple{args...}
+    else
+        tt = Tuple{map(Core.Typeof, args)...}
+    end
+    return spmd_function(f, tt; kwargs...)
 end

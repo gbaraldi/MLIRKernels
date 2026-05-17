@@ -95,6 +95,20 @@ mutable struct LowerCtx
     kernel_state_ssas::Set{Int}
     # MLIR Value of the i32 `KernelState.seed` parameter, bound at func entry.
     seed_param::Union{Nothing, IR.Value}
+    # ----- SPMD ("ISPC-style" scalar-typed kernels) mode -----
+    # When true, the walker accepts plain Julia scalar code (Vector{T} args
+    # + scalar lane index) and lifts each scalar op to a `lane_width`-wide
+    # vector. See `lower_to_mlir_spmd` and the SPMD-aware dispatches in
+    # `walk_call!`.
+    spmd::Bool
+    lane_width::Int
+    # Arg slot of the lane index (e.g. the `i::Int` last param). The value
+    # in `arg_vals[lane_arg]` is the per-iteration lane vector
+    # `vector<lane_width × iX>` of values `[bid*W+1, bid*W+2, ..., (bid+1)*W]`.
+    lane_arg::Int
+    # MLIR i-type used for the lane index vector (matches the kernel's lane
+    # arg Julia type — typically Int64).
+    lane_idx_type::Type
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -107,7 +121,8 @@ LowerCtx(ctx, mod) = LowerCtx(
     Dict{Int, Symbol}(),
     Dict{Int, Type}(),
     IR.Value[], IR.Value[],
-    Set{Int}(), nothing)
+    Set{Int}(), nothing,
+    false, 16, 0, Int64)
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -509,6 +524,198 @@ function lower_to_mlir(sci::StructuredIRCode, argtypes::Type;
                     for d in 1:n_grid_dims
                         push!(lc.bids, IR.argument(par_block, d))
                     end
+                    walk_block!(lc, sci.entry)
+                    _scf.reduce(IR.Value[]; reductions=IR.Region[])
+                end
+
+                _func.return_(IR.Value[])
+            end
+        end
+    end
+    return (mod_ref[], param_julia_types, ctx, param_kinds)
+end
+
+# ----------------------------------------------------------------------------
+# SPMD mode: lower a scalar-typed Julia kernel to vector MLIR
+# ----------------------------------------------------------------------------
+#
+# Compiles a Julia function of shape
+#
+#     function k(arr1::Vector{T1}, ..., arrK::Vector{TK}, i::Int)
+#         @inbounds arr1[i] = arr2[i] + arr3[i]   # plain Julia, no Tile/ct.*
+#         return
+#     end
+#
+# into vector MLIR, where each grid block processes `lane_width` consecutive
+# values of `i` simultaneously. ISPC-style SPMD-on-SIMD: the trailing `i::Int`
+# arg is treated as *varying* — at codegen time it's a `vector<lane_width × iX>`
+# of values `[bid*W+1, ..., (bid+1)*W]`. Plain Julia ops on varying values
+# become vector ops; uniform scalars are broadcast to `lane_width` lanes when
+# combined with varying ones.
+#
+# Implementation:
+#   • Vector{T} args lower to plain `memref<?xT>` (no strided<[1]> layout,
+#     no ArraySpec). The user passes plain `Vector{T}` host buffers — no
+#     alignment requirement beyond what Julia gives by default.
+#   • The lane arg's MLIR Value is rebound at each `scf.parallel` iteration
+#     to `splat(bid * W) + (1, 2, ..., W)`.
+#   • Bounds-check IfOps (`if boundscheck …`) are dropped — we assume the
+#     user wrote `@inbounds` (or are okay with elision).
+#   • `Base.memoryrefnew(memref_field, i, bc)` builds an OffsetInfo when `i`
+#     is the lane vector; `Base.memoryrefget/set!` then lower to
+#     `vector.gather`/`vector.scatter`.
+#   • Vary/uniform: a value is "varying" iff its MLIR type is a vector.
+#     Scalar/uniform-only ops stay scalar (cheaper); when any operand is
+#     varying, scalars are broadcast to the lane vector type before the op.
+#
+# MVP limitation: requires `n % lane_width == 0`. Boundary handling via mask
+# is left as a TODO — the kernel signature `(arr..., i::Int)` doesn't carry
+# `n`, so any masking has to come from a separate kernel signature with a
+# length scalar.
+function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
+                            kernel_name::String, lane_width::Int=16)
+    ctx = Reactant.ReactantContext()
+    mod_ref = Ref{IR.Module}()
+    param_julia_types = Type[]
+    param_kinds = Symbol[]
+    n_grid_dims = 1
+
+    @with_context ctx begin
+        IR.load_all_available_dialects()
+        mod = IR.Module(IR.Location())
+        mod_ref[] = mod
+
+        @with_module mod begin
+            lc = LowerCtx(ctx, mod)
+            lc.spmd = true
+            lc.lane_width = lane_width
+
+            idx_t = IR.IndexType()
+            param_mlir_types = IR.Type[]
+            param_arg_slots = Int[]
+
+            # Identify the lane arg: the trailing Integer arg (after dropping
+            # Const-seeded slots). Everything else is array (Vector{T}) or
+            # uniform scalar.
+            lane_slot = 0
+            for (i, AT) in enumerate(sci.argtypes)
+                i == 1 && continue
+                AT_wide = widenconst(AT)
+                if AT_wide <: Integer
+                    lane_slot = i
+                end
+            end
+            lane_slot == 0 && error(
+                "lower_to_mlir_spmd: kernel signature must end with a scalar " *
+                "lane index (e.g. `i::Int`); no Integer arg found in $sci.argtypes")
+            lc.lane_arg = lane_slot
+
+            for (i, AT) in enumerate(sci.argtypes)
+                i == 1 && continue
+                if AT isa Core.Const
+                    lc.arg_const[i] = AT.val
+                    continue
+                end
+                AT_wide = widenconst(AT)
+                if AT_wide <: AbstractArray
+                    eT = eltype(AT_wide)
+                    N  = ndims(AT_wide)
+                    # SPMD memref: plain dynamic shape, no strided layout,
+                    # no alignment requirement.
+                    elem = mlir_elem_type(eT)
+                    shape = fill(Int(IR.dynsize()), N)
+                    mr = IR.MemRefType(elem, shape, IR.Attribute(), IR.Attribute())
+                    push!(param_mlir_types, mr)
+                    push!(param_arg_slots, i)
+                    push!(param_julia_types, AT_wide)
+                    push!(param_kinds, :memref)
+                    lc.arg_elem_types[i] = eT
+                elseif AT_wide <: Number
+                    if i == lane_slot
+                        # Lane arg: don't materialise it as a func parameter
+                        # here. It's bound to a per-iteration vector inside
+                        # the scf.parallel body below.
+                        lc.lane_idx_type = AT_wide
+                    else
+                        # Uniform scalar arg (e.g. a length `n`).
+                        push!(param_mlir_types, mlir_elem_type(AT_wide))
+                        push!(param_arg_slots, i)
+                        push!(param_julia_types, AT_wide)
+                        push!(param_kinds, :scalar)
+                    end
+                else
+                    error("cuTileCPU SPMD: unsupported arg type $AT_wide at slot $i")
+                end
+            end
+
+            # Grid dim (a single `index` arg: nblocks).
+            grid_param_offset = length(param_mlir_types)
+            push!(param_mlir_types, idx_t)
+
+            ftype = IR.FunctionType(param_mlir_types, IR.Type[])
+            arg_locs = [IR.Location() for _ in 1:length(param_mlir_types)]
+            entry = IR.Block(param_mlir_types, arg_locs)
+            body_region = IR.Region()
+            push!(body_region, entry)
+
+            funcop = _func.func_(;
+                sym_name      = IR.Attribute(kernel_name),
+                function_type = IR.Attribute(ftype),
+                body          = body_region,
+            )
+            IR.setattr!(funcop, "llvm.emit_c_interface", IR.UnitAttribute())
+            push!(IR.body(mod), funcop)
+
+            for (k, slot) in enumerate(param_arg_slots)
+                lc.arg_vals[slot] = IR.argument(entry, k)
+            end
+            grid_val = IR.argument(entry, grid_param_offset + 1)
+
+            @with_block entry begin
+                c0 = IR.result(_arith.constant(; value=IR.Attribute(Int(0), idx_t)))
+                c1 = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
+
+                par_region = IR.Region()
+                par_block = IR.Block([idx_t], [IR.Location()])
+                push!(par_region, par_block)
+                _scf.parallel(
+                    IR.Value[c0],
+                    IR.Value[grid_val],
+                    IR.Value[c1],
+                    IR.Value[];
+                    results=IR.Type[], region=par_region,
+                )
+
+                @with_block par_block begin
+                    bid = IR.argument(par_block, 1)
+                    push!(lc.bids, bid)
+                    # Build the lane vector for this grid step:
+                    #   lane_base = (bid * lane_width)              (index)
+                    #   lane_idx  = splat(lane_base) + (1, 2, ..., W)  -- as iX
+                    # Julia's user-facing `i` is 1-based; the kernel uses
+                    # `c[i]` so we add 1 to get the 1-based lane indices.
+                    W_const = IR.result(_arith.constant(;
+                        value=IR.Attribute(Int(lane_width), idx_t)))
+                    lane_base_idx = IR.result(_arith.muli(bid, W_const; result=idx_t))
+                    lane_t = mlir_elem_type(lc.lane_idx_type)
+                    # Build (0, 1, ..., W-1) as `vector<W × index>` then cast
+                    # to the lane idx integer type, then add splat(lane_base+1).
+                    idx_vec_t = IR.VectorType(1, Int[lane_width], idx_t)
+                    step_v = IR.result(_vector.step(; result=idx_vec_t))
+                    int_vec_t = IR.VectorType(1, Int[lane_width], lane_t)
+                    step_int = IR.result(_arith.index_cast(step_v; out=int_vec_t))
+                    # base + 1 as scalar (1-based)
+                    one_idx = IR.result(_arith.constant(;
+                        value=IR.Attribute(Int(1), idx_t)))
+                    base_p1_idx = IR.result(_arith.addi(lane_base_idx, one_idx;
+                                                       result=idx_t))
+                    base_p1_int = IR.result(_arith.index_cast(base_p1_idx; out=lane_t))
+                    base_splat = IR.result(_vector.broadcast(base_p1_int;
+                                                              vector=int_vec_t))
+                    lane_vec = IR.result(_arith.addi(base_splat, step_int;
+                                                    result=int_vec_t))
+                    lc.arg_vals[lane_slot] = lane_vec
+
                     walk_block!(lc, sci.entry)
                     _scf.reduce(IR.Value[]; reductions=IR.Region[])
                 end
@@ -1106,6 +1313,22 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         return emit_atomic_cas!(lc, args, typ)
     end
 
+    # ----- SPMD-mode dispatch for plain Julia callees -----
+    if lc.spmd
+        if fname === :memoryrefnew
+            return emit_spmd_memoryrefnew!(lc, idx, args, typ)
+        elseif fname === :memoryrefget
+            return emit_spmd_memoryrefget!(lc, args, typ)
+        elseif fname === :memoryrefset!
+            return emit_spmd_memoryrefset!(lc, args, typ)
+        elseif fname === :throw
+            # Dead inside elided bounds-check IfOps; if we hit it here the
+            # walker is processing a live throw, which the SPMD MVP doesn't
+            # support. Drop it (the LLVM-IR end will get a no-op).
+            return nothing
+        end
+    end
+
     error("cuTileCPU.walk_call!: unhandled callee $fname " *
           "(callee=$callee, args=$args)")
 end
@@ -1117,7 +1340,61 @@ function emit_binop_value!(lc::LowerCtx, args, op_fn)
     b = resolve_value_or_const(lc, args[2])
     (a === nothing || b === nothing) &&
         error("$(op_fn): unresolved operands ($(args[1]), $(args[2]))")
+    a, b = _spmd_harmonise(lc, a, b)
     return IR.result(op_fn(a, b))
+end
+
+# In SPMD mode, if one operand is a vector (varying) and the other is scalar
+# (uniform), broadcast the scalar to match the vector type. No-op outside
+# SPMD mode or when shapes already match. Used by all binop / cmp emitters.
+function _spmd_harmonise(lc::LowerCtx, a::IR.Value, b::IR.Value)
+    lc.spmd || return a, b
+    ta = IR.type(a); tb = IR.type(b)
+    if IR.isvector(ta) && !IR.isvector(tb)
+        b = _broadcast_to_match(b, ta)
+    elseif IR.isvector(tb) && !IR.isvector(ta)
+        a = _broadcast_to_match(a, tb)
+    end
+    return a, b
+end
+
+function _spmd_harmonise(lc::LowerCtx, a::IR.Value, b::IR.Value, c::IR.Value)
+    lc.spmd || return a, b, c
+    # Find the vector type (if any) among the operands; broadcast scalars to it.
+    vec_t = nothing
+    for v in (a, b, c)
+        if IR.isvector(IR.type(v))
+            vec_t = IR.type(v); break
+        end
+    end
+    if vec_t !== nothing
+        IR.isvector(IR.type(a)) || (a = _broadcast_to_match(a, vec_t))
+        IR.isvector(IR.type(b)) || (b = _broadcast_to_match(b, vec_t))
+        IR.isvector(IR.type(c)) || (c = _broadcast_to_match(c, vec_t))
+    end
+    return a, b, c
+end
+
+# Broadcast a scalar `v` to a vector of element type matching `vec_t`. If `v`'s
+# scalar type differs from the vector element type (common for SPMD where a
+# user literal `1` is `i64` but the lane index is the same — but cmpi on
+# `vector<W × i64>` needs the scalar broadcast at i64), insert an int-cast.
+function _broadcast_to_match(v::IR.Value, vec_t)
+    elem_t = IR.eltype(vec_t)
+    v_t = IR.type(v)
+    if v_t != elem_t
+        # Scalar element-type mismatch. Common case: index → integer cast.
+        if v_t == IR.IndexType()
+            v = IR.result(_arith.index_cast(v; out=elem_t))
+        elseif elem_t == IR.IndexType()
+            v = IR.result(_arith.index_cast(v; out=elem_t))
+        else
+            # Integer width mismatch — extend or truncate. We only need this
+            # in narrow cases; fall back to extsi for now.
+            v = IR.result(_arith.extsi(v; out=elem_t))
+        end
+    end
+    return IR.result(_vector.broadcast(v; vector=vec_t))
 end
 
 # cuTile Intrinsics.mulhii(a, b) — high half of the unsigned-widened product.
@@ -1995,6 +2272,14 @@ end
 # ----------------------------------------------------------------------------
 
 function emit_if!(lc::LowerCtx, idx::Int, op::IfOp, @nospecialize(typ))
+    # SPMD mode: `if boundscheck …` IfOps gate dead bounds-check code.
+    # Their condition resolves to the `:boundscheck` sentinel (no Value).
+    # We assume `@inbounds` and skip the entire IfOp — its then-branch is
+    # the actual bounds check (compare + throw), its else-branch is empty.
+    if lc.spmd && op.condition isa SSAValue &&
+       get(lc.sentinels, op.condition.id, nothing) === :boundscheck
+        return nothing
+    end
     cond_v = resolve_value_or_const(lc, op.condition)
     cond_v === nothing && error("scf.if: cannot resolve condition $(op.condition)")
     # Result types — flatten Tuple{...} into a vector of MLIR types.
@@ -2166,13 +2451,21 @@ function emit_bitcast!(lc::LowerCtx, args, @nospecialize(typ))
     target_T = something(resolve_const(lc, args[2]), args[2])
     target_T isa Type ||
         error("bitcast: target type must be a Type, got $target_T")
-    out_t = if typ isa DataType && typ <: ct.Tile
+    # In SPMD mode the cuTile-inferred `typ` may be a 0-D tile (scalar) but the
+    # actual operand is a lane-wide vector — derive the output type from the
+    # operand's shape, not from `typ`.
+    src_t = IR.type(v)
+    elem_target = mlir_elem_type(target_T)
+    out_t = if lc.spmd && IR.isvector(src_t)
+        n = Int(size(src_t, 1))
+        IR.VectorType(1, Int[n], elem_target)
+    elseif typ isa DataType && typ <: ct.Tile
         mlir_type_for_tile(typ)
     else
-        mlir_elem_type(target_T)
+        elem_target
     end
     # If the MLIR type already matches, this is an identity (signless types).
-    IR.type(v) == out_t && return v
+    src_t == out_t && return v
     if IR.isvector(out_t)
         return IR.result(_vector.bitcast(v; result=out_t))
     else
@@ -2725,4 +3018,211 @@ function emit_tile_store!(lc::LowerCtx, part::PartitionInfo,
     _vector.transfer_write(value, part.base, offs;
                             permutation_map=perm, in_bounds=inb)
     return nothing
+end
+
+# ----------------------------------------------------------------------------
+# SPMD-mode plain-Julia op emitters
+# ----------------------------------------------------------------------------
+#
+# These handle the SCI ops that arise from Julia's `Vector{T}[i]` /
+# `Vector{T}[i] = v` lowering when the kernel is written without cuTile
+# types. The IRStructurizer / cuTile pipeline accepts plain Julia
+# `Vector{T}` args and decomposes indexing into:
+#
+#   %ref = Base.getfield(_arr, :ref)                   # MemoryRef{T}
+#   %mr  = Base.memoryrefnew(%ref, %i, false)          # GenericMemoryRef{T}
+#   %v   = Base.memoryrefget(%mr, :not_atomic, false)  # T   -- load
+#   Base.memoryrefset!(%mr, %v, :not_atomic, false)    # store
+#
+# When `%i` is the (varying) lane vector, the resulting memoryrefnew is an
+# OffsetInfo with that vector as the per-lane index; `memoryrefget`/`set!`
+# then lower to `vector.gather`/`vector.scatter` on the array's memref.
+# Indices arriving here are 1-based (Julia semantics); cuTile lowers them
+# to 0-based in `memoryrefnew` itself, but on plain Julia code we get the
+# raw 1-based index — we subtract 1 below.
+
+# Detect contiguous lane indices. The SPMD lane vector is constructed as
+# `splat(bid * W) + step(0..W-1)` — an affine, contiguous pattern. The
+# fast path: convert to a `vector.transfer_read` / `vector.transfer_write`
+# with the (scalar) base offset; falls back to gather/scatter otherwise.
+# For the MVP we detect the contiguous case purely by checking whether the
+# index vector equals `lc.arg_vals[lane_arg]` — i.e. the user's `%i` is the
+# lane arg directly (the common `a[i]` case). Anything else (computed
+# offsets, gather-style indirection) falls back to gather/scatter.
+function _is_contiguous_lane_index(lc::LowerCtx, indices::IR.Value)
+    lc.spmd || return false
+    haskey(lc.arg_vals, lc.lane_arg) || return false
+    return indices == lc.arg_vals[lc.lane_arg]
+end
+
+# Recover the scalar `lane_base` (`bid * lane_width`) for a contiguous-lane
+# transfer_read/write. Encoded once when the lane vector is built; here we
+# rebuild it on demand from the current `bid`.
+function _spmd_lane_base(lc::LowerCtx)
+    idx_t = IR.IndexType()
+    bid = lc.bids[1]
+    W_const = IR.result(_arith.constant(;
+        value=IR.Attribute(Int(lc.lane_width), idx_t)))
+    return IR.result(_arith.muli(bid, W_const; result=idx_t))
+end
+
+# `Base.memoryrefnew(ref_ssa, idx, bc)`
+function emit_spmd_memoryrefnew!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
+    ref_ref = args[1]
+    ref_ref isa SSAValue && haskey(lc.field_refs, ref_ref.id) ||
+        error("SPMD memoryrefnew: ref operand must be `getfield(arr, :ref)`, got $ref_ref")
+    (arg_id, fld) = lc.field_refs[ref_ref.id]
+    fld === :ref || error(
+        "SPMD memoryrefnew: ref operand must be `getfield(arr, :ref)` (got :$fld)")
+    base_memref = lc.arg_vals[arg_id]
+    elem_T = lc.arg_elem_types[arg_id]
+
+    # Index: typically the lane Argument (varying vector). Materialise it; if
+    # it's a scalar (uniform load), we'll bypass gather and use a scalar
+    # `memref.load`/`memref.store` at the consumer. We still record the
+    # OffsetInfo with the (possibly scalar) Value.
+    idx_v = resolve_value_or_const(lc, args[2])
+    idx_v === nothing &&
+        error("SPMD memoryrefnew: cannot resolve index operand $(args[2])")
+
+    # SPMD memoryrefnew indices are 1-based Julia (raw `i`). Convert to 0-based
+    # for downstream `memref` ops by subtracting 1 splat'd into the vector.
+    t = IR.type(idx_v)
+    if IR.isvector(t)
+        elem_t = IR.eltype(t)
+        n = Int(size(t, 1))
+        one_attr = _splat_attr(_one_of_elem(elem_t), t)
+        one_v = IR.result(_arith.constant(; value=one_attr, result=t))
+        idx_v = IR.result(_arith.subi(idx_v, one_v; result=t))
+        sh = Int[n]
+    else
+        one_v = IR.result(_arith.constant(; value=IR.Attribute(1, t), result=t))
+        idx_v = IR.result(_arith.subi(idx_v, one_v; result=t))
+        sh = Int[]
+    end
+    lc.offsets[idx] = OffsetInfo(base_memref, idx_v, elem_T, sh)
+    return nothing
+end
+
+# Return a 1 of the given MLIR element type (as a Julia value usable in a
+# DenseElements splat — we map i32/i64/index to plain Int, and floats to 1.0
+# of the matching width).
+function _one_of_elem(elem_t)
+    elem_t == IR.Type(Int32) && return Int32(1)
+    elem_t == IR.Type(Int64) && return Int64(1)
+    elem_t == IR.IndexType() && return Int(1)
+    elem_t == IR.Type(Float32) && return 1f0
+    elem_t == IR.Type(Float64) && return 1.0
+    elem_t == IR.Type(Bool) && return true
+    return Int(1)
+end
+
+# `Base.memoryrefget(mr, :not_atomic, bc)` → vector.gather / vector.transfer_read
+function emit_spmd_memoryrefget!(lc::LowerCtx, args, @nospecialize(typ))
+    mr_ref = args[1]
+    mr_ref isa SSAValue && haskey(lc.offsets, mr_ref.id) ||
+        error("SPMD memoryrefget: mr operand must be a tracked memoryrefnew SSA, got $mr_ref")
+    off = lc.offsets[mr_ref.id]
+    if isempty(off.idx_shape)
+        # Scalar load — `memref.load %base[%idx]`.
+        idx_index = cast_to_index(off.indices)
+        return IR.result(_memref.load(off.base, IR.Value[idx_index];
+                                       result=mlir_elem_type(off.elem_type)))
+    end
+
+    n = off.idx_shape[1]
+    result_t = IR.VectorType(1, Int[n], mlir_elem_type(off.elem_type))
+
+    if _is_contiguous_lane_index_from_offset(lc, off)
+        # Fast path: lane is contiguous (`i = bid*W + 1..W`). Use
+        # `vector.transfer_read` for a wide contiguous load.
+        base_off = _spmd_lane_base(lc)
+        pad = IR.result(_arith.constant(;
+            value=IR.Attribute(zero(off.elem_type))))
+        perm = IR.Attribute(IR.IdentityAffineMap(1))
+        inb  = IR.Attribute(IR.Attribute[IR.Attribute(true)])
+        return IR.result(_vector.transfer_read(
+            off.base, IR.Value[base_off], pad;
+            vector=result_t, permutation_map=perm, in_bounds=inb,
+        ))
+    end
+
+    # Gather path. mask = all-true; pass_thru = zeros.
+    idx_t = IR.IndexType()
+    c0 = IR.result(_arith.constant(; value=IR.Attribute(Int(0), idx_t)))
+    mask_v = _resolve_or_alltrue_mask(lc, nothing, off.idx_shape)
+    pad_v = _resolve_or_zero_passthru(lc, nothing, off.elem_type, off.idx_shape)
+    return IR.result(_vector.gather(off.base, IR.Value[c0], off.indices,
+                                     mask_v, pad_v; result=result_t))
+end
+
+# `Base.memoryrefset!(mr, value, :not_atomic, bc)`
+function emit_spmd_memoryrefset!(lc::LowerCtx, args, @nospecialize(typ))
+    mr_ref = args[1]
+    mr_ref isa SSAValue && haskey(lc.offsets, mr_ref.id) ||
+        error("SPMD memoryrefset!: mr operand must be a tracked memoryrefnew SSA, got $mr_ref")
+    off = lc.offsets[mr_ref.id]
+    val_v = resolve_value_or_const(lc, args[2])
+    val_v === nothing &&
+        error("SPMD memoryrefset!: cannot resolve value operand $(args[2])")
+
+    if isempty(off.idx_shape)
+        # Scalar store.
+        idx_index = cast_to_index(off.indices)
+        _memref.store(val_v, off.base, IR.Value[idx_index])
+        return nothing
+    end
+
+    # If the value is scalar but the index is varying, broadcast.
+    if !IR.isvector(IR.type(val_v))
+        n = off.idx_shape[1]
+        vec_t = IR.VectorType(1, Int[n], mlir_elem_type(off.elem_type))
+        val_v = _broadcast_to_match(val_v, vec_t)
+    end
+
+    if _is_contiguous_lane_index_from_offset(lc, off)
+        # Fast path: vector.transfer_write at `bid * W`.
+        base_off = _spmd_lane_base(lc)
+        perm = IR.Attribute(IR.IdentityAffineMap(1))
+        inb  = IR.Attribute(IR.Attribute[IR.Attribute(true)])
+        _vector.transfer_write(val_v, off.base, IR.Value[base_off];
+                                permutation_map=perm, in_bounds=inb)
+        return nothing
+    end
+
+    # Scatter path.
+    idx_t = IR.IndexType()
+    c0 = IR.result(_arith.constant(; value=IR.Attribute(Int(0), idx_t)))
+    mask_v = _resolve_or_alltrue_mask(lc, nothing, off.idx_shape)
+    _vector.scatter(off.base, IR.Value[c0], off.indices, mask_v, val_v)
+    return nothing
+end
+
+# Detect the contiguous-lane pattern *from an OffsetInfo*. Because
+# `emit_spmd_memoryrefnew!` subtracted 1 from the raw lane index to convert
+# 1-based → 0-based, the offset's `indices` Value won't `==` the original
+# lane vector. Instead we compare against the 0-based lane vector. Simplest
+# robust heuristic: see if the indices was produced by an `arith.subi` whose
+# LHS is the lane arg. For the MVP we use a structural check via Reactant's
+# IR API.
+function _is_contiguous_lane_index_from_offset(lc::LowerCtx, off::OffsetInfo)
+    lc.spmd || return false
+    haskey(lc.arg_vals, lc.lane_arg) || return false
+    # Heuristic: walk back from off.indices through one `arith.subi` op to
+    # see if its LHS matches the lane arg vector. Reactant's IR exposes the
+    # defining op via `IR.owner` on a Value (when the value is an op result).
+    try
+        owner = IR.owner(off.indices)
+        owner === nothing && return false
+        # The owner op should be arith.subi with operand 0 equal to the lane
+        # arg vector.
+        name = String(IR.name(owner))
+        name == "arith.subi" || return false
+        n = IR.noperands(owner)
+        n >= 1 || return false
+        op0 = IR.operand(owner, 1)
+        return op0 == lc.arg_vals[lc.lane_arg]
+    catch
+        return false
+    end
 end
