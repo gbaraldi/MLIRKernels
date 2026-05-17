@@ -1,0 +1,15 @@
+# Top-level Manifest pins exact versions; downstream users resolve their own.
+# Subdir Manifests (test/, bench/) follow the same convention.
+/Manifest.toml
+test/Manifest.toml
+bench/Manifest.toml
+
+# Julia coverage/profiling
+*.cov
+*.mem
+*.jlcov
+
+# Editor
+*.swp
+*~
+.DS_Store

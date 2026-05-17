@@ -1,0 +1,17 @@
+name = "cuTileCPU"
+uuid = "62a3a8c1-3f0e-4d6f-8d0e-7c5f9b3d2a01"
+version = "0.1.0"
+authors = ["gbaraldi"]
+
+[deps]
+IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
+LLVMOpenMP_jll = "1d63c593-3942-5779-bab2-d838dc0a180e"
+LLVM_full_jll = "a3ccf953-465e-511d-b87f-60a6490c289d"
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"
+
+[compat]
+IRStructurizer = "0.6.2"
+LLVM_full_jll = "21.1.8"
+julia = "1.11"
