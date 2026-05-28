@@ -1291,6 +1291,12 @@ function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
         # Tag the SSA as a sentinel; subsequent getfield call recognises it.
         lc.sentinels[idx] = :boundscheck
         return nothing
+    elseif e.head === :aliasscope || e.head === :popaliasscope
+        # `@Const`/`@inbounds` (KA's `constify`) wrap loads in alias-scope
+        # markers (`Expr(:aliasscope)` ... `Expr(:popaliasscope)`). They carry
+        # noalias metadata for LLVM but have no MLIR analogue here — the memref
+        # ABI already encodes the (non-aliasing) argument buffers. Drop them.
+        return nothing
     end
     error("MLIRKernels.walk_expr!: unhandled Expr head :$(e.head) at %$idx ($e)")
 end
@@ -1754,10 +1760,15 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             return emit_spmd_memoryrefget!(lc, args, typ)
         elseif fname === :memoryrefset!
             return emit_spmd_memoryrefset!(lc, args, typ)
-        elseif fname === :throw
+        elseif fname === :throw || fname === :throw_complex_domainerror ||
+               fname === :throw_inexacterror || fname === :throw_overflowerror
             # Dead inside elided bounds-check IfOps; if we hit it here the
             # walker is processing a live throw, which the SPMD MVP doesn't
-            # support. Drop it (the LLVM-IR end will get a no-op).
+            # support. `throw_complex_domainerror` is the guard `Base.sqrt`
+            # emits for negative inputs (`sqrt(x<0)`); on the lane-vector path
+            # the compare is varying so the throw can't be hoisted out — and
+            # the kernel author has opted into the math.sqrt (NaN-on-negative)
+            # semantics anyway. Drop it (LLVM end gets a no-op).
             return nothing
         end
     end
@@ -1830,6 +1841,10 @@ const _RAW_CORE_INTRINSICS = Set{Symbol}([
     :sext_int, :zext_int, :trunc_int, :bitcast,
     :sitofp, :fptosi,
     :ifelse, Symbol("==="),
+    # Unary float math intrinsics (raw Julia names; cuTile rewrites these to
+    # :absf/:sqrt/etc, but the Frontend path hands them raw). One operand,
+    # operand-typed result — vector-aware via emit_unary_math!.
+    :abs_float, :sqrt_llvm, :sqrt_llvm_fast,
 ])
 
 # A constant matching `v`'s MLIR type (scalar or vector<N×elem>) holding the
@@ -1889,6 +1904,13 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
         v === nothing && error("not_int: unresolved operand")
         return IR.result(_arith.xori(v, _const_like(v, _allones_of_elem(IR.type(v)))))
     end
+    # Unary float math. `Base.abs(::AbstractFloat)` → :abs_float (single op);
+    # `Base.sqrt(::Float32/64)` → :sqrt_llvm. cuTile rewrites these to
+    # :absf/:sqrt; the Frontend hands them raw. Same op as the cuTile-named
+    # dispatch, vector-aware via emit_unary_math!.
+    name === :abs_float      && return emit_unary_math!(lc, args, _math.absf, typ)
+    name === :sqrt_llvm      && return emit_unary_math!(lc, args, _math.sqrt, typ)
+    name === :sqrt_llvm_fast && return emit_unary_math!(lc, args, _math.sqrt, typ)
     # Integer comparisons → emit_cmpi! with synthesized (pred, signedness).
     name === :slt_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThan, SG.Signed], typ)
     name === :sle_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThanOrEqual, SG.Signed], typ)
@@ -2309,6 +2331,10 @@ function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
         error("cmpi: signedness must be Signedness.T, got $signed")
     mlir_pred = cmpi_predicate_code(pred, signed)
     pred_attr = IR.Attribute(mlir_pred, IR.Type(Int64))
+    # SPMD: broadcast a uniform scalar operand to the lane vector width when
+    # the other side is varying (e.g. `gid < n` masks, or a lane-vector vs
+    # scalar-literal compare).
+    a, b = _spmd_harmonise(lc, a, b)
     # arith.cmpi result is i1; for tile element type Bool yields i1 (or
     # vector<...xi1>). Result type is inferred by Reactant wrapper since we
     # don't pass it.
@@ -2340,6 +2366,10 @@ function emit_cmpf!(lc::LowerCtx, args, @nospecialize(typ))
         error("cmpf: predicate must be ComparisonPredicate.T, got $pred")
     code = cmpf_predicate_code(pred, ord)
     pred_attr = IR.Attribute(code, IR.Type(Int64))
+    # SPMD: a varying-vs-uniform compare (e.g. the `x < 0` guard `Base.sqrt`
+    # emits, comparing the lane vector against a scalar 0.0) needs the scalar
+    # broadcast to the lane vector width so both operands share a type.
+    a, b = _spmd_harmonise(lc, a, b)
     return IR.result(_arith.cmpf(a, b; predicate=pred_attr))
 end
 
@@ -2867,6 +2897,45 @@ end
 # Control flow: scf.if / scf.for
 # ----------------------------------------------------------------------------
 
+# A branch region is a "dead throw arm" of a Base-math domain/overflow guard
+# (e.g. `Base.sqrt`'s `if x<0; throw_complex_domainerror; end`) when, after
+# dropping the throw, it carries no observable effect: every body statement is
+# either a `throw`/`throw_*(...)` call (typed `Union{}`) or trivial
+# (nothing/constant/QuoteNode). Such arms `return` (early kernel exit). The
+# *live* arm — which also ends in `return` at the kernel tail — does real work
+# (loads/stores/arith), so it is NOT classified dead. We must inspect the body,
+# not just the terminator: structurization gives BOTH arms a `ReturnNode`.
+function _is_dead_throw_branch(block::Block)
+    # A live continuation yields a value rather than returning — never dead.
+    block.terminator isa Core.ReturnNode || return false
+    saw_throw = false
+    for (_, entry) in block.body
+        stmt = entry.stmt
+        if stmt isa Expr && stmt.head === :invoke
+            nm = callee_name(stmt.args[2])
+            if nm === :throw || startswith(String(nm), "throw")
+                saw_throw = true
+                continue
+            end
+            return false  # a non-throw invoke = real work
+        elseif stmt isa Expr && stmt.head === :call
+            nm = callee_name(stmt.args[1])
+            if nm === :throw || startswith(String(nm), "throw")
+                saw_throw = true
+                continue
+            end
+            return false
+        elseif stmt === nothing || stmt isa QuoteNode ||
+               stmt isa Core.ReturnNode || stmt isa GlobalRef ||
+               stmt isa Core.Const || !(stmt isa Expr)
+            continue  # trivial / value-only statement
+        else
+            return false  # any other Expr (getfield, foreigncall, …) = real work
+        end
+    end
+    return saw_throw
+end
+
 function emit_if!(lc::LowerCtx, idx::Int, op::IfOp, @nospecialize(typ))
     # SPMD mode: `if boundscheck …` IfOps gate dead bounds-check code.
     # Their condition resolves to the `:boundscheck` sentinel (no Value).
@@ -2878,6 +2947,39 @@ function emit_if!(lc::LowerCtx, idx::Int, op::IfOp, @nospecialize(typ))
     end
     cond_v = resolve_value_or_const(lc, op.condition)
     cond_v === nothing && error("scf.if: cannot resolve condition $(op.condition)")
+    # SPMD mode: a varying (lane-vector) condition can't drive an `scf.if`
+    # (which requires a scalar i1). The varying guards we produce are the
+    # domain/overflow checks Base math helpers emit, e.g. `Base.sqrt`:
+    #     %g = (x < 0)            (varying, vector<W×i1>)
+    #     if %g  then: throw_complex_domainerror; return
+    #            else: sqrt_llvm(x); ...store...; return
+    # i.e. one branch is a dead early-return (its throw is already dropped in
+    # `walk_call!`); the other carries the live computation. We inline that
+    # live branch's body into the current block — no scf.if. A varying guard
+    # whose BOTH branches do live work would need per-lane masking (the MVP
+    # doesn't support it), so we only take this path when one branch is a
+    # throw/return-only dead branch.
+    if lc.spmd && IR.isvector(IR.type(cond_v))
+        then_dead = _is_dead_throw_branch(op.then_region)
+        else_dead = _is_dead_throw_branch(op.else_region)
+        if then_dead ⊻ else_dead
+            live = then_dead ? op.else_region : op.then_region
+            walk_block!(lc, live; kind=:entry)
+            # If the IfOp yields values (typ is a Tuple), bind them from the
+            # live branch's YieldOp so downstream SSAs resolve.
+            if typ !== Nothing && live.terminator isa YieldOp
+                vals = IR.Value[]
+                for v in live.terminator.values
+                    rv = resolve_value_or_const(lc, v)
+                    rv === nothing &&
+                        error("scf.if (inlined live branch): cannot resolve yield $v")
+                    push!(vals, rv)
+                end
+                lc.ssa_multi[idx] = vals
+            end
+            return nothing
+        end
+    end
     # Result types — flatten Tuple{...} into a vector of MLIR types.
     result_types, jl_yield_types = if_result_types(typ)
 
