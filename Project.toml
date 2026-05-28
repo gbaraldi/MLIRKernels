@@ -17,10 +17,13 @@ MLIR = {path = "/home/gbaraldi/.julia/dev/MLIR"}
 
 [weakdeps]
 Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
 
 [extensions]
 KernelAbstractionsExt = ["KernelAbstractions", "Atomix"]
+MLIRCUDAExt = ["KernelAbstractions", "CUDA", "LLVM"]
 
 [compat]
 Atomix = "0.1, 1"
