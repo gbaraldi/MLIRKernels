@@ -48,6 +48,16 @@ struct MLIRBackend <: KA.GPU end
 # `__index_Global_Linear(ctx)` → global linear thread index (1-based).
 @overlay FE.METHOD_TABLE KA.__index_Global_Linear(ctx) = FE.Intrinsics.global_index()
 
+# `@index(Local, Linear)` / `@index(Group, Linear)` / `@groupsize` expand to
+# one-arg `(ctx)` calls (the `:Linear` kind is a macro-stripped literal), so
+# the unary overlay is the matching one. KA's 2-arg `(ctx, ::CartesianIndex)`
+# defs in cpu.jl are CPU-emit-only and never reached on the Frontend path.
+# NOTE: `groupsize` returns a SCALAR Int32 here (not an NTuple) — kernels use
+# `@groupsize()` without `[1]` indexing.
+@overlay FE.METHOD_TABLE KA.__index_Local_Linear(ctx) = FE.Intrinsics.local_index()
+@overlay FE.METHOD_TABLE KA.__index_Group_Linear(ctx) = FE.Intrinsics.group_index()
+@overlay FE.METHOD_TABLE KA.groupsize(ctx)            = FE.Intrinsics.group_size()
+
 # `__validindex(ctx)` — for launches where ndrange is a multiple of the
 # workgroup size, every lane is valid. Tighter (lane < ndrange) masking is a
 # TODO (thread `ndrange` through and emit a per-lane mask compare).

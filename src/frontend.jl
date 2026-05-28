@@ -54,6 +54,15 @@ module Intrinsics
     # Block (workgroup) dimension along an axis.
     @noinline block_dim(dim::Int32) = compilerbarrier(:type, zero(Int32))::Int32
 
+    # Local linear index within the workgroup (1-based). CPU = lane step+1; GPU = thread_id+1.
+    @noinline local_index() = compilerbarrier(:type, zero(Int32))::Int32
+
+    # Group (workgroup/block) linear index (1-based). CPU = bid+1 (uniform); GPU = block_id+1.
+    @noinline group_index() = compilerbarrier(:type, zero(Int32))::Int32
+
+    # Workgroup size (count). CPU = lane_width const; GPU = block_dim.
+    @noinline group_size() = compilerbarrier(:type, zero(Int32))::Int32
+
     # Workgroup barrier (CPU: no-op; GPU: gpu.barrier). Returns nothing.
     @noinline barrier() = compilerbarrier(:type, nothing)
 end

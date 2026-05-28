@@ -1792,6 +1792,53 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         return lc.arg_vals[lc.lane_arg]
     end
 
+    # Local linear index (1-based): CPU SPMD = vector splat(1)+step(0..W-1);
+    # GPU SIMT (lane_width==1) = gpu.thread_id + 1 (scalar).
+    if fname === :local_index && lc.spmd
+        lane_t = mlir_elem_type(lc.lane_idx_type)
+        if lc.lane_width == 1                      # GPU SIMT
+            idx_t = IR.IndexType()
+            dimx = parse(IR.Attribute, "#gpu<dim x>")
+            tid  = IR.result(_gpu.thread_id(; result_0=idx_t, dimension=dimx))
+            one  = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
+            l1   = IR.result(_arith.addi(tid, one; result=idx_t))
+            return IR.result(_arith.index_cast(l1; out=lane_t))
+        else                                        # CPU SPMD: splat(1) + step
+            vt   = IR.VectorType(1, Int[lc.lane_width], lane_t)
+            step = _emit_step_vec(vt, lc.lane_idx_type, lc.lane_width)
+            one  = IR.result(_arith.constant(; value=IR.Attribute(Int(1), lane_t)))
+            os   = IR.result(_vector.broadcast(one; vector=vt))
+            return IR.result(_arith.addi(os, step; result=vt))
+        end
+    end
+
+    # Group linear index (1-based, uniform scalar): CPU = bid+1; GPU = block_id+1.
+    # Scalar result; `_spmd_harmonise`/`_broadcast_to_match` lift it on use.
+    if fname === :group_index && lc.spmd
+        idx_t = IR.IndexType(); lane_t = mlir_elem_type(lc.lane_idx_type)
+        bid = lc.lane_width == 1 ?
+            IR.result(_gpu.block_id(; result_0=idx_t,
+                       dimension=parse(IR.Attribute, "#gpu<dim x>"))) :
+            lc.bids[1]
+        one = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
+        g1  = IR.result(_arith.addi(bid, one; result=idx_t))
+        return IR.result(_arith.index_cast(g1; out=lane_t))
+    end
+
+    # Group size (uniform count): CPU = lane_width const; GPU = block_dim.
+    if fname === :group_size && lc.spmd
+        lane_t = mlir_elem_type(lc.lane_idx_type)
+        if lc.lane_width == 1                      # GPU
+            idx_t = IR.IndexType()
+            bd = IR.result(_gpu.block_dim(; result_0=idx_t,
+                       dimension=parse(IR.Attribute, "#gpu<dim x>")))
+            return IR.result(_arith.index_cast(bd; out=lane_t))
+        else                                        # CPU compile-time const
+            return IR.result(_arith.constant(;
+                value=IR.Attribute(Int(lc.lane_width), lane_t)))
+        end
+    end
+
     # Workgroup barrier marker (`Frontend.Intrinsics.barrier`, from KA
     # `@synchronize`). CPU SIMD has no warp barrier → no-op. (GPU barrier is
     # a future step; on the SIMT GPU path with `__validindex→true` and no
