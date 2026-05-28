@@ -110,6 +110,14 @@ mutable struct LowerCtx
     # MLIR i-type used for the lane index vector (matches the kernel's lane
     # arg Julia type — typically Int64).
     lane_idx_type::Type
+    # ----- N-D KA grid (multi-dimensional workgroup/ndrange) -----
+    # Workgroup dims and ndrange dims (Julia/column-major order). The workgroup
+    # is still flattened to a single `vector<prod(wg_dims)>` lane and the grid
+    # to a 1-D `scf.parallel`; these let the N-D `@index(…,NTuple/Cartesian)`
+    # markers reconstruct per-dim coords by column-major unflatten. Empty / a
+    # 1-tuple for the plain 1-D path.
+    wg_dims::Vector{Int}
+    nd_dims::Vector{Int}
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -123,7 +131,8 @@ LowerCtx(ctx, mod) = LowerCtx(
     Dict{Int, Type}(),
     IR.Value[], IR.Value[],
     Set{Int}(), nothing,
-    false, 16, 0, Int64)
+    false, 16, 0, Int64,
+    Int[], Int[])
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -817,7 +826,9 @@ end
 # up unchanged.
 function lower_to_mlir_ka(sci::StructuredIRCode, argtypes::Type;
                           kernel_name::String, lane_width::Int=16,
-                          alignment::Int=16, lane_idx_type::Type=Int64)
+                          alignment::Int=16, lane_idx_type::Type=Int64,
+                          wg_dims::Vector{Int}=Int[lane_width],
+                          nd_dims::Vector{Int}=Int[lane_width])
     ctx = fresh_context()
     mod_ref = Ref{IR.Module}()
     param_julia_types = Type[]
@@ -833,6 +844,8 @@ function lower_to_mlir_ka(sci::StructuredIRCode, argtypes::Type;
             lc.spmd = true
             lc.lane_width = lane_width
             lc.lane_idx_type = lane_idx_type
+            lc.wg_dims = wg_dims
+            lc.nd_dims = nd_dims
 
             idx_t = IR.IndexType()
             param_mlir_types = IR.Type[]
@@ -1864,6 +1877,18 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             return IR.result(_arith.constant(;
                 value=IR.Attribute(Int(lc.lane_width), lane_t)))
         end
+    end
+
+    # N-D `@index(Global/Local/Group, NTuple)` → per-dim 1-based index values,
+    # registered as the marker result's tuple components (`ssa_multi`). The
+    # kernel's `i, j = @index(…, NTuple)` destructure becomes `getfield(result,
+    # d)`, which returns component `d` directly.
+    if (fname === :global_ntuple || fname === :local_ntuple ||
+        fname === :group_ntuple) && lc.spmd
+        kind = fname === :global_ntuple ? :global :
+               fname === :local_ntuple  ? :local : :group
+        lc.ssa_multi[idx] = _emit_nd_index!(lc, kind)
+        return nothing
     end
 
     # Workgroup barrier marker (`Frontend.Intrinsics.barrier`, from KA
@@ -2946,7 +2971,11 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
         if haskey(lc.field_refs, obj.id)
             (arg_id, fld) = lc.field_refs[obj.id]
             memref_v = lc.arg_vals[arg_id]
-            if fld === :sizes
+            if fld === :sizes || fld === :size
+                # `:sizes` is cuTile's TileArray dims field; `:size` is a plain
+                # Julia `Array`'s dims tuple (`getfield(A, :size)[k]`, the form
+                # `size(A, k)` and N-D `A[i,j]` linearisation expand to). Both
+                # resolve a per-dim extent the same way.
                 # Convert Julia dim ki (col-major, 1-indexed) to MLIR dim
                 # (row-major, 0-indexed). MemRefType rank reverses: Julia
                 # dim k ↔ MLIR dim N - k.
@@ -3908,6 +3937,65 @@ end
 # `Base.modifyindex_atomic!(mem, order, op, val, i)` — the CPU-array target of
 # KA `@atomic arr[i] op= x`. On the SPMD path the index `i` is the per-lane
 # bucket (a lane vector, e.g. `idx[lane]`), so this is a SCATTER of W atomic
+# N-D workgroup index reconstruction for `@index(Global/Local/Group, NTuple)`.
+# The workgroup is flattened to a single `vector<W>` lane (W = prod(wg_dims))
+# and the grid to a 1-D `scf.parallel`; we recover each Julia (column-major)
+# per-dim coordinate by unflattening the per-lane step (0..W-1) over the
+# workgroup dims and the block id over the grid dims:
+#
+#   local[d]  = (step ÷ ∏wg[1:d-1]) % wg[d]            (per-lane vector, 0-based)
+#   block[d]  = (bid  ÷ ∏gridsz[1:d-1]) % gridsz[d]    (uniform scalar, 0-based)
+#   global[d] = block[d]·wg[d] + local[d] + 1          (per-lane vector, 1-based)
+#
+# Returns the N per-dim 1-based index Values (vectors for :global/:local; uniform
+# scalars for :group, which `_broadcast_to_match` lifts at the use site). The
+# enumeration order of work-items is irrelevant — each computes its own output —
+# so this need only be a bijection onto the ndrange, which per-dim divisibility
+# (checked in the launcher) guarantees.
+function _emit_nd_index!(lc::LowerCtx, kind::Symbol)
+    wg, nd = lc.wg_dims, lc.nd_dims
+    N = length(wg)
+    N == length(nd) ||
+        error("_emit_nd_index!: wg_dims $(wg) / nd_dims $(nd) rank mismatch")
+    lane_t = mlir_elem_type(lc.lane_idx_type)
+    W = prod(wg)
+    vec_t = IR.VectorType(1, Int[W], lane_t)
+    scalar(c) = IR.result(_arith.constant(; value=IR.Attribute(Int(c), lane_t)))
+    splat(c)  = IR.result(_vector.broadcast(scalar(c); vector=vec_t))
+    step  = _emit_step_vec(vec_t, lc.lane_idx_type, W)            # 0..W-1 vector
+    bid_i = IR.result(_arith.index_cast(lc.bids[1]; out=lane_t))  # 0-based scalar
+    gridsz = Int[nd[d] ÷ wg[d] for d in 1:N]
+
+    out = IR.Value[]
+    for d in 1:N
+        wstride = prod(@view wg[1:(d - 1)])      # 1 for d == 1
+        gstride = prod(@view gridsz[1:(d - 1)])
+        # local[d] (vector, 0-based)
+        local_d = step
+        wstride != 1 && (local_d = IR.result(_arith.divui(local_d, splat(wstride); result=vec_t)))
+        local_d = IR.result(_arith.remui(local_d, splat(wg[d]); result=vec_t))
+        if kind === :local
+            push!(out, IR.result(_arith.addi(local_d, splat(1); result=vec_t)))
+            continue
+        end
+        # block[d] (scalar, 0-based)
+        block_d = bid_i
+        gstride != 1 && (block_d = IR.result(_arith.divui(block_d, scalar(gstride); result=lane_t)))
+        block_d = IR.result(_arith.remui(block_d, scalar(gridsz[d]); result=lane_t))
+        if kind === :group
+            push!(out, IR.result(_arith.addi(block_d, scalar(1); result=lane_t)))
+            continue
+        end
+        # global[d] (vector) = block[d]·wg[d] + local[d] + 1
+        kind === :global || error("_emit_nd_index!: bad kind $kind")
+        bc  = IR.result(_arith.muli(block_d, scalar(wg[d]); result=lane_t))
+        bc1 = IR.result(_arith.addi(bc, scalar(1); result=lane_t))
+        bc1v = IR.result(_vector.broadcast(bc1; vector=vec_t))
+        push!(out, IR.result(_arith.addi(bc1v, local_d; result=vec_t)))
+    end
+    return out
+end
+
 # RMWs — one per lane into arr[bucket_lane] — mirroring the cuTile N-D
 # `emit_atomic_rmw!` lane loop. (A uniform/scalar index does a single atomic.)
 # We recover the base memref from the array arg (Argument or getfield(arr,:ref),
@@ -4007,6 +4095,35 @@ function emit_spmd_atomic_modifyindex!(lc::LowerCtx, args, @nospecialize(typ))
 end
 
 # `Base.memoryrefnew(ref_ssa, idx, bc)`
+# Flatten a rank-N memref to a contiguous rank-1 view for linear indexing.
+# Julia's N-D `A[i,j]` linearises to a SINGLE linear index in the IR (via
+# `getfield(A,:size)` + arith), so accesses bottom out in `memoryrefnew(ref,
+# linear)`; but the array arg is bound as a rank-N memref (so `memref.dim` can
+# still serve per-dim `size(A,d)`). A 1-index gather/load into a rank-N memref
+# is invalid ("requires N indices"), so we `reinterpret_cast` to `memref<?×T>`
+# of `prod(dims)` elements, stride 1 — valid because Julia arrays are
+# contiguous column-major. Rank ≤ 1 is returned unchanged.
+function _flatten_memref(base::IR.Value)
+    bt = IR.type(base)
+    n = ndims(bt)
+    n <= 1 && return base
+    idx_t = IR.IndexType()
+    dimc(d) = IR.result(_memref.dim(base,
+        IR.result(_arith.constant(; value=IR.Attribute(d, idx_t))); result=idx_t))
+    total = dimc(0)
+    for d in 1:(n - 1)
+        total = IR.result(_arith.muli(total, dimc(d); result=idx_t))
+    end
+    elem = eltype(bt)
+    res_t = IR.MemRefType(elem, Int[Int(IR.dynsize())], IR.Attribute(), IR.Attribute())
+    return IR.result(_memref.reinterpret_cast(
+        base, IR.Value[], IR.Value[total], IR.Value[];
+        result=res_t,
+        static_offsets=IR.DenseArrayAttribute(Int64[0]),
+        static_sizes=IR.DenseArrayAttribute(Int64[Int(IR.dynsize())]),
+        static_strides=IR.DenseArrayAttribute(Int64[1])))
+end
+
 function emit_spmd_memoryrefnew!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     ref_ref = args[1]
     ref_ref isa SSAValue && haskey(lc.field_refs, ref_ref.id) ||
@@ -4014,7 +4131,9 @@ function emit_spmd_memoryrefnew!(lc::LowerCtx, idx::Int, args, @nospecialize(typ
     (arg_id, fld) = lc.field_refs[ref_ref.id]
     fld === :ref || error(
         "SPMD memoryrefnew: ref operand must be `getfield(arr, :ref)` (got :$fld)")
-    base_memref = lc.arg_vals[arg_id]
+    # N-D array args are bound as rank-N memrefs (for `size`); N-D indexing
+    # linearises to one index, so flatten to rank-1 for the gather/scatter/load.
+    base_memref = _flatten_memref(lc.arg_vals[arg_id])
     elem_T = lc.arg_elem_types[arg_id]
 
     # Index: typically the lane Argument (varying vector). Materialise it; if

@@ -511,7 +511,7 @@ end
 
 # Cache for `ka_function`. Key shape mirrors `_spmd_kernel_cache`:
 # (f, argtypes, n_grid_dims, serial, lane_width, alignment).
-const _ka_kernel_cache = Dict{Tuple{Any, Type, Int, Bool, Int, Int}, CPUKernel}()
+const _ka_kernel_cache = Dict{Tuple{Any, Type, Int, Bool, Int, Int, Tuple, Tuple}, CPUKernel}()
 
 """
     ka_function(f, argtypes::Type; lane_width=16, alignment=16, serial=false) -> CPUKernel
@@ -529,8 +529,10 @@ function ka_function(@nospecialize(f), argtypes::Type;
                      lane_width::Int=16,
                      alignment::Int=16,
                      kernel_name=string(nameof(f), "_ka"),
-                     serial::Bool=false)
-    key = (f, argtypes, 1, serial, lane_width, alignment)
+                     serial::Bool=false,
+                     wg_dims::Vector{Int}=Int[lane_width],
+                     nd_dims::Vector{Int}=Int[lane_width])
+    key = (f, argtypes, 1, serial, lane_width, alignment, Tuple(wg_dims), Tuple(nd_dims))
     haskey(_ka_kernel_cache, key) && return _ka_kernel_cache[key]::CPUKernel
 
     # Standalone inference via Frontend (KA overlays live in
@@ -546,7 +548,8 @@ function ka_function(@nospecialize(f), argtypes::Type;
         error("ka_function: kernel must return Nothing, got $rettype")
 
     mod, param_julia_types, mlir_ctx, param_kinds =
-        lower_to_mlir_ka(sci, argtypes; kernel_name, lane_width, alignment)
+        lower_to_mlir_ka(sci, argtypes; kernel_name, lane_width, alignment,
+                         wg_dims, nd_dims)
 
     passes = serial ? SERIAL_PASSES : DEFAULT_PASSES
     so_path = compile_module_to_so(mod, mlir_ctx; kernel_name, passes)

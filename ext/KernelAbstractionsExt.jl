@@ -64,6 +64,21 @@ struct MLIRBackend <: KA.GPU end
 @overlay FE.METHOD_TABLE KA.__index_Group_Linear(ctx) = FE.Intrinsics.group_index()
 @overlay FE.METHOD_TABLE KA.groupsize(ctx)            = FE.Intrinsics.group_size()
 
+# `@index(Global/Local/Group, NTuple)` → unary `__index_*_NTuple(ctx)` returning
+# an `NTuple{N,Int}` of 1-based per-dim coords. We read the grid dimensionality
+# `N` straight off the ctx type (`CompilerMetadata{…, NDRange{N,…}}`) and pass it
+# to the marker so inference sees a concrete-arity tuple; the walker fills in the
+# per-dim vectors. (`@index(…, Cartesian)` / N-D `__validindex` masking are TODO.)
+@overlay FE.METHOD_TABLE KA.__index_Global_NTuple(
+        ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
+    FE.Intrinsics.global_ntuple(Val(N))
+@overlay FE.METHOD_TABLE KA.__index_Local_NTuple(
+        ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
+    FE.Intrinsics.local_ntuple(Val(N))
+@overlay FE.METHOD_TABLE KA.__index_Group_NTuple(
+        ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
+    FE.Intrinsics.group_ntuple(Val(N))
+
 # `__validindex(ctx)` — for launches where ndrange is a multiple of the
 # workgroup size, every lane is valid. Tighter (lane < ndrange) masking is a
 # TODO (thread `ndrange` through and emit a per-lane mask compare).
@@ -172,37 +187,34 @@ function (obj::KA.Kernel{MLIRBackend})(args...; ndrange=nothing,
                                                   workgroupsize=nothing)
     wg = _resolve_wgsize(obj, workgroupsize)
     nd = ndrange isa Integer ? (ndrange,) : ndrange
+    nd === nothing && error("MLIRBackend: ndrange must be specified")
 
-    # The lowering is strictly 1-D: a single `scf.parallel` grid dimension and a
-    # contiguous lane vector `bid*W .. bid*W+W-1`. A multi-dimensional ndrange
-    # or workgroupsize would be silently collapsed (`W=first(wg)`,
-    # `total=prod(nd)`), corrupting @index(Local/Group, Linear) and @groupsize
-    # while leaving @index(Global, Linear) correct — i.e. a silent wrong answer
-    # in any kernel that uses the group/local indices. Reject it explicitly.
-    length(wg) == 1 || error(
-        "MLIRBackend: multi-dimensional workgroupsize=$wg not supported " *
-        "(the backend lowers a 1-D workgroup); use a scalar/1-tuple size.")
-    (nd === nothing || length(nd) == 1) || error(
-        "MLIRBackend: multi-dimensional ndrange=$nd not supported " *
-        "(the backend lowers a 1-D grid); flatten to a 1-D ndrange.")
+    # N-D model: the workgroup is flattened to a single `vector<prod(wg)>` lane
+    # and the grid to a 1-D `scf.parallel` over `prod(nd)/prod(wg)` blocks; the
+    # N-D `@index(…,NTuple)` markers reconstruct per-dim coords by column-major
+    # unflatten. That reconstruction requires each ndrange dim to be an exact
+    # multiple of the matching workgroup dim (no masked/partial blocks yet), and
+    # the dimensionalities to agree.
+    length(wg) == length(nd) || error(
+        "MLIRBackend: ndrange $(nd) ($(length(nd))-D) and workgroupsize $(wg) " *
+        "($(length(wg))-D) must have the same number of dimensions.")
+    all(nd[d] % wg[d] == 0 for d in 1:length(wg)) || error(
+        "MLIRBackend: ndrange=$nd not a per-dim multiple of workgroupsize=$wg " *
+        "— masked launches not yet supported.")
+
+    wg_dims = collect(Int, wg)
+    nd_dims = collect(Int, nd)
+    W = prod(wg_dims)          # flat workgroup (lane) width
+    total = prod(nd_dims)      # total work-items
 
     _, _, iterspace, _ = KA.launch_config(obj, nd, wg)
-
     ctx = KA.mkcontext(obj, nd, iterspace)
     ctx_T = typeof(ctx)
     arg_types = map(typeof, args)
     full_argtypes = Tuple{ctx_T, arg_types...}
 
-    # Lane width = workgroup size. ndrange must be a multiple (the POC's
-    # `__validindex == true` overlay assumes that).
-    W = first(wg)
-    total = prod(nd)
-    total % W == 0 || error(
-        "MLIRBackend: ndrange=$nd not a multiple of workgroupsize=$wg " *
-        "— masked launches not yet supported")
-
     k = ka_function(obj.f, full_argtypes;
-                    lane_width=W,
+                    lane_width=W, wg_dims=wg_dims, nd_dims=nd_dims,
                     kernel_name=string(nameof(obj.f), "_ka"))
     k(args...; blocks=total ÷ W)
     return nothing

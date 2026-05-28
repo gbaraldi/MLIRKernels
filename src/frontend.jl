@@ -84,6 +84,20 @@ module Intrinsics
         Base.donotdelete(arr, val, idx)
         return compilerbarrier(:type, val)
     end
+
+    # N-D workgroup indices (1-based), as an `NTuple{N,Int}`. The KA extension
+    # overlays `__index_{Global,Local,Group}_NTuple(ctx)` onto these, reading the
+    # grid dimensionality `N` from the ctx type. The walker reconstructs the per-
+    # dim coordinate vectors (column-major unflatten of the flat lane/block) and
+    # registers them as the tuple's components, so `i, j = @index(…, NTuple)`
+    # binds `i`/`j` to the right per-lane vectors. Returning a concrete-arity
+    # `NTuple{N,Int}` is what lets inference destructure the result.
+    @noinline global_ntuple(::Val{N}) where {N} =
+        compilerbarrier(:type, ntuple(_ -> zero(Int), Val(N)))::NTuple{N,Int}
+    @noinline local_ntuple(::Val{N}) where {N} =
+        compilerbarrier(:type, ntuple(_ -> zero(Int), Val(N)))::NTuple{N,Int}
+    @noinline group_ntuple(::Val{N}) where {N} =
+        compilerbarrier(:type, ntuple(_ -> zero(Int), Val(N)))::NTuple{N,Int}
 end
 
 # Predicate mirroring cuTile's `isintrinsic`: a function defined in our

@@ -2291,4 +2291,33 @@ end
         end
     end
 
+    # Multi-dimensional support: N-D `@index(Global, NTuple)` + N-D array
+    # indexing `A[i,j]`. The workgroup is flattened to a 1-D lane vector, per-dim
+    # coords reconstructed by column-major unflatten, and `A[i,j]` linearised
+    # (column-major) to a gather/scatter over a flattened (`reinterpret_cast`)
+    # rank-1 view. 2-D transpose (KA's `naive_transpose`) is the end-to-end gate.
+    @testset "KA: multi-dim @index(Global, NTuple) + A[i,j]" begin
+        ka_loaded = try; @eval using KernelAbstractions; true; catch; false; end
+        if !ka_loaded
+            @info "KernelAbstractions not in this env — skipping multi-dim test"
+            @test true
+        else
+            KA = KernelAbstractions
+            Backend = Base.get_extension(MLIRKernels, :KernelAbstractionsExt).MLIRBackend
+            @eval begin
+                @kernel function _ka_transpose!(a, @Const(b))
+                    i, j = @index(Global, NTuple)
+                    @inbounds a[i, j] = b[j, i]
+                end
+            end
+            M = 8
+            b = MLIRKernels.aligned_array(Float32, (M, M); alignment=128)
+            copyto!(b, reshape(collect(Float32, 1:(M * M)), M, M))
+            a = MLIRKernels.aligned_array(Float32, (M, M); alignment=128)
+            fill!(a, 0f0)
+            (@eval _ka_transpose!)(Backend(), (4, 4))(a, b; ndrange=(M, M))
+            @test a == permutedims(b)            # full N-D index + linearised A[i,j]
+        end
+    end
+
 end
