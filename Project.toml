@@ -15,8 +15,15 @@ cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"
 [sources]
 MLIR = {path = "/home/gbaraldi/.julia/dev/MLIR"}
 
+[weakdeps]
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+
+[extensions]
+KernelAbstractionsExt = "KernelAbstractions"
+
 [compat]
 IRStructurizer = "0.6.2"
+KernelAbstractions = "0.9"
 LLVM_full_jll = "21.1.8"
 MLIR = "0.2"
 MLIR_jll = "18, 19, 20"

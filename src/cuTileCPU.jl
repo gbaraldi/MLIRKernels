@@ -118,7 +118,7 @@ include("launch.jl")
 include("reflect.jl")
 
 export aligned_array, cpu_function, parallel_for, @parallel_for,
-       spmd_function,
+       spmd_function, ka_function,
        code_mlir, code_mlir_lowered, code_llvm
 
 end # module

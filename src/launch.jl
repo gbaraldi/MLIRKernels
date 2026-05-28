@@ -159,6 +159,7 @@ function (k::CPUKernel)(args...; blocks)
               "launch passed $(length(grid))")
 
     is_spmd = k.kind === :spmd
+    is_ka   = k.kind === :ka
 
     # Walk runtime args, matching them against the kernel's expected param
     # kinds. AbstractArray → memref descriptor. Constants are dropped. Scalar
@@ -189,12 +190,13 @@ function (k::CPUKernel)(args...; blocks)
             # Alignment check: cuTile-mode always checks (per-arg from
             # ArraySpec); SPMD-mode checks only when the user requested an
             # alignment > Julia's default 16 (param_alignments populated).
-            if !is_spmd || align_idx ≤ length(k.param_alignments)
+            if !(is_spmd || is_ka) || align_idx ≤ length(k.param_alignments)
                 align = k.param_alignments[align_idx]
                 pointer_aligned(a, align) || error(
                     "CPUKernel: array arg #$(align_idx) (pointer $(repr(pointer(a)))) is not " *
                     "aligned to $(align) bytes" *
                     (is_spmd ? " required by spmd_function(...; alignment=$(align))" :
+                     is_ka   ? " required by ka_function(...; alignment=$(align))" :
                                " required by ArraySpec") *
                     ". Allocate with `cuTileCPU.aligned_array(...; alignment=$(align))`.")
             end
@@ -243,7 +245,10 @@ function (k::CPUKernel)(args...; blocks)
     # still has to pass it to match the ABI.
     seed = Base.rand(UInt32)
     GC.@preserve descs pin_targets begin
-        if is_spmd
+        if is_spmd || is_ka
+            # Same ABI as SPMD: memref descriptors + uniform scalars + grid;
+            # no implicit seed slot (kernels written for the KA / SPMD paths
+            # don't have access to `Intrinsics.kernel_state()`).
             _ccall_launch_spmd(k.fn, desc_ptrs, Tuple(scalar_vals),
                                Tuple(scalar_types), grid)
         else
@@ -499,4 +504,57 @@ function spmd_function(@nospecialize(f), args::Tuple; kwargs...)
         tt = Tuple{map(Core.Typeof, args)...}
     end
     return spmd_function(f, tt; kwargs...)
+end
+
+# Cache for `ka_function`. Key shape mirrors `_spmd_kernel_cache`:
+# (f, argtypes, n_grid_dims, serial, lane_width, alignment).
+const _ka_kernel_cache = Dict{Tuple{Any, Type, Int, Bool, Int, Int}, CPUKernel}()
+
+"""
+    ka_function(f, argtypes::Type; lane_width=16, alignment=16, serial=false) -> CPUKernel
+
+Compile a KernelAbstractions-style `gpu_*` kernel body via cuTileCPU's MLIR
+pipeline. `argtypes` is `Tuple{CtxType, ArgTypes...}` where the first slot
+is a `KernelAbstractions.CompilerMetadata{…}` type — that slot is *consumed*
+by the KA-intrinsic overlays (see `ext/KernelAbstractionsExt.jl`) and is
+not materialised as an MLIR parameter.
+
+Used internally by `(::Kernel{cuTileBackend})(...)`; users normally don't
+call this directly.
+"""
+function ka_function(@nospecialize(f), argtypes::Type;
+                     lane_width::Int=16,
+                     alignment::Int=16,
+                     kernel_name=string(nameof(f), "_ka"),
+                     serial::Bool=false)
+    key = (f, argtypes, 1, serial, lane_width, alignment)
+    haskey(_ka_kernel_cache, key) && return _ka_kernel_cache[key]::CPUKernel
+
+    sci, rettype, _, _ = _structured_with_analyses(f, argtypes)
+    rettype === Nothing ||
+        error("ka_function: kernel must return Nothing, got $rettype")
+
+    mod, param_julia_types, mlir_ctx, param_kinds =
+        lower_to_mlir_ka(sci, argtypes; kernel_name, lane_width, alignment)
+
+    passes = serial ? SERIAL_PASSES : DEFAULT_PASSES
+    so_path = compile_module_to_so(mod, mlir_ctx; kernel_name, passes)
+    h = Libdl.dlopen(so_path)
+    fn = Libdl.dlsym(h, Symbol("_mlir_ciface_" * kernel_name))
+
+    nmemref = count(==(:memref), param_kinds)
+    alignments = alignment > 16 ? fill(alignment, nmemref) : Int[]
+
+    # We reuse the `:spmd` kind for launch dispatch — the launcher's SPMD
+    # path drops a trailing Integer arg from the user-facing call. KA
+    # kernels don't have that trailing arg (the lane is synthesized in
+    # MLIR), so the user-call signature is `(args...; blocks)` with no
+    # placeholder — but cpu_function's launcher loops over args and skips
+    # the trailing Integer ONLY for SPMD. We set kind = :ka and add the
+    # corresponding branch in the launcher.
+    k = CPUKernel{typeof(f), argtypes}(f, so_path, h, fn,
+                                       param_julia_types, param_kinds,
+                                       1, alignments, :ka)
+    _ka_kernel_cache[key] = k
+    return k
 end

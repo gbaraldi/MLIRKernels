@@ -792,6 +792,187 @@ function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
 end
 
 # ----------------------------------------------------------------------------
+# KernelAbstractions-style entrypoint
+# ----------------------------------------------------------------------------
+#
+# Variant of `lower_to_mlir_spmd` for the KernelAbstractions kernel shape:
+#
+#     function gpu_foo(__ctx__::CompilerMetadata, A, B, C)
+#         @active_lane = KA.__validindex(__ctx__)              # overlay → true
+#         if @active_lane
+#             i = KA.__index_Global_Linear(__ctx__)            # overlay →
+#                                                              # __cutilecpu_spmd_lane_id()
+#             @inbounds C[i] = A[i] + B[i]
+#         end
+#     end
+#
+# The first arg is the KA `__ctx__` (a `CompilerMetadata{…}` struct). With the
+# overlay set up in `ext/KernelAbstractionsExt.jl`, the body never reads any
+# field of `__ctx__` — every reference to it has been folded to either a
+# constant or a call to the sentinel function `__cutilecpu_spmd_lane_id()`.
+# We therefore don't materialise the ctx as an MLIR parameter at all; we just
+# use its arg slot as the SPMD `lane_arg` so the existing walker
+# infrastructure (the lane vector, `__cutilecpu_spmd_lane_id` clause) lights
+# up unchanged.
+function lower_to_mlir_ka(sci::StructuredIRCode, argtypes::Type;
+                          kernel_name::String, lane_width::Int=16,
+                          alignment::Int=16, lane_idx_type::Type=Int64)
+    ctx = fresh_context()
+    mod_ref = Ref{IR.Module}()
+    param_julia_types = Type[]
+    param_kinds = Symbol[]
+
+    @with_context ctx begin
+        IR.load_all_available_dialects()
+        mod = IR.Module(IR.Location())
+        mod_ref[] = mod
+
+        @with_module mod begin
+            lc = LowerCtx(ctx, mod)
+            lc.spmd = true
+            lc.lane_width = lane_width
+            lc.lane_idx_type = lane_idx_type
+
+            idx_t = IR.IndexType()
+            param_mlir_types = IR.Type[]
+            param_arg_slots = Int[]
+
+            # Lane slot = first non-function, non-Const arg = the KA ctx.
+            lane_slot = 0
+            for (i, AT) in enumerate(sci.argtypes)
+                i == 1 && continue
+                AT isa Core.Const && continue
+                lane_slot = i
+                break
+            end
+            lane_slot == 0 && error(
+                "lower_to_mlir_ka: kernel has no non-Const args; expected a " *
+                "KernelAbstractions.CompilerMetadata ctx as the first arg")
+            lc.lane_arg = lane_slot
+
+            for (i, AT) in enumerate(sci.argtypes)
+                i == 1 && continue
+                i == lane_slot && continue
+                if AT isa Core.Const
+                    lc.arg_const[i] = AT.val
+                    continue
+                end
+                AT_wide = widenconst(AT)
+                if AT_wide <: AbstractArray
+                    eT = eltype(AT_wide)
+                    N  = ndims(AT_wide)
+                    elem = mlir_elem_type(eT)
+                    shape = fill(Int(IR.dynsize()), N)
+                    layout = if alignment > 16
+                        strides_mlir = Vector{String}(undef, N)
+                        for k in 1:N
+                            mlir_dim = N - k + 1
+                            strides_mlir[mlir_dim] = (k == 1) ? "1" : "?"
+                        end
+                        parse(IR.Attribute, "strided<[" * join(strides_mlir, ", ") * "]>")
+                    else
+                        IR.Attribute()
+                    end
+                    mr = IR.MemRefType(elem, shape, layout, IR.Attribute())
+                    push!(param_mlir_types, mr)
+                    push!(param_arg_slots, i)
+                    push!(param_julia_types, AT_wide)
+                    push!(param_kinds, :memref)
+                    lc.arg_elem_types[i] = eT
+                elseif AT_wide <: Number
+                    push!(param_mlir_types, mlir_elem_type(AT_wide))
+                    push!(param_arg_slots, i)
+                    push!(param_julia_types, AT_wide)
+                    push!(param_kinds, :scalar)
+                else
+                    error("cuTileCPU KA: unsupported arg type $AT_wide at slot $i " *
+                          "(only AbstractArray + Number args are wired up; the " *
+                          "first non-Const arg is consumed as the KA ctx)")
+                end
+            end
+
+            # Grid dim (a single `index` arg: nblocks).
+            grid_param_offset = length(param_mlir_types)
+            push!(param_mlir_types, idx_t)
+
+            ftype = IR.FunctionType(param_mlir_types, IR.Type[])
+            arg_locs = [IR.Location() for _ in 1:length(param_mlir_types)]
+            entry = IR.Block(param_mlir_types, arg_locs)
+            body_region = IR.Region()
+            push!(body_region, entry)
+
+            funcop = _func.func_(;
+                sym_name      = IR.Attribute(kernel_name),
+                function_type = IR.Attribute(ftype),
+                body          = body_region,
+            )
+            IR.setattr!(funcop, "llvm.emit_c_interface", IR.UnitAttribute())
+            push!(IR.body(mod), funcop)
+
+            raw_arg_vals = Dict{Int, IR.Value}()
+            for (k, slot) in enumerate(param_arg_slots)
+                raw_arg_vals[slot] = IR.argument(entry, k)
+                lc.arg_vals[slot] = raw_arg_vals[slot]
+            end
+            grid_val = IR.argument(entry, grid_param_offset + 1)
+
+            @with_block entry begin
+                c0 = IR.result(_arith.constant(; value=IR.Attribute(Int(0), idx_t)))
+                c1 = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
+
+                if alignment > 16
+                    align_attr = IR.Attribute(alignment, IR.Type(Int32))
+                    for (k, slot) in enumerate(param_arg_slots)
+                        param_kinds[k] === :memref || continue
+                        _memref.assume_alignment(
+                            raw_arg_vals[slot]; alignment=align_attr,
+                        )
+                    end
+                end
+
+                par_region = IR.Region()
+                par_block = IR.Block([idx_t], [IR.Location()])
+                push!(par_region, par_block)
+                _scf.parallel(
+                    IR.Value[c0],
+                    IR.Value[grid_val],
+                    IR.Value[c1],
+                    IR.Value[];
+                    results=IR.Type[], region=par_region,
+                )
+
+                @with_block par_block begin
+                    bid = IR.argument(par_block, 1)
+                    push!(lc.bids, bid)
+                    W_const = IR.result(_arith.constant(;
+                        value=IR.Attribute(Int(lane_width), idx_t)))
+                    lane_base_idx = IR.result(_arith.muli(bid, W_const; result=idx_t))
+                    lane_t = mlir_elem_type(lc.lane_idx_type)
+                    int_vec_t = IR.VectorType(1, Int[lane_width], lane_t)
+                    step_int = _emit_step_vec(int_vec_t, lc.lane_idx_type, lane_width)
+                    one_idx = IR.result(_arith.constant(;
+                        value=IR.Attribute(Int(1), idx_t)))
+                    base_p1_idx = IR.result(_arith.addi(lane_base_idx, one_idx;
+                                                       result=idx_t))
+                    base_p1_int = IR.result(_arith.index_cast(base_p1_idx; out=lane_t))
+                    base_splat = IR.result(_vector.broadcast(base_p1_int;
+                                                              vector=int_vec_t))
+                    lane_vec = IR.result(_arith.addi(base_splat, step_int;
+                                                    result=int_vec_t))
+                    lc.arg_vals[lane_slot] = lane_vec
+
+                    walk_block!(lc, sci.entry)
+                    _scf.reduce(IR.Value[]; reductions=IR.Region[])
+                end
+
+                _func.return_(IR.Value[])
+            end
+        end
+    end
+    return (mod_ref[], param_julia_types, ctx, param_kinds)
+end
+
+# ----------------------------------------------------------------------------
 # Block / statement walking
 # ----------------------------------------------------------------------------
 
@@ -1396,6 +1577,17 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             # support. Drop it (the LLVM-IR end will get a no-op).
             return nothing
         end
+    end
+
+    # Sentinel function emitted by KernelAbstractions overlays (see
+    # `ext/KernelAbstractionsExt.jl`): `KA.__index_Global_Linear(ctx)` is
+    # overlaid to `__cutilecpu_spmd_lane_id()`, which inference inlines as
+    # a call to a function we never define. The walker recognises the call
+    # in SPMD/KA mode and returns the lane vector synthesized at the top of
+    # the scf.parallel body.
+    if (fname === :__cutilecpu_spmd_lane_id || fname === :__ka_lane_id) &&
+       lc.spmd && haskey(lc.arg_vals, lc.lane_arg)
+        return lc.arg_vals[lc.lane_arg]
     end
 
     error("cuTileCPU.walk_call!: unhandled callee $fname " *
