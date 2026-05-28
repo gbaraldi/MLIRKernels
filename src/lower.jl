@@ -899,6 +899,11 @@ function walk_stmt!(lc::LowerCtx, idx::Int, @nospecialize(stmt), @nospecialize(t
     elseif stmt isa SSAValue
         # Naked SSA-to-SSA alias (`%a = %b`). Just forward.
         return get(lc.ssa_vals, stmt.id, nothing)
+    elseif stmt === nothing
+        # Literal `nothing` SSA — produced when an overlay'd void-returning
+        # function (e.g. KernelAbstractions.__synchronize → nothing) is
+        # inlined and its return value materialises as an SSA. Drop.
+        return nothing
     elseif stmt isa Core.Compiler.PiNode || (isdefined(Core, :PiNode) && stmt isa Core.PiNode)
         # PiNode: type-refinement wrapper around a Value. Forward the value.
         inner = stmt.val
