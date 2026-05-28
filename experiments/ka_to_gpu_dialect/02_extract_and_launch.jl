@@ -26,7 +26,7 @@
 #     ↓  CUDA.CuModule(ptx)                    -- driver-loaded
 #     ↓  cudacall(...)                         -- launched
 
-using cuTileCPU
+using MLIRKernels
 using MLIR
 const IR = MLIR.IR
 using LLVM
@@ -53,7 +53,7 @@ const GPU_PASSES = String[
 ]
 _pipeline_str(passes) = "builtin.module(" * join(passes, ",") * ")"
 
-ctx = cuTileCPU.fresh_context()
+ctx = MLIRKernels.fresh_context()
 IR.activate(ctx)
 
 mlir_text = read(joinpath(HERE, "01_handwritten_vadd_gpu.mlir"), String)

@@ -3,7 +3,7 @@
 
 using cuTile
 const ct = cuTile
-using cuTileCPU
+using MLIRKernels
 using Printf, LinearAlgebra
 
 function matmul_kernel(A::ct.TileArray{T,2}, B::ct.TileArray{T,2}, C::ct.TileArray{T,2},
@@ -42,16 +42,16 @@ end
 ngflops(t_ns, M, N, K) = 2.0 * M * N * K / t_ns
 
 function bench_tile(M, N, K, tile)
-    A = cuTileCPU.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
-    B = cuTileCPU.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
-    C = cuTileCPU.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
+    A = MLIRKernels.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
+    B = MLIRKernels.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
+    C = MLIRKernels.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
     # warm + cache compile
     t_compile_start = time_ns()
-    cuTileCPU.parallel_for(matmul_kernel,
+    MLIRKernels.parallel_for(matmul_kernel,
         (A, B, C, ct.Constant(tile), ct.Constant(tile), ct.Constant(tile));
         blocks = (M ÷ tile, N ÷ tile))
     t_compile = (time_ns() - t_compile_start) / 1e9
-    t = time_min(() -> cuTileCPU.parallel_for(matmul_kernel,
+    t = time_min(() -> MLIRKernels.parallel_for(matmul_kernel,
         (A, B, C, ct.Constant(tile), ct.Constant(tile), ct.Constant(tile));
         blocks = (M ÷ tile, N ÷ tile)))
     return t, t_compile
@@ -75,9 +75,9 @@ function main()
     println()
 
     # BLAS reference
-    A = cuTileCPU.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
-    B = cuTileCPU.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
-    C = cuTileCPU.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
+    A = MLIRKernels.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
+    B = MLIRKernels.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
+    C = MLIRKernels.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
     t_blas = time_min(() -> mul!(C, A, B))
     @printf("  %-12s %12s %14.1f %18.1f\n",
             "OpenBLAS", "—", t_blas/1e3, ngflops(t_blas, M, N, K))

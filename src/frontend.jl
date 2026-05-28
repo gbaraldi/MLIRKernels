@@ -31,7 +31,7 @@ const CC = Core.Compiler
 using IRStructurizer: StructuredIRCode
 
 # ----------------------------------------------------------------------------
-# Frontend intrinsics — markers the cuTileCPU walker recognises by name.
+# Frontend intrinsics — markers the MLIRKernels walker recognises by name.
 # ----------------------------------------------------------------------------
 #
 # Each is `@noinline` with a `compilerbarrier(:type, …)` body so that, under

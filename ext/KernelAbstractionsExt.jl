@@ -2,16 +2,16 @@ module KernelAbstractionsExt
 
 # Mirrors the CUDA.jl / AMDGPU.jl / oneAPI.jl / Metal.jl KA backend pattern:
 #
-#   1. `struct cuTileBackend <: KA.GPU` so KA's `@kernel` macro picks the
+#   1. `struct MLIRBackend <: KA.GPU` so KA's `@kernel` macro picks the
 #      `gpu_*` (SIMT) function body, not the `cpu_*` (loop-splitting) one.
 #
-#   2. `@overlay cuTileCPU.Frontend.METHOD_TABLE` redefinitions of the KA
-#      intrinsics. Inference runs under cuTileCPU's *own* Frontend
+#   2. `@overlay MLIRKernels.Frontend.METHOD_TABLE` redefinitions of the KA
+#      intrinsics. Inference runs under MLIRKernels's *own* Frontend
 #      interpreter (src/frontend.jl) — NOT cuTile's — so the overlays map KA
-#      intrinsics onto cuTileCPU's own `Frontend.Intrinsics` markers, which
+#      intrinsics onto MLIRKernels's own `Frontend.Intrinsics` markers, which
 #      the walker recognises by name. No cuTile dependency.
 #
-#   3. `(::Kernel{cuTileBackend})(args...; ndrange, workgroupsize)` builds the
+#   3. `(::Kernel{MLIRBackend})(args...; ndrange, workgroupsize)` builds the
 #      KA `CompilerMetadata` type and calls `ka_function` → `lower_to_mlir_ka`
 #      → in-process MLIR pipeline → clang → dlopen, then dispatches the grid
 #      via the standard SPMD-style launch path.
@@ -25,8 +25,8 @@ module KernelAbstractionsExt
 using KernelAbstractions
 const KA = KernelAbstractions
 const NDI = KernelAbstractions.NDIteration
-using cuTileCPU
-const FE = cuTileCPU.Frontend
+using MLIRKernels
+const FE = MLIRKernels.Frontend
 
 import Base.Experimental: @overlay
 
@@ -34,7 +34,7 @@ import Base.Experimental: @overlay
 # 1. Backend
 # ----------------------------------------------------------------------------
 
-struct cuTileBackend <: KA.GPU end
+struct MLIRBackend <: KA.GPU end
 
 # ----------------------------------------------------------------------------
 # 2. Overlays into the Frontend method table
@@ -60,9 +60,9 @@ struct cuTileBackend <: KA.GPU end
 
 # `SharedMemory` / `Scratchpad` — not yet wired up (Phase B / B7,B8).
 @overlay FE.METHOD_TABLE KA.SharedMemory(::Type{T}, ::Val, ::Val) where {T} =
-    error("cuTileBackend: @localmem / SharedMemory not yet implemented")
+    error("MLIRBackend: @localmem / SharedMemory not yet implemented")
 @overlay FE.METHOD_TABLE KA.Scratchpad(ctx, ::Type, ::Val) =
-    error("cuTileBackend: @private / Scratchpad not yet implemented")
+    error("MLIRBackend: @private / Scratchpad not yet implemented")
 
 # ----------------------------------------------------------------------------
 # 3. KA backend protocol
@@ -72,35 +72,35 @@ struct cuTileBackend <: KA.GPU end
 # synchronisation / copyto! all fall back to KA's default `<: KA.GPU`
 # behaviour on the host (we're CPU-targeting, so host == device).
 
-KA.allocate(::cuTileBackend, ::Type{T}, dims::Tuple) where {T} =
-    cuTileCPU.aligned_array(T, dims; alignment=128)
+KA.allocate(::MLIRBackend, ::Type{T}, dims::Tuple) where {T} =
+    MLIRKernels.aligned_array(T, dims; alignment=128)
 
-KA.zeros(b::cuTileBackend, ::Type{T}, dims::Tuple) where {T} =
+KA.zeros(b::MLIRBackend, ::Type{T}, dims::Tuple) where {T} =
     fill!(KA.allocate(b, T, dims), zero(T))
-KA.ones(b::cuTileBackend, ::Type{T}, dims::Tuple) where {T} =
+KA.ones(b::MLIRBackend, ::Type{T}, dims::Tuple) where {T} =
     fill!(KA.allocate(b, T, dims), one(T))
 
-KA.synchronize(::cuTileBackend) = nothing
-KA.functional(::cuTileBackend) = true
-KA.argconvert(::cuTileBackend, x) = x
-# NOTE: deliberately no `KA.get_backend(::Array) = cuTileBackend()`. Plain
+KA.synchronize(::MLIRBackend) = nothing
+KA.functional(::MLIRBackend) = true
+KA.argconvert(::MLIRBackend, x) = x
+# NOTE: deliberately no `KA.get_backend(::Array) = MLIRBackend()`. Plain
 # `Array` already dispatches to KA's `CPU()` backend, and overriding here
 # would silently steal every `Array`-touching KA call from the default
 # (and fails precompile with method-overwriting anyway). Users select the
-# backend explicitly: `vadd!(cuTileBackend(), 16)(C, A, B; ndrange=N)`.
+# backend explicitly: `vadd!(MLIRBackend(), 16)(C, A, B; ndrange=N)`.
 
 # `mkcontext` and `launch_config` follow KA's GPU defaults (no per-backend
 # specialisation needed) by reusing the generic methods. We provide a
 # minimal stub so KA's `partition` can build the CompilerMetadata type.
 
-KA.mkcontext(kernel::KA.Kernel{cuTileBackend}, ndrange, iterspace) =
+KA.mkcontext(kernel::KA.Kernel{MLIRBackend}, ndrange, iterspace) =
     KA.CompilerMetadata{KA.ndrange(kernel), NDI.NoDynamicCheck}(ndrange, iterspace)
 
-function KA.launch_config(kernel::KA.Kernel{cuTileBackend}, ndrange, workgroupsize)
+function KA.launch_config(kernel::KA.Kernel{MLIRBackend}, ndrange, workgroupsize)
     ndrange isa Integer && (ndrange = (ndrange,))
     workgroupsize isa Integer && (workgroupsize = (workgroupsize,))
     if KA.workgroupsize(kernel) <: KA.NDIteration.DynamicSize && workgroupsize === nothing
-        workgroupsize = (16,)  # default lane width for cuTileCPU SPMD lowering
+        workgroupsize = (16,)  # default lane width for MLIRKernels SPMD lowering
     end
     iterspace, dynamic = KA.partition(kernel, ndrange, workgroupsize)
     return ndrange, workgroupsize, iterspace, dynamic
@@ -113,7 +113,7 @@ end
 # Resolve the effective workgroupsize. KA's StaticSize{(N,)} encodes it in
 # the kernel type; DynamicSize falls back to the launch-time kwarg or our
 # 16-lane default.
-function _resolve_wgsize(obj::KA.Kernel{cuTileBackend}, workgroupsize)
+function _resolve_wgsize(obj::KA.Kernel{MLIRBackend}, workgroupsize)
     wg_T = KA.workgroupsize(obj)
     if wg_T <: NDI.StaticSize
         return NDI.get(wg_T)
@@ -123,7 +123,7 @@ function _resolve_wgsize(obj::KA.Kernel{cuTileBackend}, workgroupsize)
     return workgroupsize
 end
 
-function (obj::KA.Kernel{cuTileBackend})(args...; ndrange=nothing,
+function (obj::KA.Kernel{MLIRBackend})(args...; ndrange=nothing,
                                                   workgroupsize=nothing)
     wg = _resolve_wgsize(obj, workgroupsize)
     nd = ndrange isa Integer ? (ndrange,) : ndrange
@@ -139,7 +139,7 @@ function (obj::KA.Kernel{cuTileBackend})(args...; ndrange=nothing,
     W = first(wg)
     total = prod(nd)
     total % W == 0 || error(
-        "cuTileBackend: ndrange=$nd not a multiple of workgroupsize=$wg " *
+        "MLIRBackend: ndrange=$nd not a multiple of workgroupsize=$wg " *
         "— masked launches not yet supported")
 
     k = ka_function(obj.f, full_argtypes;

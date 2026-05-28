@@ -145,7 +145,7 @@ function run_pipeline!(mod::IR.Module; passes=DEFAULT_PASSES)
     # MlirLogicalResult is a struct holding `.value::Int32` — nonzero is
     # success, zero is failure. (The `mlirLogicalResultIs*` helper symbols
     # aren't exported from libMLIR-C, so we inspect the field directly.)
-    status.value == 0 && error("cuTileCPU pass pipeline failed")
+    status.value == 0 && error("MLIRKernels pass pipeline failed")
     return mod
 end
 
@@ -227,7 +227,7 @@ The .so is rpath-linked against libomp from `LLVMOpenMP_jll` (or
 function compile_module_to_so(mod::IR.Module, mlir_ctx::IR.Context;
                               kernel_name::String, opt_level::Int=2,
                               passes=DEFAULT_PASSES, clang::String=_clang())
-    workdir = mktempdir(; prefix="cuTileCPU_$(kernel_name)_")
+    workdir = mktempdir(; prefix="MLIRKernels_$(kernel_name)_")
     llvm_path = joinpath(workdir, "$(kernel_name).ll")
     so_path   = joinpath(workdir, "$(kernel_name).so")
 

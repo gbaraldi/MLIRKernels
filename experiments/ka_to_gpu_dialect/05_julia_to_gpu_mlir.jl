@@ -1,5 +1,5 @@
 # Step 3 (design-doc step 1): Julia source → gpu.module MLIR, no
-# hand-written MLIR. Uses cuTileCPU's NEW `lower_to_mlir_gpu` SIMT walker.
+# hand-written MLIR. Uses MLIRKernels's NEW `lower_to_mlir_gpu` SIMT walker.
 #
 # This closes the frontend half of the GPU path. Experiments 01-04 ran
 # hand-written gpu-dialect MLIR through the pipeline; here the gpu.module
@@ -16,7 +16,7 @@
 #     baked into the walker)
 
 using cuTile          # the inference/structurizer pipeline
-using cuTileCPU
+using MLIRKernels
 
 # Plain Julia SIMT kernel. `gid` is the synthesized global thread index;
 # the host never passes it (the launcher drops the trailing arg, like the
@@ -36,13 +36,13 @@ println("Julia source → SCI → gpu.module MLIR")
 println("=" ^ 60)
 
 # Run cuTile's inference + structurizer to get the SCI (+ analyses).
-sci, rettype, _, _ = cuTileCPU._structured_with_analyses(vadd_simt, argtypes)
+sci, rettype, _, _ = MLIRKernels._structured_with_analyses(vadd_simt, argtypes)
 @assert rettype === Nothing
 
 mod, param_julia_types, mlir_ctx, param_kinds =
-    cuTileCPU.lower_to_mlir_gpu(sci, argtypes; kernel_name="vadd")
+    MLIRKernels.lower_to_mlir_gpu(sci, argtypes; kernel_name="vadd")
 
-cuTileCPU.MLIR.IR.activate(mlir_ctx)
+MLIRKernels.MLIR.IR.activate(mlir_ctx)
 mlir_text = sprint(show, mod)
 println(mlir_text)
 
@@ -77,8 +77,8 @@ println(allok ? "\n✓ All checks passed — Julia → gpu.module MLIR works" :
 # ---------------------------------------------------------------------------
 
 using LLVM
-const IR = cuTileCPU.MLIR.IR
-const MLIRAPI = cuTileCPU.MLIR.API
+const IR = MLIRKernels.MLIR.IR
+const MLIRAPI = MLIRKernels.MLIR.API
 
 const GPU_PASSES = String[
     "nvvm-attach-target{chip=sm_90 features=+ptx80}",

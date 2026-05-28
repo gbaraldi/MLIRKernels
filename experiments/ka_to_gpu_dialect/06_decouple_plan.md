@@ -33,8 +33,8 @@ Each step leaves the tree green and is independently verifiable. The Frontend mo
 ### Step 0 — Establish a green baseline
 - **File(s):** none (read-only).
 - **Change:** none.
-- **Verify:** `julia --project=. -e 'using cuTileCPU'` then `julia --project=. test/runtests.jl`. Capture which testsets pass — specifically `"SPMD: vadd"` (`runtests.jl:2051`) and `"SPMD: vadd with alignment=128"` (`:2089`).
-- **If precompile fails** (the `Zstd_jll`/`LLVM_full_jll` issue): fix the environment first — `julia --project=. -e 'using Pkg; Pkg.add("Zstd_jll"); Pkg.resolve()'` or pin a working `LLVM_full_jll`. **Do not proceed** until `using cuTileCPU` works and the two SPMD testsets are green. Every step below depends on this.
+- **Verify:** `julia --project=. -e 'using MLIRKernels'` then `julia --project=. test/runtests.jl`. Capture which testsets pass — specifically `"SPMD: vadd"` (`runtests.jl:2051`) and `"SPMD: vadd with alignment=128"` (`:2089`).
+- **If precompile fails** (the `Zstd_jll`/`LLVM_full_jll` issue): fix the environment first — `julia --project=. -e 'using Pkg; Pkg.add("Zstd_jll"); Pkg.resolve()'` or pin a working `LLVM_full_jll`. **Do not proceed** until `using MLIRKernels` works and the two SPMD testsets are green. Every step below depends on this.
 - **Rollback:** n/a.
 
 ### Step 1 — Port the intrinsic-name rewrite into the Frontend path (THE RISKIEST STEP — do it first, standalone, before any switch)
@@ -51,7 +51,7 @@ This is R1/R2/R3 from the audit. It must land and be verified while SPMD/KA stil
     - **`:bitcast` (R2 — arg-order):** raw `Core.Intrinsics.bitcast(T, x)` has args `(T, x)`; `emit_bitcast!` (`lower.jl:2893`) expects `(value, type)`. Add a `:bitcast` case that detects arg order — if `args[1]` resolves to a `Type`, swap to `emit_bitcast!(lc, [args[2], args[1]], typ)`. (The cuTile-rewritten form already arrives swapped, so guard on which arg is the `Type`.)
     - **`:ifelse` (R3):** `Core.ifelse`→ existing `:select` emitter.
   - Gate none of these on `lc.spmd` — they are pure scalar/vector arith and are valid on any path; the cuTile path simply never produces raw names so the new cases are dead there.
-- **Verify (while still on old path):** `julia --project=. test/runtests.jl` — the 2 SPMD testsets stay green (new cases are dead until Step 3). Then a standalone check that the new cases compile: a temporary `@test` lowering a Frontend SCI of `vadd_spmd` (build via `cuTileCPU.Frontend.structured(vadd_spmd, Tuple{Vector{Float32},Vector{Float32},Vector{Float32},Int})` then walk) — must produce `arith.addf` + `vector<16xf32>`, **not** throw `unhandled callee :add_float`. Add a branchy kernel (`c[i] = a[i] > 0f0 ? a[i] : b[i]`) to exercise `:cmpf`/`:ifelse`/`:select` (R3 has no existing coverage).
+- **Verify (while still on old path):** `julia --project=. test/runtests.jl` — the 2 SPMD testsets stay green (new cases are dead until Step 3). Then a standalone check that the new cases compile: a temporary `@test` lowering a Frontend SCI of `vadd_spmd` (build via `MLIRKernels.Frontend.structured(vadd_spmd, Tuple{Vector{Float32},Vector{Float32},Vector{Float32},Int})` then walk) — must produce `arith.addf` + `vector<16xf32>`, **not** throw `unhandled callee :add_float`. Add a branchy kernel (`c[i] = a[i] > 0f0 ? a[i] : b[i]`) to exercise `:cmpf`/`:ifelse`/`:select` (R3 has no existing coverage).
 - **Rollback:** revert the added `walk_call!` cases. Old path unaffected (it never hit them).
 - **Why riskiest:** if this is wrong or incomplete, Steps 3-4 produce a hard throw on real kernels, and the failure mode (`unhandled callee :X`) only surfaces for the *specific* ops a kernel uses — so incomplete coverage ships latent. Porting `INTRINSIC_RULES` in full (every row of `canonicalize.jl:17-68`) up front is the mitigation.
 
@@ -74,24 +74,24 @@ CHANGE-SET Edit 4 + REGRESSION R4. Must be one atomic change (overlay table + in
 - **File(s):** `ext/KernelAbstractionsExt.jl` (delete `using cuTile`/`const ct` at `:22-23`; replace overlay+`__init__` block `:28-93`) AND `src/launch.jl:533` (`ka_function` → `Frontend.structured`).
 - **Change:**
   - Delete `using cuTile`/`const ct` (`:22-23`).
-  - `const Frontend = cuTileCPU.Frontend`.
+  - `const Frontend = MLIRKernels.Frontend`.
   - Overlays into `Frontend.METHOD_TABLE`: `KA.__index_Global_Linear(ctx) = Frontend.Intrinsics.global_index()`; `KA.__validindex(ctx) = true`; `KA.__synchronize() = Frontend.Intrinsics.barrier()`; `KA.SharedMemory(...)`/`KA.Scratchpad(...)` → `error(...)` stubs.
   - Delete the `__init__` `Core.eval`-into-`cuTile.Intrinsics` hack — overlays now register at precompile against our own table (legal: adding methods for a foreign generic into *our* table).
   - `launch.jl:533`: `sci, rettype = Frontend.structured(f, argtypes)`.
-- **Verify:** Precompile cuTileCPU, then `using KernelAbstractions` to load the ext (must precompile with **no** `__init__` eval). Run the KA regression test added in Step 4a below.
+- **Verify:** Precompile MLIRKernels, then `using KernelAbstractions` to load the ext (must precompile with **no** `__init__` eval). Run the KA regression test added in Step 4a below.
 - **Rollback:** restore the old `ext/KernelAbstractionsExt.jl` block + `launch.jl:533`. **Critical:** if rolled back, also revert any `Frontend.Intrinsics.barrier`/`global_index` references that only the ext used.
 
 ### Step 4a — Add the missing KA regression test BEFORE relying on Step 4 (R5)
 R5: there are **zero** KA tests today, so Step 4 is otherwise unverifiable. Land the test as part of Step 4.
 - **File(s):** `test/runtests.jl` (new `@testset "KA: vadd"`).
-- **Change:** A KA `@kernel function vadd_ka(a,b,c) i=@index(Global,Linear); c[i]=a[i]+b[i] end`, launched on `cuTileBackend()`, asserting `c ≈ a .+ b`; plus `code_mlir` reflection asserting `arith.addf` and that inference left a `:global_index` call (not an inlined body — proves Frontend's default opt params keep the `@noinline` intrinsic alive, and Step 2's `:global_index` clause fires). Add a `@synchronize` no-op kernel asserting it compiles (Step 2 `:barrier` clause).
+- **Change:** A KA `@kernel function vadd_ka(a,b,c) i=@index(Global,Linear); c[i]=a[i]+b[i] end`, launched on `MLIRBackend()`, asserting `c ≈ a .+ b`; plus `code_mlir` reflection asserting `arith.addf` and that inference left a `:global_index` call (not an inlined body — proves Frontend's default opt params keep the `@noinline` intrinsic alive, and Step 2's `:global_index` clause fires). Add a `@synchronize` no-op kernel asserting it compiles (Step 2 `:barrier` clause).
 - **Verify:** `julia --project=. test/runtests.jl`.
 - **Rollback:** remove the testset.
 
 ### Step 5 — Zero-cuTile audit + experiments
 CHANGE-SET Edit 5. Confirmation only.
 - **File(s):** `ext/KernelAbstractionsExt.jl`, `experiments/ka_to_gpu_dialect/` (the GPU experiments; `07_*` referenced in the change-set lives here).
-- **Change:** `grep -n 'cuTile\|\bct\b' ext/KernelAbstractionsExt.jl` must return only comments. Repoint the GPU experiments' SCI construction to `cuTileCPU.Frontend.structured` (experiment-local, outside the package). Do **not** remove `_structured_with_analyses` — `cpu_function` (`launch.jl:109`) and `reflect.jl` tile path still need it.
+- **Change:** `grep -n 'cuTile\|\bct\b' ext/KernelAbstractionsExt.jl` must return only comments. Repoint the GPU experiments' SCI construction to `MLIRKernels.Frontend.structured` (experiment-local, outside the package). Do **not** remove `_structured_with_analyses` — `cpu_function` (`launch.jl:109`) and `reflect.jl` tile path still need it.
 - **Verify:** run the GPU experiment in `experiments/ka_to_gpu_dialect/` (the highest-numbered driver) — it must lower via Frontend and emit `gpu.thread_id`/`gpu.block_id`. `julia --project=. test/runtests.jl` full pass.
 - **Rollback:** experiments are non-package; revert individually.
 
@@ -281,19 +281,19 @@ with:
 
 The rest of `ka_function` (`lower_to_mlir_ka` call at `:537-538`, kind `:ka` at `:555-557`) is unchanged. `lower_to_mlir_ka` already takes the first non-Const arg as the lane (`lower.jl:842-852`) — works identically on the Frontend SCI.
 
-**GPU path (`lower_to_mlir_gpu`):** the function itself needs no change — the sentinel it depends on is now handled by Edit 1 (`:global_index`). Its only callers are the experiments (`05/06/07_*.jl`), which call `lower_to_mlir_gpu` directly with an SCI they built themselves. To make them cuTile-free, those experiments should build the SCI via `cuTileCPU.Frontend.structured` instead of whatever cuTile path they use now — but that is experiment-local and outside the package edit. If a packaged `gpu_function` entry point is desired, add it mirroring `ka_function` (same `Frontend.structured` call, then `lower_to_mlir_gpu(sci, argtypes; kernel_name, ctx_arg=…)`). Not required for the stated goal.
+**GPU path (`lower_to_mlir_gpu`):** the function itself needs no change — the sentinel it depends on is now handled by Edit 1 (`:global_index`). Its only callers are the experiments (`05/06/07_*.jl`), which call `lower_to_mlir_gpu` directly with an SCI they built themselves. To make them cuTile-free, those experiments should build the SCI via `MLIRKernels.Frontend.structured` instead of whatever cuTile path they use now — but that is experiment-local and outside the package edit. If a packaged `gpu_function` entry point is desired, add it mirroring `ka_function` (same `Frontend.structured` call, then `lower_to_mlir_gpu(sci, argtypes; kernel_name, ctx_arg=…)`). Not required for the stated goal.
 
-**Note on `Frontend` visibility from `launch.jl`:** `frontend.jl` is `include`d at `cuTileCPU.jl:115`, defining submodule `cuTileCPU.Frontend`. `launch.jl` is included at `:118` into the same `cuTileCPU` module scope, so bare `Frontend.structured` resolves. No import line needed.
+**Note on `Frontend` visibility from `launch.jl`:** `frontend.jl` is `include`d at `MLIRKernels.jl:115`, defining submodule `MLIRKernels.Frontend`. `launch.jl` is included at `:118` into the same `MLIRKernels` module scope, so bare `Frontend.structured` resolves. No import line needed.
 
 ---
 
 ## Edit 4 — KA extension rewrite (`ext/KernelAbstractionsExt.jl`)
 
 Replace the `cuTile.cuTileMethodTable` overlays + the `__init__` `cuTile.Intrinsics` eval hack with overlays into `Frontend.METHOD_TABLE`. All of it works at precompile because:
-- We overlay into **our own** module's method table (`cuTileCPU.Frontend.METHOD_TABLE`) — defining an `@overlay` method for a foreign generic (`KA.__index_Global_Linear`) in our table is legal at precompile (it adds a method to *our* table, not KA's).
+- We overlay into **our own** module's method table (`MLIRKernels.Frontend.METHOD_TABLE`) — defining an `@overlay` method for a foreign generic (`KA.__index_Global_Linear`) in our table is legal at precompile (it adds a method to *our* table, not KA's).
 - The intrinsics referenced (`Frontend.Intrinsics.global_index`, `Frontend.Intrinsics.barrier`) already exist in our package — no cross-package `eval`, no `__init__`.
 
-The `cuTile`/`ct` import is no longer needed for the intrinsic plumbing. It is still needed only for the backend `<: KA.GPU` machinery? No — `cuTileBackend <: KA.GPU` (`:32`) uses only KA. `cuTileCPU.aligned_array` (`:104`) uses cuTileCPU. **The `using cuTile` / `const ct` lines become dead** and should be removed (Edit 5 goal: zero cuTile).
+The `cuTile`/`ct` import is no longer needed for the intrinsic plumbing. It is still needed only for the backend `<: KA.GPU` machinery? No — `MLIRBackend <: KA.GPU` (`:32`) uses only KA. `MLIRKernels.aligned_array` (`:104`) uses MLIRKernels. **The `using cuTile` / `const ct` lines become dead** and should be removed (Edit 5 goal: zero cuTile).
 
 New file shape for `ext/KernelAbstractionsExt.jl` — change the header/overlay region (lines 19-93). Concretely:
 
@@ -313,15 +313,15 @@ Replace the entire overlay + `__init__` block, `ext/KernelAbstractionsExt.jl:28-
 # 1. Backend
 # ----------------------------------------------------------------------------
 
-struct cuTileBackend <: KA.GPU end
+struct MLIRBackend <: KA.GPU end
 
 # ----------------------------------------------------------------------------
-# 2. Overlays into cuTileCPU's Frontend method table
+# 2. Overlays into MLIRKernels's Frontend method table
 # ----------------------------------------------------------------------------
 #
 # The KA `@kernel` macro emits a `gpu_*` body that calls a handful of KA
-# intrinsics on the `__ctx__`. We redirect those onto cuTileCPU's standalone
-# Frontend (cuTileCPU.Frontend), whose interpreter applies METHOD_TABLE and
+# intrinsics on the `__ctx__`. We redirect those onto MLIRKernels's standalone
+# Frontend (MLIRKernels.Frontend), whose interpreter applies METHOD_TABLE and
 # uses DEFAULT optimization params (so our `@noinline` marker intrinsics
 # survive inference for the walker to intercept):
 #
@@ -335,11 +335,11 @@ struct cuTileBackend <: KA.GPU end
 #       The walker's `:barrier` clause emits a no-op on the CPU SIMD path
 #       (one block == one SIMD vector; no cross-lane barrier).
 #
-# All of this is legal at PRECOMPILE: we add methods to cuTileCPU's OWN
-# overlay table and reference cuTileCPU's OWN intrinsics — no cross-package
+# All of this is legal at PRECOMPILE: we add methods to MLIRKernels's OWN
+# overlay table and reference MLIRKernels's OWN intrinsics — no cross-package
 # binding mutation, hence no `__init__` eval hack.
 
-const Frontend = cuTileCPU.Frontend
+const Frontend = MLIRKernels.Frontend
 
 Base.Experimental.@overlay Frontend.METHOD_TABLE KA.__index_Global_Linear(ctx) =
     Frontend.Intrinsics.global_index()
@@ -351,9 +351,9 @@ Base.Experimental.@overlay Frontend.METHOD_TABLE KA.__synchronize() =
 
 # `SharedMemory` / `Scratchpad` — not yet wired up.
 Base.Experimental.@overlay Frontend.METHOD_TABLE KA.SharedMemory(::Type{T}, ::Val, ::Val) where {T} =
-    error("cuTileBackend: @localmem / SharedMemory not yet implemented")
+    error("MLIRBackend: @localmem / SharedMemory not yet implemented")
 Base.Experimental.@overlay Frontend.METHOD_TABLE KA.Scratchpad(ctx, ::Type, ::Val) =
-    error("cuTileBackend: @private / Scratchpad not yet implemented")
+    error("MLIRBackend: @private / Scratchpad not yet implemented")
 ```
 
 Notes:
@@ -369,9 +369,9 @@ After Edits 1-4, audit:
 
 1. **`launch.jl`** — `spmd_function`/`ka_function` no longer call `_structured_with_analyses` (the only cuTile touchpoint they had). The shared `(k::CPUKernel)(...)` launcher (`:155-261`) and `_ccall_launch_spmd` (`:395-412`) use no cuTile for `:spmd`/`:ka` kinds. The `seed = Base.rand(UInt32)` at `:246` is computed unconditionally but only *used* in the `else` (cuTile) branch (`:255`); harmless, not a dependency. **Clean.** (Do **not** remove `_structured_with_analyses` itself — `cpu_function` at `:109` and `reflect.jl:19` still need it for the cuTile tile path.)
 
-2. **`lower.jl`** — `lower_to_mlir_spmd`/`_ka`/`_gpu` reference `ct.` nowhere (they use `mlir_elem_type`, `widenconst`, `IR.*`). The `:cuTile`-only walker clauses (`make_tensor_view`, `load_partition_view`, etc., `lower.jl:1469-1746`) are simply never reached for SPMD/KA bodies. **Clean.** `widenconst` is `Core.Compiler.widenconst` (`cuTileCPU.jl:80`), not cuTile.
+2. **`lower.jl`** — `lower_to_mlir_spmd`/`_ka`/`_gpu` reference `ct.` nowhere (they use `mlir_elem_type`, `widenconst`, `IR.*`). The `:cuTile`-only walker clauses (`make_tensor_view`, `load_partition_view`, etc., `lower.jl:1469-1746`) are simply never reached for SPMD/KA bodies. **Clean.** `widenconst` is `Core.Compiler.widenconst` (`MLIRKernels.jl:80`), not cuTile.
 
-3. **`ext/KernelAbstractionsExt.jl`** — after removing `using cuTile`/`const ct` and the `__init__`, the only non-KA deps are `cuTileCPU` (`aligned_array`, `Frontend`, `ka_function`). **Clean.** Verify no remaining `ct.`/`cuTile.` token survives (the old `KA.SharedMemory`/`Scratchpad` overlays referenced neither; `aligned_array` uses cuTileCPU). 
+3. **`ext/KernelAbstractionsExt.jl`** — after removing `using cuTile`/`const ct` and the `__init__`, the only non-KA deps are `MLIRKernels` (`aligned_array`, `Frontend`, `ka_function`). **Clean.** Verify no remaining `ct.`/`cuTile.` token survives (the old `KA.SharedMemory`/`Scratchpad` overlays referenced neither; `aligned_array` uses MLIRKernels). 
 
 4. **`frontend.jl`** — already cuTile-free by construction (`frontend.jl:30-31` import only `Core.Compiler` and `IRStructurizer`). **Clean.**
 
@@ -386,11 +386,11 @@ After Edits 1-4, audit:
 3. **`launch.jl:472`** — Edit 2 (`spmd_function` → `Frontend.structured`).
 4. **`launch.jl:533`** — Edit 3 (`ka_function` → `Frontend.structured`).
 5. **`ext/KernelAbstractionsExt.jl:22-23` + `:28-93`** — Edit 4 (drop `using cuTile`/`const ct`; overlays into `Frontend.METHOD_TABLE`; delete `__init__`).
-6. Rebuild/precompile cuTileCPU, then load the KA extension. The `__init__` removal eliminates the runtime `Core.eval` into `cuTile.Intrinsics`; overlays now register at precompile.
+6. Rebuild/precompile MLIRKernels, then load the KA extension. The `__init__` removal eliminates the runtime `Core.eval` into `cuTile.Intrinsics`; overlays now register at precompile.
 
 ## Verification checklist (after applying)
 - `spmd_function(vadd, (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int))` compiles and the lane is still the trailing `Int` (`lower.jl:636`), not the sentinel — confirms Edit 2 didn't perturb SPMD lane detection.
-- A KA `@kernel` over `cuTileBackend()` lowers: inference must leave a call whose `callee_name` is `:global_index` (not an inlined body) — confirms `Frontend`'s default opt params + the `@noinline` intrinsic survive, and Edit 1's clause fires.
+- A KA `@kernel` over `MLIRBackend()` lowers: inference must leave a call whose `callee_name` is `:global_index` (not an inlined body) — confirms `Frontend`'s default opt params + the `@noinline` intrinsic survive, and Edit 1's clause fires.
 - A KA kernel containing `@synchronize` compiles to a no-op (Edit 1 `:barrier` clause) instead of erroring.
 - `grep -n "cuTile\|\bct\b" ext/KernelAbstractionsExt.jl` returns only comment/docstring mentions (or nothing) — confirms Edit 5.
 
@@ -404,18 +404,18 @@ I have all the information needed. This is a regression audit subagent task — 
 ## Verified facts (file:line)
 
 **`_structured_with_analyses` returns 4-tuple; `run_passes!` is a separate SCI→SCI pass.**
-`/home/gbaraldi/gpufun/cuTileCPU/src/launch.jl:74-83`: builds the SCI via `ct.emit_structured(ir, rettype)` then *separately* calls `divby_info, bounds_info = ct.run_passes!(sci)`. The SCI is constructed BEFORE passes run — confirmed in cuTile at `/home/gbaraldi/gpufun/cuTile.jl/src/compiler/driver.jl:150-155` (`emit_structured` = `process_meta!` + `StructuredIRCode(ir)`, no passes).
+`/home/gbaraldi/gpufun/MLIRKernels/src/launch.jl:74-83`: builds the SCI via `ct.emit_structured(ir, rettype)` then *separately* calls `divby_info, bounds_info = ct.run_passes!(sci)`. The SCI is constructed BEFORE passes run — confirmed in cuTile at `/home/gbaraldi/gpufun/cuTile.jl/src/compiler/driver.jl:150-155` (`emit_structured` = `process_meta!` + `StructuredIRCode(ir)`, no passes).
 
 **`StructuredIRCode(ir)` expects raw optimized IRCode, NOT post-pass IR.** `/home/gbaraldi/.julia/packages/IRStructurizer/xRTJx/src/ir/types.jl:657-706` — the constructor takes `ir::IRCode` straight from inference, copies argtypes/sptypes/stmts/types/flags and structurizes the CFG. IRStructurizer's own canonical usage (`interface.jl:55-58`) is `code_ircode(...)` → `StructuredIRCode(ir)` — *exactly* what `Frontend.structured` does (`frontend.jl:117-121`). So `Frontend.structured`'s SCI-construction step is shape-identical to cuTile's; there is no "passes-must-have-run" precondition on the constructor.
 
 **`divby_info`/`bounds_info` are NOT consumed by SPMD/KA/GPU.** Grep across the package: they flow only into `lower_to_mlir` (cuTile tile path, `lower.jl:412-414`) and `reflect.jl:19-25`. The SPMD/KA/GPU lowering signatures take neither: `lower_to_mlir_spmd` (`lower.jl:606-608`), `lower_to_mlir_ka` (`lower.jl:818-820`), `lower_to_mlir_gpu` (`lower.jl:1024-1027`). `spmd_function`/`ka_function` explicitly discard them: `sci, rettype, _, _ = _structured_with_analyses(...)` (`launch.jl:472, 533`). Even on the cuTile path, `lower_to_mlir` only *accepts* them "for future use" — the entry-time alignment chain is spec-only via `arg_chain` / `emit_stride_divby_assumes!` (`lower.jl:517-529`). They are dead on the SPMD/KA/GPU paths today.
 
-**The dominant hidden coupling: `run_passes!`'s FIRST pass (`canonicalize!` → `lower_intr_pass!`) rewrites Julia Core intrinsics into cuTile intrinsics, and the cuTileCPU walker only knows the cuTile-intrinsic names.**
+**The dominant hidden coupling: `run_passes!`'s FIRST pass (`canonicalize!` → `lower_intr_pass!`) rewrites Julia Core intrinsics into cuTile intrinsics, and the MLIRKernels walker only knows the cuTile-intrinsic names.**
 - `/home/gbaraldi/gpufun/cuTile.jl/src/compiler/transform/pipeline.jl:274-275`: `run_passes!` begins with `canonicalize!(sci)`.
 - `/home/gbaraldi/gpufun/cuTile.jl/src/compiler/transform/canonicalize.jl:17-68` (`INTRINSIC_RULES`): `Core.Intrinsics.add_float → addf`, `add_int → addi`, `sub_int → subi`, `mul_int → muli`, `slt_int/sle_int/ult_int → cmpi(...)`, `and_int/or_int/xor_int → andi/ori/xori`, `not_int → xori`, `bitcast(T,x) → bitcast(x,T)` (arg order swapped), builtins `===` → `cmpi`, `Core.ifelse → select`.
-- The cuTileCPU walker dispatches by name (`callee_name` at `lower.jl:2852-2857`) and has cases ONLY for the cuTile names — `:addf` (`lower.jl:1513`), `:subi` (1597), `:cmpi` (1662), `:bitcast` (1701) — and NONE for `:add_float`/`:sub_int`/`:ult_int`/raw `Core.Intrinsics.*`.
+- The MLIRKernels walker dispatches by name (`callee_name` at `lower.jl:2852-2857`) and has cases ONLY for the cuTile names — `:addf` (`lower.jl:1513`), `:subi` (1597), `:cmpi` (1662), `:bitcast` (1701) — and NONE for `:add_float`/`:sub_int`/`:ult_int`/raw `Core.Intrinsics.*`.
 
-I confirmed empirically what the default interpreter (= Frontend) produces for the exact SPMD test kernel `vadd_spmd` (`@inbounds c[i]=a[i]+b[i]`): optimized IRCode contains `Base.add_float(%17,%35)`, `Base.sub_int`, `Base.ult_int`, `Base.bitcast`, plus the full bounds-check machinery (`getfield(_,:size)`, `throw_boundserror`, `unreachable`). `callee_name(Core.Intrinsics.add_float)` = `:add_float` (it's `isa Function`, so `nameof` is used). The walker would hit `error("cuTileCPU.walk_call!: unhandled callee :add_float ...")` at `lower.jl:1776`.
+I confirmed empirically what the default interpreter (= Frontend) produces for the exact SPMD test kernel `vadd_spmd` (`@inbounds c[i]=a[i]+b[i]`): optimized IRCode contains `Base.add_float(%17,%35)`, `Base.sub_int`, `Base.ult_int`, `Base.bitcast`, plus the full bounds-check machinery (`getfield(_,:size)`, `throw_boundserror`, `unreachable`). `callee_name(Core.Intrinsics.add_float)` = `:add_float` (it's `isa Function`, so `nameof` is used). The walker would hit `error("MLIRKernels.walk_call!: unhandled callee :add_float ...")` at `lower.jl:1776`.
 
 Note: bounds-check *shape* is identical in both paths (both interpreters use default `InferenceParams()` — `interpreter.jl:29` and `frontend.jl:89`), and bounds elision is handled by IRStructurizer + the walker's `:boundscheck`-sentinel IfOp elision (`lower.jl:2723-2728`), which is shared. So bounds checks are NOT a new risk. The `memoryrefnew/get/set!` + `getfield(arr,:ref/:size)` chains (`lower.jl:3531-3585`) are plain Julia builtins that canonicalize never touches — identical in both paths. The lane `subi -1` is emitted by the walker itself.
 
@@ -461,9 +461,9 @@ Note: bounds-check *shape* is identical in both paths (both interpreters use def
 - **KA path needs its overlays re-homed to `Frontend.METHOD_TABLE`/`Frontend.Intrinsics` in the same change** (R4), and **KA/GPU have zero tests** (R5) — add coverage before the switch.
 - **Regression surface for the SPMD switch is exactly 2 testsets** (`runtests.jl:2051, 2089`), both of which also assert on `code_mlir(...; spmd=true)`, so reflection must switch in lockstep (R6).
 
-Key files: `/home/gbaraldi/gpufun/cuTileCPU/src/launch.jl`, `/home/gbaraldi/gpufun/cuTileCPU/src/lower.jl`, `/home/gbaraldi/gpufun/cuTileCPU/src/frontend.jl`, `/home/gbaraldi/gpufun/cuTileCPU/src/reflect.jl`, `/home/gbaraldi/gpufun/cuTileCPU/ext/KernelAbstractionsExt.jl`, `/home/gbaraldi/gpufun/cuTile.jl/src/compiler/transform/canonicalize.jl`, `/home/gbaraldi/gpufun/cuTile.jl/src/compiler/transform/pipeline.jl`, `/home/gbaraldi/gpufun/cuTileCPU/test/runtests.jl`.
+Key files: `/home/gbaraldi/gpufun/MLIRKernels/src/launch.jl`, `/home/gbaraldi/gpufun/MLIRKernels/src/lower.jl`, `/home/gbaraldi/gpufun/MLIRKernels/src/frontend.jl`, `/home/gbaraldi/gpufun/MLIRKernels/src/reflect.jl`, `/home/gbaraldi/gpufun/MLIRKernels/ext/KernelAbstractionsExt.jl`, `/home/gbaraldi/gpufun/cuTile.jl/src/compiler/transform/canonicalize.jl`, `/home/gbaraldi/gpufun/cuTile.jl/src/compiler/transform/pipeline.jl`, `/home/gbaraldi/gpufun/MLIRKernels/test/runtests.jl`.
 
-Note: I could not execute a live SCI comparison — the environment's `LLVM_full_jll [whYTI]` fails to load (`Zstd_jll` missing from its manifest deps), blocking `cuTileCPU` precompile. All findings above are from static source reading plus a minimal standalone Julia check of `code_ircode`/`callee_name` behavior, which is sufficient and decisive for the central R1/R2 finding.
+Note: I could not execute a live SCI comparison — the environment's `LLVM_full_jll [whYTI]` fails to load (`Zstd_jll` missing from its manifest deps), blocking `MLIRKernels` precompile. All findings above are from static source reading plus a minimal standalone Julia check of `code_ircode`/`callee_name` behavior, which is sufficient and decisive for the central R1/R2 finding.
 
 ## KA COVERAGE MAP
 I have a complete and exhaustive picture. Confirmed key facts:
@@ -475,7 +475,7 @@ Now I'll write up the coverage map.
 
 ---
 
-# KA Coverage Map for cuTileCPU (CPU SPMD + GPU SIMT)
+# KA Coverage Map for MLIRKernels (CPU SPMD + GPU SIMT)
 
 ## Ground truth from the code
 
@@ -487,7 +487,7 @@ __active_lane__ = __validindex(__ctx__)   # macros.jl:99
 <body, with @index calls hoisted/aggregated by `split(emit_gpu, …)` macros.jl:105>
 return nothing
 ```
-On the GPU path `@synchronize` is **not** used to split the body (that is the CPU path's `transform_cpu!`/`WorkgroupLoop`, macros.jl:129-167); on the GPU path `@synchronize` survives inline as a call to `__synchronize()`. cuTileCPU's KA path picks the `gpu_*` body because `cuTileBackend <: KA.GPU` (`ext/KernelAbstractionsExt.jl:32`).
+On the GPU path `@synchronize` is **not** used to split the body (that is the CPU path's `transform_cpu!`/`WorkgroupLoop`, macros.jl:129-167); on the GPU path `@synchronize` survives inline as a call to `__synchronize()`. MLIRKernels's KA path picks the `gpu_*` body because `MLIRBackend <: KA.GPU` (`ext/KernelAbstractionsExt.jl:32`).
 
 **`@index` expansion** (`macros.jl:422-441`): `@index(locale, kind, I...)` → `KernelAbstractions.__index_{locale}_{kind}(__ctx__, I...)`. `locale ∈ {Global,Local,Group}`, `kind ∈ {Linear,Cartesian,NTuple}` (default `Linear`). Declarations at `macros.jl:448-458`. NTuple variants are `Tuple(__index_*_Cartesian(ctx, I...))`.
 
@@ -501,7 +501,7 @@ On the GPU path `@synchronize` is **not** used to split the body (that is the CP
 - `__synchronize() = sync_threads()`
 - `@uniform`/`@private expr` are pure host-side passthroughs (`macros.jl:283-285`, `273-275`) — no intrinsic.
 
-**Current cuTileCPU handling** (`ext/KernelAbstractionsExt.jl`): only `__index_Global_Linear`→sentinel `__cutilecpu_spmd_lane_id` (lines 61-72), `__validindex`→`true` (line 81), `__synchronize`→`nothing` (line 87). `SharedMemory`/`Scratchpad` overlays throw (lines 90-93). The walker clause that consumes the sentinel is `lower.jl:1771-1774` (returns `lc.arg_vals[lc.lane_arg]`). Everything else in `walk_call!` (atomics, gather/scatter, mma, reduce) keys on **cuTile** `Intrinsics` names and only fires on the tile path.
+**Current MLIRKernels handling** (`ext/KernelAbstractionsExt.jl`): only `__index_Global_Linear`→sentinel `__cutilecpu_spmd_lane_id` (lines 61-72), `__validindex`→`true` (line 81), `__synchronize`→`nothing` (line 87). `SharedMemory`/`Scratchpad` overlays throw (lines 90-93). The walker clause that consumes the sentinel is `lower.jl:1771-1774` (returns `lc.arg_vals[lc.lane_arg]`). Everything else in `walk_call!` (atomics, gather/scatter, mma, reduce) keys on **cuTile** `Intrinsics` names and only fires on the tile path.
 
 **Frontend target intrinsics** (`src/frontend.jl:43-59`): `global_index()`, `block_index(dim::Int32)`, `block_dim(dim::Int32)`, `barrier()` — all `@noinline`+`compilerbarrier`, `Int32` (or `nothing`) returns. The overlay table is `Frontend.METHOD_TABLE` (frontend.jl:70). So the migration is: route KA overlays into `Frontend.METHOD_TABLE`, mapping each `__index_*`/`__synchronize`/`SharedMemory`/`Scratchpad` to a `Frontend.Intrinsics.*` marker, and add walker clauses keyed on the new marker names.
 
@@ -634,13 +634,13 @@ Easiest → hardest, with the intrinsics each unlocks. (Reference kernels are th
 ---
 
 **Key file:line references**
-- KA overlays to migrate: `/home/gbaraldi/gpufun/cuTileCPU/ext/KernelAbstractionsExt.jl:61-93`
-- Frontend intrinsics + overlay table: `/home/gbaraldi/gpufun/cuTileCPU/src/frontend.jl:43-59`, `:70`, `:114-122`
-- Sentinel walker clause (Global,Linear): `/home/gbaraldi/gpufun/cuTileCPU/src/lower.jl:1771-1774`
-- KA SPMD entrypoint (single grid dim): `/home/gbaraldi/gpufun/cuTileCPU/src/lower.jl:818-974`
-- GPU SIMT entrypoint (x-dim only, no barrier/alloca): `/home/gbaraldi/gpufun/cuTileCPU/src/lower.jl:1024-1156`
-- SPMD memoryref load/store/gather/scatter: `/home/gbaraldi/gpufun/cuTileCPU/src/lower.jl:3531-3689`
-- Atomic RMW/CAS emitters (reusable for KA atomics): `/home/gbaraldi/gpufun/cuTileCPU/src/lower.jl:3139-3422`
+- KA overlays to migrate: `/home/gbaraldi/gpufun/MLIRKernels/ext/KernelAbstractionsExt.jl:61-93`
+- Frontend intrinsics + overlay table: `/home/gbaraldi/gpufun/MLIRKernels/src/frontend.jl:43-59`, `:70`, `:114-122`
+- Sentinel walker clause (Global,Linear): `/home/gbaraldi/gpufun/MLIRKernels/src/lower.jl:1771-1774`
+- KA SPMD entrypoint (single grid dim): `/home/gbaraldi/gpufun/MLIRKernels/src/lower.jl:818-974`
+- GPU SIMT entrypoint (x-dim only, no barrier/alloca): `/home/gbaraldi/gpufun/MLIRKernels/src/lower.jl:1024-1156`
+- SPMD memoryref load/store/gather/scatter: `/home/gbaraldi/gpufun/MLIRKernels/src/lower.jl:3531-3689`
+- Atomic RMW/CAS emitters (reusable for KA atomics): `/home/gbaraldi/gpufun/MLIRKernels/src/lower.jl:3139-3422`
 - KA `@index`/`@localmem`/`@private`/`@uniform`/`@synchronize` macros: `~/.julia/packages/KernelAbstractions/X5fk1/src/KernelAbstractions.jl:237-323`, `macros.jl:422-458`
 - GPU transform (validindex guard, body split): `~/.julia/packages/KernelAbstractions/X5fk1/src/macros.jl:83-120`
 - Canonical GPU intrinsic semantics: `~/.julia/packages/CUDA/1WEyo/CUDACore/src/CUDAKernels.jl:161-211`

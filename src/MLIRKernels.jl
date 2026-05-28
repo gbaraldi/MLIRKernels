@@ -1,5 +1,5 @@
 """
-    cuTileCPU
+    MLIRKernels
 
 CPU backend for cuTile.jl. Takes a cuTile kernel + argtypes, runs cuTile's
 existing inference + structurization pipeline, then lowers the resulting
@@ -11,7 +11,7 @@ StructuredIRCode to MLIR (high-level dialects: `scf`, `arith`, `memref`,
 # Quick start
 
 ```julia
-using cuTile, cuTileCPU
+using cuTile, MLIRKernels
 const ct = cuTile
 
 function vadd(a, b, c, tile_size::Int)
@@ -25,12 +25,12 @@ end
 # Aligned host buffers (the kernel's TileArray ArraySpec demands alignment
 # > 16 bytes, which plain `Vector{Float32}` doesn't guarantee).
 n = 1024
-a = cuTileCPU.aligned_array(Float32, n)
-b = cuTileCPU.aligned_array(Float32, n)
-c = cuTileCPU.aligned_array(Float32, n)
+a = MLIRKernels.aligned_array(Float32, n)
+b = MLIRKernels.aligned_array(Float32, n)
+c = MLIRKernels.aligned_array(Float32, n)
 copyto!(a, 1:n); copyto!(b, 1:n); fill!(c, 0)
 
-k = cuTileCPU.cpu_function(vadd, (a, b, c, ct.Constant(16)))
+k = MLIRKernels.cpu_function(vadd, (a, b, c, ct.Constant(16)))
 k(a, b, c, ct.Constant(16); blocks=(n ÷ 16,))
 @assert c == a .+ b
 ```
@@ -38,11 +38,11 @@ k(a, b, c, ct.Constant(16); blocks=(n ÷ 16,))
 # Reflection
 
 ```julia
-println(cuTileCPU.code_mlir(vadd, (a, b, c, ct.Constant(16))))
-println(cuTileCPU.code_llvm(vadd, (a, b, c, ct.Constant(16))))
+println(MLIRKernels.code_mlir(vadd, (a, b, c, ct.Constant(16))))
+println(MLIRKernels.code_llvm(vadd, (a, b, c, ct.Constant(16))))
 ```
 """
-module cuTileCPU
+module MLIRKernels
 
 using cuTile
 const ct = cuTile

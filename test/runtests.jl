@@ -1,7 +1,7 @@
 using Test
 using Statistics
 using cuTile
-using cuTileCPU
+using MLIRKernels
 using cuTile: BFloat16
 const ct = cuTile
 
@@ -307,7 +307,7 @@ end
 # Atomic RMW kernels for the new atomic_add / atomic_max / atomic_min tests.
 # All three kernels use the scalar-index form (`ct.atomic_*(arr, scalar_idx,
 # val)`) which cuTile lowers to a 0-D pointer-tile via `Intrinsics.offset`
-# followed by an `Intrinsics.atomic_*` SCI op. On the cuTileCPU walker this
+# followed by an `Intrinsics.atomic_*` SCI op. On the MLIRKernels walker this
 # maps to a single `memref.atomic_rmw <kind>` per block.
 function atomic_count_kernel(counter::ct.TileArray{Int32,1})
     bid = ct.bid(1)
@@ -448,7 +448,7 @@ end
 # ----------------------------------------------------------------------------
 #
 # These kernels look like normal Julia — no Tile/ct.* types. The walker's
-# SPMD mode (`cuTileCPU.spmd_function`) lifts the trailing lane-index arg
+# SPMD mode (`MLIRKernels.spmd_function`) lifts the trailing lane-index arg
 # to a `lane_width`-wide vector and turns each scalar op into a vector op.
 
 function vadd_spmd(a::Vector{Float32}, b::Vector{Float32},
@@ -672,11 +672,11 @@ function moe_routing_kernel(
     return
 end
 
-@testset "cuTileCPU" begin
+@testset "MLIRKernels" begin
 
     @testset "aligned_array" begin
         for align in (32, 64, 128, 256)
-            a = cuTileCPU.aligned_array(Float32, 1024; alignment=align)
+            a = MLIRKernels.aligned_array(Float32, 1024; alignment=align)
             @test a isa Array{Float32, 1}
             @test length(a) == 1024
             @test UInt(pointer(a)) % align == 0
@@ -691,14 +691,14 @@ end
         # cuTile default ArraySpec.
         n = 1024
         tile = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        c = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        c = MLIRKernels.aligned_array(Float32, n; alignment=128)
         copyto!(a, Float32.(1:n))
         copyto!(b, Float32.(101:100+n))
         fill!(c, 0f0)
 
-        k = cuTileCPU.cpu_function(vadd_kernel, (a, b, c, ct.Constant(tile)))
+        k = MLIRKernels.cpu_function(vadd_kernel, (a, b, c, ct.Constant(tile)))
         k(a, b, c, ct.Constant(tile); blocks=cld(n, tile))
 
         @test c ≈ a .+ b
@@ -710,33 +710,33 @@ end
         # the underlying mechanism.
         n = 1024
         tile = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        c = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        c = MLIRKernels.aligned_array(Float32, n; alignment=128)
         copyto!(a, Float32.(1:n))
         copyto!(b, Float32.(101:100+n))
         fill!(c, 0f0)
 
         # Function form
-        cuTileCPU.parallel_for(vadd_kernel,
+        MLIRKernels.parallel_for(vadd_kernel,
                                (a, b, c, ct.Constant(tile));
                                blocks = cld(n, tile))
         @test c ≈ a .+ b
 
         # Macro form — re-run with a different buffer to confirm same effect.
-        c2 = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        c2 = MLIRKernels.aligned_array(Float32, n; alignment=128)
         fill!(c2, 0f0)
-        cuTileCPU.@parallel_for blocks = cld(n, tile) vadd_kernel(a, b, c2,
+        MLIRKernels.@parallel_for blocks = cld(n, tile) vadd_kernel(a, b, c2,
                                                                   ct.Constant(tile))
         @test c2 ≈ a .+ b
     end
 
     @testset "reflection: code_mlir contains expected ops" begin
         n = 1024; tile = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        c = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        mlir = cuTileCPU.code_mlir(vadd_kernel, (a, b, c, ct.Constant(tile)))
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        c = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        mlir = MLIRKernels.code_mlir(vadd_kernel, (a, b, c, ct.Constant(tile)))
         # Should be a func.func named after the kernel
         @test occursin("func.func @vadd_kernel", mlir)
         # Tile-shaped vectors
@@ -767,13 +767,13 @@ end
         # accesses; absent it the row-stride dim falls back to scalar loads.
         M, N, K = 128, 128, 128
         BM, BN, BK = 64, 64, 64
-        raw_a = cuTileCPU.aligned_array(Float32, M*K; alignment=128)
-        raw_b = cuTileCPU.aligned_array(Float32, K*N; alignment=128)
-        raw_c = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
+        raw_a = MLIRKernels.aligned_array(Float32, M*K; alignment=128)
+        raw_b = MLIRKernels.aligned_array(Float32, K*N; alignment=128)
+        raw_c = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
         A = reshape(raw_a, (M, K))
         B = reshape(raw_b, (K, N))
         C = reshape(raw_c, (M, N))
-        mlir = cuTileCPU.code_mlir(matmul_kernel,
+        mlir = MLIRKernels.code_mlir(matmul_kernel,
             (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
             n_grid_dims=2)
         # 3 TileArray args × 1 non-contiguous-dim with a DivBy hint = 3 assumes.
@@ -792,10 +792,10 @@ end
 
     @testset "reflection: code_llvm contains __kmpc_*" begin
         n = 1024; tile = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        c = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        ll = cuTileCPU.code_llvm(vadd_kernel, (a, b, c, ct.Constant(tile)))
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        c = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        ll = MLIRKernels.code_llvm(vadd_kernel, (a, b, c, ct.Constant(tile)))
         @test occursin("__kmpc_fork_call", ll)   # OpenMP parallelism
         @test occursin("_mlir_ciface_vadd_kernel", ll)  # C-interface wrapper
     end
@@ -808,8 +808,8 @@ end
         # ArraySpec — so this just confirms aligned_array is sufficient
         # for the canonical alignment.
         for align in (32, 64, 128)
-            a = cuTileCPU.aligned_array(Float32, 1024; alignment=align)
-            @test cuTileCPU.pointer_aligned(a, align)
+            a = MLIRKernels.aligned_array(Float32, 1024; alignment=align)
+            @test MLIRKernels.pointer_aligned(a, align)
         end
     end
 
@@ -818,20 +818,20 @@ end
         # `b` untouched (the kernel returns before the store); flag==1 stores
         # tile*2.
         n = 1024; tile = 16
-        a  = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b0 = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b1 = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        a  = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b0 = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b1 = MLIRKernels.aligned_array(Float32, n; alignment=128)
         copyto!(a, Float32.(1:n))
         fill!(b0, 7f0); fill!(b1, 7f0)
 
-        k = cuTileCPU.cpu_function(if_branch_kernel, (a, b0, Int32(0)))
+        k = MLIRKernels.cpu_function(if_branch_kernel, (a, b0, Int32(0)))
         k(a, b0, Int32(0); blocks=cld(n, tile))
         @test b0 == fill(7f0, n)   # nothing stored
 
         k(a, b1, Int32(1); blocks=cld(n, tile))
         @test b1 ≈ a .* 2f0
 
-        mlir = cuTileCPU.code_mlir(if_branch_kernel, (a, b0, Int32(0)))
+        mlir = MLIRKernels.code_mlir(if_branch_kernel, (a, b0, Int32(0)))
         @test occursin("scf.if", mlir)
     end
 
@@ -839,17 +839,17 @@ end
         # Repeated accumulate-from-`a` n times into a zero-tile, then store.
         # Result: b[i] == n * a[i].
         n = 1024; tile = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
         copyto!(a, Float32.(1:n))
         fill!(b, 0f0)
 
         reps = Int32(5)
-        k = cuTileCPU.cpu_function(counted_loop_kernel, (a, b, reps))
+        k = MLIRKernels.cpu_function(counted_loop_kernel, (a, b, reps))
         k(a, b, reps; blocks=cld(n, tile))
         @test b ≈ a .* Float32(reps)
 
-        mlir = cuTileCPU.code_mlir(counted_loop_kernel, (a, b, reps))
+        mlir = MLIRKernels.code_mlir(counted_loop_kernel, (a, b, reps))
         @test occursin("scf.for", mlir)
     end
 
@@ -858,17 +858,17 @@ end
         nrows = 16
         ncols = 128
         # 2-D aligned array via reshape of an aligned flat buffer.
-        raw = cuTileCPU.aligned_array(Float32, nrows * ncols; alignment=128)
+        raw = MLIRKernels.aligned_array(Float32, nrows * ncols; alignment=128)
         a2 = reshape(raw, (nrows, ncols))
         copyto!(a2, Float32.(reshape(1:(nrows*ncols), (nrows, ncols))))
-        b = cuTileCPU.aligned_array(Float32, nrows; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, nrows; alignment=128)
         fill!(b, 0f0)
 
-        k = cuTileCPU.cpu_function(row_sum_kernel, (a2, b))
+        k = MLIRKernels.cpu_function(row_sum_kernel, (a2, b))
         k(a2, b; blocks=nrows)
         @test b ≈ vec(sum(a2; dims=2))
 
-        mlir = cuTileCPU.code_mlir(row_sum_kernel, (a2, b))
+        mlir = MLIRKernels.code_mlir(row_sum_kernel, (a2, b))
         @test occursin("vector.multi_reduction", mlir)
     end
 
@@ -882,9 +882,9 @@ end
         # instead of ~30 s. Still covers every walker path.
         M, N, K = 64, 64, 64
         BM, BN, BK = 16, 16, 16
-        raw_a = cuTileCPU.aligned_array(Float32, M*K; alignment=128)
-        raw_b = cuTileCPU.aligned_array(Float32, K*N; alignment=128)
-        raw_c = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
+        raw_a = MLIRKernels.aligned_array(Float32, M*K; alignment=128)
+        raw_b = MLIRKernels.aligned_array(Float32, K*N; alignment=128)
+        raw_c = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
         A = reshape(raw_a, (M, K))
         B = reshape(raw_b, (K, N))
         C = reshape(raw_c, (M, N))
@@ -893,13 +893,13 @@ end
         fill!(C, 0f0)
 
         # Compile + launch via @parallel_for on a 2-D grid.
-        cuTileCPU.@parallel_for blocks = (M ÷ BM, N ÷ BN) matmul_kernel(
+        MLIRKernels.@parallel_for blocks = (M ÷ BM, N ÷ BN) matmul_kernel(
             A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK))
 
         @test C ≈ A * B rtol=1e-4
 
         # Reflection: should emit vector.contract and ceildivsi.
-        mlir = cuTileCPU.code_mlir(matmul_kernel,
+        mlir = MLIRKernels.code_mlir(matmul_kernel,
             (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
             n_grid_dims=2)
         @test occursin("vector.contract", mlir)
@@ -921,9 +921,9 @@ end
         # dramatically lower (~1 s vs ~30 s for big-tile contract).
         M, N, K = 128, 128, 128
         RM, RN = 16, 16
-        raw_a = cuTileCPU.aligned_array(Float32, M*K; alignment=128)
-        raw_b = cuTileCPU.aligned_array(Float32, K*N; alignment=128)
-        raw_c = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
+        raw_a = MLIRKernels.aligned_array(Float32, M*K; alignment=128)
+        raw_b = MLIRKernels.aligned_array(Float32, K*N; alignment=128)
+        raw_c = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
         A = reshape(raw_a, (M, K))
         B = reshape(raw_b, (K, N))
         C = reshape(raw_c, (M, N))
@@ -931,7 +931,7 @@ end
         copyto!(B, Float32.(reshape(1:K*N, (K, N)) ./ Float32(K*N)))
         fill!(C, 0f0)
 
-        cuTileCPU.@parallel_for blocks = (M ÷ RM, N ÷ RN) matmul_reg_kernel(
+        MLIRKernels.@parallel_for blocks = (M ÷ RM, N ÷ RN) matmul_reg_kernel(
             A, B, C, ct.Constant(RM), ct.Constant(RN))
 
         @test C ≈ A * B rtol=1e-4
@@ -940,7 +940,7 @@ end
         # a phi-carried accumulator + ~RM vector FMAs per iteration. Lock
         # in the property — if the IR balloons to thousands of FMAs (= the
         # contract path got selected somehow), this test catches it.
-        llvm = cuTileCPU.code_llvm(matmul_reg_kernel,
+        llvm = MLIRKernels.code_llvm(matmul_reg_kernel,
             (A, B, C, ct.Constant(RM), ct.Constant(RN));
             n_grid_dims=2)
         # Phi node carrying the accumulator across the K-loop.
@@ -957,14 +957,14 @@ end
         # the costly path).
         M, N, K, Batch = 32, 32, 32, 4
         BM, BN, BK, BS = 16, 16, 16, 2
-        A = cuTileCPU.aligned_array(Float32, (M, K, Batch); alignment=128)
-        B = cuTileCPU.aligned_array(Float32, (K, N, Batch); alignment=128)
-        C = cuTileCPU.aligned_array(Float32, (M, N, Batch); alignment=128)
+        A = MLIRKernels.aligned_array(Float32, (M, K, Batch); alignment=128)
+        B = MLIRKernels.aligned_array(Float32, (K, N, Batch); alignment=128)
+        C = MLIRKernels.aligned_array(Float32, (M, N, Batch); alignment=128)
         copyto!(A, Float32.(reshape(1:M*K*Batch, (M, K, Batch)) ./ Float32(M*K*Batch)))
         copyto!(B, Float32.(reshape(1:K*N*Batch, (K, N, Batch)) ./ Float32(K*N*Batch)))
         fill!(C, 0f0)
 
-        cuTileCPU.@parallel_for blocks = (M ÷ BM, N ÷ BN, Batch ÷ BS) bmm_kernel(
+        MLIRKernels.@parallel_for blocks = (M ÷ BM, N ÷ BN, Batch ÷ BS) bmm_kernel(
             A, B, C,
             ct.Constant(BM), ct.Constant(BN), ct.Constant(BK), ct.Constant(BS))
 
@@ -978,7 +978,7 @@ end
 
         # Reflection: should emit a batched vector.contract (4 iterator types,
         # 4-axis affine maps with a leading batch dim).
-        mlir = cuTileCPU.code_mlir(bmm_kernel,
+        mlir = MLIRKernels.code_mlir(bmm_kernel,
             (A, B, C,
              ct.Constant(BM), ct.Constant(BN), ct.Constant(BK), ct.Constant(BS));
             n_grid_dims=3)
@@ -992,14 +992,14 @@ end
         # to (1, N) for the shift, applies math.exp, sums to (1, 1), divides
         # back to (1, N), and stores.
         M, N = 64, 128
-        raw_a = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
-        raw_y = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
+        raw_a = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
+        raw_y = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
         A = reshape(raw_a, (M, N))
         Y = reshape(raw_y, (M, N))
         copyto!(A, Float32.(reshape(1:M*N, (M, N)) ./ Float32(M*N)))
         fill!(Y, 0f0)
 
-        cuTileCPU.@parallel_for blocks = M softmax_kernel(A, Y, ct.Constant(N))
+        MLIRKernels.@parallel_for blocks = M softmax_kernel(A, Y, ct.Constant(N))
 
         # Numerically-stable Julia oracle.
         m = maximum(A; dims=2)
@@ -1008,7 +1008,7 @@ end
         @test Y ≈ Y_expected rtol=1e-4
 
         # Reflection: emitted MLIR should contain the new ops.
-        mlir = cuTileCPU.code_mlir(softmax_kernel, (A, Y, ct.Constant(N)))
+        mlir = MLIRKernels.code_mlir(softmax_kernel, (A, Y, ct.Constant(N)))
         @test occursin("vector.multi_reduction <maxnumf>", mlir)
         @test occursin("math.exp", mlir)
         @test occursin("arith.divf", mlir)
@@ -1023,14 +1023,14 @@ end
         # multiplies elementwise with Δ.
         M, N = 64, 128
         eps = 1f-5
-        raw_x = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
-        raw_y = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
+        raw_x = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
+        raw_y = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
         X = reshape(raw_x, (M, N))
         Y = reshape(raw_y, (M, N))
         copyto!(X, Float32.(reshape(1:M*N, (M, N)) ./ Float32(M*N)))
         fill!(Y, 0f0)
 
-        cuTileCPU.@parallel_for blocks = M layernorm_kernel(X, Y, eps,
+        MLIRKernels.@parallel_for blocks = M layernorm_kernel(X, Y, eps,
                                                             ct.Constant(N))
 
         # Julia oracle: mean → Δ → variance → rsqrt → normalize.
@@ -1044,7 +1044,7 @@ end
         @test maximum(abs, Y .- Y_expected) < 1f-4
 
         # Reflection: emitted MLIR should contain the new ops.
-        mlir = cuTileCPU.code_mlir(layernorm_kernel, (X, Y, eps, ct.Constant(N)))
+        mlir = MLIRKernels.code_mlir(layernorm_kernel, (X, Y, eps, ct.Constant(N)))
         @test occursin("math.rsqrt", mlir)
         @test occursin("vector.multi_reduction <add>", mlir)
         # Runtime Float32 scalar arg should appear in func signature.
@@ -1060,9 +1060,9 @@ end
         # a broadcast-multiply-subtract chain.
         M, N = 64, 128
         eps = 1f-5
-        raw_x  = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
-        raw_dy = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
-        raw_dx = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
+        raw_x  = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
+        raw_dy = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
+        raw_dx = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
         X  = reshape(raw_x,  (M, N))
         dY = reshape(raw_dy, (M, N))
         dX = reshape(raw_dx, (M, N))
@@ -1076,7 +1076,7 @@ end
         end
         fill!(dX, 0f0)
 
-        cuTileCPU.@parallel_for blocks = M layernorm_bwd_kernel(X, dY, dX, eps,
+        MLIRKernels.@parallel_for blocks = M layernorm_bwd_kernel(X, dY, dX, eps,
                                                                 ct.Constant(N))
 
         # Julia oracle: replicate the per-row backward math on host.
@@ -1096,7 +1096,7 @@ end
 
         # Reflection: same row-reduction / rsqrt machinery as forward, plus
         # additional reductions for sum(dy) and sum(dy * x_hat).
-        mlir = cuTileCPU.code_mlir(layernorm_bwd_kernel,
+        mlir = MLIRKernels.code_mlir(layernorm_bwd_kernel,
                                    (X, dY, dX, eps, ct.Constant(N)))
         @test occursin("math.rsqrt", mlir)
         @test occursin("vector.multi_reduction <add>", mlir)
@@ -1107,19 +1107,19 @@ end
         # Same shape as the F32 vadd; F16 only has ~3 sig figs of precision.
         n = 1024
         tile = 16
-        a = cuTileCPU.aligned_array(Float16, n; alignment=32)
-        b = cuTileCPU.aligned_array(Float16, n; alignment=32)
-        c = cuTileCPU.aligned_array(Float16, n; alignment=32)
+        a = MLIRKernels.aligned_array(Float16, n; alignment=32)
+        b = MLIRKernels.aligned_array(Float16, n; alignment=32)
+        c = MLIRKernels.aligned_array(Float16, n; alignment=32)
         copyto!(a, Float16.(1:n) ./ Float16(n))
         copyto!(b, Float16.(101:100+n) ./ Float16(n))
         fill!(c, Float16(0))
 
-        k = cuTileCPU.cpu_function(vadd_kernel, (a, b, c, ct.Constant(tile)))
+        k = MLIRKernels.cpu_function(vadd_kernel, (a, b, c, ct.Constant(tile)))
         k(a, b, c, ct.Constant(tile); blocks=cld(n, tile))
 
         @test Float32.(c) ≈ Float32.(a) .+ Float32.(b) rtol=1e-3
 
-        mlir = cuTileCPU.code_mlir(vadd_kernel, (a, b, c, ct.Constant(tile)))
+        mlir = MLIRKernels.code_mlir(vadd_kernel, (a, b, c, ct.Constant(tile)))
         @test occursin("vector<16xf16>", mlir)
         @test occursin("arith.addf", mlir)
     end
@@ -1128,19 +1128,19 @@ end
         # BFloat16 = 8-bit exponent, 7-bit mantissa → ~2-3 sig figs of precision.
         n = 1024
         tile = 16
-        a = cuTileCPU.aligned_array(BFloat16, n; alignment=32)
-        b = cuTileCPU.aligned_array(BFloat16, n; alignment=32)
-        c = cuTileCPU.aligned_array(BFloat16, n; alignment=32)
+        a = MLIRKernels.aligned_array(BFloat16, n; alignment=32)
+        b = MLIRKernels.aligned_array(BFloat16, n; alignment=32)
+        c = MLIRKernels.aligned_array(BFloat16, n; alignment=32)
         copyto!(a, BFloat16.((1:n) ./ n))
         copyto!(b, BFloat16.((101:100+n) ./ n))
         fill!(c, BFloat16(0))
 
-        k = cuTileCPU.cpu_function(vadd_kernel, (a, b, c, ct.Constant(tile)))
+        k = MLIRKernels.cpu_function(vadd_kernel, (a, b, c, ct.Constant(tile)))
         k(a, b, c, ct.Constant(tile); blocks=cld(n, tile))
 
         @test Float32.(c) ≈ Float32.(a) .+ Float32.(b) rtol=1e-2
 
-        mlir = cuTileCPU.code_mlir(vadd_kernel, (a, b, c, ct.Constant(tile)))
+        mlir = MLIRKernels.code_mlir(vadd_kernel, (a, b, c, ct.Constant(tile)))
         @test occursin("vector<16xbf16>", mlir)
         @test occursin("arith.addf", mlir)
     end
@@ -1154,14 +1154,14 @@ end
         # pipeline (separate from MLIR), so we exercise only code emission.
         M, N, K = 32, 32, 32
         BM, BN, BK = 16, 16, 16
-        raw_a = cuTileCPU.aligned_array(BFloat16, M*K; alignment=128)
-        raw_b = cuTileCPU.aligned_array(BFloat16, K*N; alignment=128)
-        raw_c = cuTileCPU.aligned_array(Float32, M*N; alignment=128)
+        raw_a = MLIRKernels.aligned_array(BFloat16, M*K; alignment=128)
+        raw_b = MLIRKernels.aligned_array(BFloat16, K*N; alignment=128)
+        raw_c = MLIRKernels.aligned_array(Float32, M*N; alignment=128)
         A = reshape(raw_a, (M, K))
         B = reshape(raw_b, (K, N))
         C = reshape(raw_c, (M, N))
 
-        mlir = cuTileCPU.code_mlir(matmul_mixed_kernel,
+        mlir = MLIRKernels.code_mlir(matmul_mixed_kernel,
             (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
             n_grid_dims=2)
         @test occursin("vector.contract", mlir)
@@ -1178,21 +1178,21 @@ end
         # bit-exactly for F32 add.
         n = 1024
         tile = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        c = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        c = MLIRKernels.aligned_array(Float32, n; alignment=128)
         copyto!(a, Float32.(1:n))
         copyto!(b, Float32.(101:100+n))
         fill!(c, 0f0)
 
-        k = cuTileCPU.cpu_function(vadd_gather_kernel,
+        k = MLIRKernels.cpu_function(vadd_gather_kernel,
                                    (a, b, c, ct.Constant(tile)))
         k(a, b, c, ct.Constant(tile); blocks=cld(n, tile))
 
         @test c ≈ a .+ b rtol=1e-5
 
         # Reflection: emitted MLIR should contain gather + scatter + step.
-        mlir = cuTileCPU.code_mlir(vadd_gather_kernel,
+        mlir = MLIRKernels.code_mlir(vadd_gather_kernel,
                                    (a, b, c, ct.Constant(tile)))
         @test occursin("vector.gather", mlir)
         @test occursin("vector.scatter", mlir)
@@ -1204,20 +1204,20 @@ end
         # the scatter path independently of gather.
         n = 1024
         tile = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        c = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        c = MLIRKernels.aligned_array(Float32, n; alignment=128)
         copyto!(a, Float32.(1:n))
         copyto!(b, Float32.(101:100+n))
         fill!(c, 0f0)
 
-        k = cuTileCPU.cpu_function(vadd_scatter_only_kernel,
+        k = MLIRKernels.cpu_function(vadd_scatter_only_kernel,
                                    (a, b, c, ct.Constant(tile)))
         k(a, b, c, ct.Constant(tile); blocks=cld(n, tile))
 
         @test c ≈ a .+ b rtol=1e-5
 
-        mlir = cuTileCPU.code_mlir(vadd_scatter_only_kernel,
+        mlir = MLIRKernels.code_mlir(vadd_scatter_only_kernel,
                                    (a, b, c, ct.Constant(tile)))
         @test occursin("vector.scatter", mlir)
         @test !occursin("vector.gather", mlir)  # loads stay contiguous
@@ -1239,10 +1239,10 @@ end
         @assert N == BN
         @assert M % BM == 0
 
-        raw_q = cuTileCPU.aligned_array(Float32, M*D; alignment=128)
-        raw_k = cuTileCPU.aligned_array(Float32, N*D; alignment=128)
-        raw_v = cuTileCPU.aligned_array(Float32, N*D; alignment=128)
-        raw_o = cuTileCPU.aligned_array(Float32, M*D; alignment=128)
+        raw_q = MLIRKernels.aligned_array(Float32, M*D; alignment=128)
+        raw_k = MLIRKernels.aligned_array(Float32, N*D; alignment=128)
+        raw_v = MLIRKernels.aligned_array(Float32, N*D; alignment=128)
+        raw_o = MLIRKernels.aligned_array(Float32, M*D; alignment=128)
         Q = reshape(raw_q, (M, D))
         K = reshape(raw_k, (N, D))
         V = reshape(raw_v, (N, D))
@@ -1257,7 +1257,7 @@ end
         copyto!(V, Float32.(reshape((1:N*D) ./ Float32(N*D), (N, D))))
         fill!(O, 0f0)
 
-        cuTileCPU.@parallel_for blocks = (M ÷ BM) attention_kernel(
+        MLIRKernels.@parallel_for blocks = (M ÷ BM) attention_kernel(
             Q, K, V, O, ct.Constant(BM), ct.Constant(BN), ct.Constant(D))
 
         # Julia oracle.
@@ -1272,7 +1272,7 @@ end
 
         # Reflection: emitted MLIR should contain vector.transpose plus two
         # vector.contract ops (one for Q*K^T, one for P*V) and a row-softmax.
-        mlir = cuTileCPU.code_mlir(attention_kernel,
+        mlir = MLIRKernels.code_mlir(attention_kernel,
             (Q, K, V, O, ct.Constant(BM), ct.Constant(BN), ct.Constant(D)))
         @test occursin("vector.transpose", mlir)
         # Two distinct vector.contract sites.
@@ -1296,10 +1296,10 @@ end
         @assert M % BM == 0
         @assert N_KV % BN == 0
 
-        raw_q = cuTileCPU.aligned_array(Float32, M*D; alignment=128)
-        raw_k = cuTileCPU.aligned_array(Float32, N_KV*D; alignment=128)
-        raw_v = cuTileCPU.aligned_array(Float32, N_KV*D; alignment=128)
-        raw_o = cuTileCPU.aligned_array(Float32, M*D; alignment=128)
+        raw_q = MLIRKernels.aligned_array(Float32, M*D; alignment=128)
+        raw_k = MLIRKernels.aligned_array(Float32, N_KV*D; alignment=128)
+        raw_v = MLIRKernels.aligned_array(Float32, N_KV*D; alignment=128)
+        raw_o = MLIRKernels.aligned_array(Float32, M*D; alignment=128)
         Q = reshape(raw_q, (M, D))
         K = reshape(raw_k, (N_KV, D))
         V = reshape(raw_v, (N_KV, D))
@@ -1315,7 +1315,7 @@ end
         copyto!(V, Float32.(reshape((1:N_KV*D) ./ Float32(N_KV*D), (N_KV, D))))
         fill!(O, 0f0)
 
-        cuTileCPU.@parallel_for blocks = (M ÷ BM) flash_attn_kernel(
+        MLIRKernels.@parallel_for blocks = (M ÷ BM) flash_attn_kernel(
             Q, K, V, O, ct.Constant(BM), ct.Constant(BN), ct.Constant(D),
             ct.Constant(N_KV))
 
@@ -1335,7 +1335,7 @@ end
         # Reflection: emitted MLIR should contain the new ops for this kernel:
         # arith.maxnumf (element-wise max), math.fma (two sites in the loop
         # body for α*l + sum(p) and α*o + p@v), and a -Inf32 splat constant.
-        mlir = cuTileCPU.code_mlir(flash_attn_kernel,
+        mlir = MLIRKernels.code_mlir(flash_attn_kernel,
             (Q, K, V, O, ct.Constant(BM), ct.Constant(BN), ct.Constant(D),
              ct.Constant(N_KV)))
         @test occursin("arith.maxnumf", mlir)
@@ -1358,20 +1358,20 @@ end
         # vector.multi_reduction <add> lowers correctly for bf16.
         nrows = 16
         ncols = 128
-        raw = cuTileCPU.aligned_array(BFloat16, nrows * ncols; alignment=128)
+        raw = MLIRKernels.aligned_array(BFloat16, nrows * ncols; alignment=128)
         a2  = reshape(raw, (nrows, ncols))
         # Keep row values small so the BF16-precision sum can stay representable.
         copyto!(a2, BFloat16.(reshape(1:(nrows*ncols), (nrows, ncols)) ./
                               (nrows * ncols)))
-        b = cuTileCPU.aligned_array(BFloat16, nrows; alignment=128)
+        b = MLIRKernels.aligned_array(BFloat16, nrows; alignment=128)
         fill!(b, BFloat16(0))
 
-        k = cuTileCPU.cpu_function(row_sum_kernel_T, (a2, b))
+        k = MLIRKernels.cpu_function(row_sum_kernel_T, (a2, b))
         k(a2, b; blocks=nrows)
         expected = vec(sum(Float32.(a2); dims=2))
         @test Float32.(b) ≈ expected rtol=5e-2
 
-        mlir = cuTileCPU.code_mlir(row_sum_kernel_T, (a2, b))
+        mlir = MLIRKernels.code_mlir(row_sum_kernel_T, (a2, b))
         @test occursin("vector.multi_reduction", mlir)
         @test occursin("bf16", mlir)
     end
@@ -1383,9 +1383,9 @@ end
         # `Intrinsics.atomic_add(...)`; the walker maps the RMW to
         # `memref.atomic_rmw addi` on the underlying memref.
         n_blocks = 128
-        counter = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+        counter = MLIRKernels.aligned_array(Int32, 1; alignment=128)
         counter[1] = Int32(0)
-        k = cuTileCPU.cpu_function(atomic_count_kernel, (counter,))
+        k = MLIRKernels.cpu_function(atomic_count_kernel, (counter,))
         k(counter; blocks=n_blocks)
         @test counter[1] == Int32(n_blocks)
 
@@ -1393,7 +1393,7 @@ end
         # the `addi` kind keyword. The atomic op lowers to `llvm.atomicrmw
         # add … acq_rel` in the pipeline (verified end-to-end by the launch
         # check above).
-        mlir = cuTileCPU.code_mlir(atomic_count_kernel, (counter,))
+        mlir = MLIRKernels.code_mlir(atomic_count_kernel, (counter,))
         @test occursin("memref.atomic_rmw addi", mlir)
         # Run a larger grid to stress the OMP fork/join + atomic contention.
         counter[1] = Int32(0)
@@ -1408,13 +1408,13 @@ end
         # with a small absolute tolerance per block.
         n_blocks = 100
         val = 1.5f0
-        out = cuTileCPU.aligned_array(Float32, 1; alignment=128)
+        out = MLIRKernels.aligned_array(Float32, 1; alignment=128)
         out[1] = 0f0
-        k = cuTileCPU.cpu_function(atomic_count_f32_kernel, (out, val))
+        k = MLIRKernels.cpu_function(atomic_count_f32_kernel, (out, val))
         k(out, val; blocks=n_blocks)
         @test out[1] ≈ Float32(n_blocks) * val rtol=1e-5
 
-        mlir = cuTileCPU.code_mlir(atomic_count_f32_kernel, (out, val))
+        mlir = MLIRKernels.code_mlir(atomic_count_f32_kernel, (out, val))
         @test occursin("memref.atomic_rmw addf", mlir)
     end
 
@@ -1423,13 +1423,13 @@ end
         # signed max. Final value is the largest bid that ran. Walker maps
         # to `memref.atomic_rmw maxs` (signed-max kind).
         n_blocks = 128
-        out = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+        out = MLIRKernels.aligned_array(Int32, 1; alignment=128)
         out[1] = Int32(0)
-        k = cuTileCPU.cpu_function(atomic_max_kernel, (out,))
+        k = MLIRKernels.cpu_function(atomic_max_kernel, (out,))
         k(out; blocks=n_blocks)
         @test out[1] == Int32(n_blocks)
 
-        mlir = cuTileCPU.code_mlir(atomic_max_kernel, (out,))
+        mlir = MLIRKernels.code_mlir(atomic_max_kernel, (out,))
         @test occursin("memref.atomic_rmw maxs", mlir)
     end
 
@@ -1438,13 +1438,13 @@ end
         # signed min over each block's bid. The minimum is `1` (bid is
         # 1-indexed). Walker maps to `memref.atomic_rmw mins`.
         n_blocks = 128
-        out = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+        out = MLIRKernels.aligned_array(Int32, 1; alignment=128)
         out[1] = typemax(Int32)
-        k = cuTileCPU.cpu_function(atomic_min_kernel, (out,))
+        k = MLIRKernels.cpu_function(atomic_min_kernel, (out,))
         k(out; blocks=n_blocks)
         @test out[1] == Int32(1)
 
-        mlir = cuTileCPU.code_mlir(atomic_min_kernel, (out,))
+        mlir = MLIRKernels.code_mlir(atomic_min_kernel, (out,))
         @test occursin("memref.atomic_rmw mins", mlir)
     end
 
@@ -1457,8 +1457,8 @@ end
         # host histogram.
         n_buckets = 16
         n_values = 1024
-        values = cuTileCPU.aligned_array(Int32, n_values; alignment=128)
-        counts = cuTileCPU.aligned_array(Int32, n_buckets; alignment=128)
+        values = MLIRKernels.aligned_array(Int32, n_values; alignment=128)
+        counts = MLIRKernels.aligned_array(Int32, n_buckets; alignment=128)
 
         # Seed-stable RNG so the histogram is deterministic across runs.
         rng_state = UInt32(0x12345678)
@@ -1474,7 +1474,7 @@ end
         end
         fill!(counts, Int32(0))
 
-        k = cuTileCPU.cpu_function(atomic_hist_kernel,
+        k = MLIRKernels.cpu_function(atomic_hist_kernel,
                                    (values, counts, ct.Constant(n_buckets)))
         k(values, counts, ct.Constant(n_buckets); blocks=n_values)
 
@@ -1486,7 +1486,7 @@ end
         @test counts == expected
         @test sum(counts) == Int32(n_values)
 
-        mlir = cuTileCPU.code_mlir(atomic_hist_kernel,
+        mlir = MLIRKernels.code_mlir(atomic_hist_kernel,
             (values, counts, ct.Constant(n_buckets)))
         @test occursin("memref.atomic_rmw addi", mlir)
         @test occursin("arith.remsi", mlir)
@@ -1497,9 +1497,9 @@ end
         # of all bids that ran (every block does run). Order-independent, so
         # the result is fully deterministic.
         n_blocks = 8
-        out = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+        out = MLIRKernels.aligned_array(Int32, 1; alignment=128)
         out[1] = Int32(0)
-        k = cuTileCPU.cpu_function(atomic_or_kernel, (out,))
+        k = MLIRKernels.cpu_function(atomic_or_kernel, (out,))
         k(out; blocks=n_blocks)
         expected = Int32(0)
         for i in 1:n_blocks
@@ -1507,7 +1507,7 @@ end
         end
         @test out[1] == expected
 
-        mlir = cuTileCPU.code_mlir(atomic_or_kernel, (out,))
+        mlir = MLIRKernels.code_mlir(atomic_or_kernel, (out,))
         @test occursin("memref.atomic_rmw ori", mlir)
     end
 
@@ -1515,9 +1515,9 @@ end
         # AND-reduction: start from all-ones, AND in each bid. Order-
         # independent.
         n_blocks = 8
-        out = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+        out = MLIRKernels.aligned_array(Int32, 1; alignment=128)
         out[1] = typemax(Int32)
-        k = cuTileCPU.cpu_function(atomic_and_kernel, (out,))
+        k = MLIRKernels.cpu_function(atomic_and_kernel, (out,))
         k(out; blocks=n_blocks)
         expected = typemax(Int32)
         for i in 1:n_blocks
@@ -1525,16 +1525,16 @@ end
         end
         @test out[1] == expected
 
-        mlir = cuTileCPU.code_mlir(atomic_and_kernel, (out,))
+        mlir = MLIRKernels.code_mlir(atomic_and_kernel, (out,))
         @test occursin("memref.atomic_rmw andi", mlir)
     end
 
     @testset "atomic_xor (Int32)" begin
         # XOR-reduction: order-independent, even number of equal bits cancel.
         n_blocks = 8
-        out = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+        out = MLIRKernels.aligned_array(Int32, 1; alignment=128)
         out[1] = Int32(0)
-        k = cuTileCPU.cpu_function(atomic_xor_kernel, (out,))
+        k = MLIRKernels.cpu_function(atomic_xor_kernel, (out,))
         k(out; blocks=n_blocks)
         expected = Int32(0)
         for i in 1:n_blocks
@@ -1545,7 +1545,7 @@ end
         # Upstream `memref.atomic_rmw` enum lacks an `xori` kind, so the
         # walker routes `atomic_xor` through `memref.generic_atomic_rmw`
         # with an `arith.xori` region body.
-        mlir = cuTileCPU.code_mlir(atomic_xor_kernel, (out,))
+        mlir = MLIRKernels.code_mlir(atomic_xor_kernel, (out,))
         @test occursin("memref.generic_atomic_rmw", mlir)
         @test occursin("arith.xori", mlir)
     end
@@ -1556,13 +1556,13 @@ end
         # always in 1..n_blocks. Walker maps to `memref.atomic_rmw assign`
         # which lowers to `llvm.atomicrmw xchg`.
         n_blocks = 64
-        out = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+        out = MLIRKernels.aligned_array(Int32, 1; alignment=128)
         out[1] = Int32(0)
-        k = cuTileCPU.cpu_function(atomic_xchg_kernel, (out,))
+        k = MLIRKernels.cpu_function(atomic_xchg_kernel, (out,))
         k(out; blocks=n_blocks)
         @test 1 <= out[1] <= n_blocks
 
-        mlir = cuTileCPU.code_mlir(atomic_xchg_kernel, (out,))
+        mlir = MLIRKernels.code_mlir(atomic_xchg_kernel, (out,))
         @test occursin("memref.atomic_rmw assign", mlir)
     end
 
@@ -1573,13 +1573,13 @@ end
         # value is non-zero and in 1..n_blocks. Walker maps to
         # `memref.generic_atomic_rmw` with a compare/select region.
         n_blocks = 64
-        out = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+        out = MLIRKernels.aligned_array(Int32, 1; alignment=128)
         out[1] = Int32(0)
-        k = cuTileCPU.cpu_function(atomic_cas_kernel, (out,))
+        k = MLIRKernels.cpu_function(atomic_cas_kernel, (out,))
         k(out; blocks=n_blocks)
         @test 1 <= out[1] <= n_blocks
 
-        mlir = cuTileCPU.code_mlir(atomic_cas_kernel, (out,))
+        mlir = MLIRKernels.code_mlir(atomic_cas_kernel, (out,))
         @test occursin("memref.generic_atomic_rmw", mlir)
         @test occursin("memref.atomic_yield", mlir)
     end
@@ -1594,11 +1594,11 @@ end
         # This exercises the *prior-value-returning* form of atomic_add
         # together with a scalar tile store at an atomic-derived index.
         for n_blocks in (64, 1024)
-            counter = cuTileCPU.aligned_array(Int32, 1; alignment=128)
+            counter = MLIRKernels.aligned_array(Int32, 1; alignment=128)
             counter[1] = Int32(0)
-            bids = cuTileCPU.aligned_array(Int32, n_blocks; alignment=128)
+            bids = MLIRKernels.aligned_array(Int32, n_blocks; alignment=128)
             fill!(bids, Int32(0))
-            k = cuTileCPU.cpu_function(atomic_counter_record_kernel,
+            k = MLIRKernels.cpu_function(atomic_counter_record_kernel,
                                         (counter, bids))
             k(counter, bids; blocks=n_blocks)
             @test counter[1] == Int32(n_blocks)
@@ -1609,9 +1609,9 @@ end
         # Reflection: the kernel must contain a `memref.atomic_rmw addi`
         # and the prior value must feed back into a store (a `transfer_write`
         # whose index originates from the atomic's i32 result).
-        counter = cuTileCPU.aligned_array(Int32, 1; alignment=128)
-        bids = cuTileCPU.aligned_array(Int32, 64; alignment=128)
-        mlir = cuTileCPU.code_mlir(atomic_counter_record_kernel, (counter, bids))
+        counter = MLIRKernels.aligned_array(Int32, 1; alignment=128)
+        bids = MLIRKernels.aligned_array(Int32, 64; alignment=128)
+        mlir = MLIRKernels.code_mlir(atomic_counter_record_kernel, (counter, bids))
         @test occursin("memref.atomic_rmw addi", mlir)
         @test occursin("vector.transfer_write", mlir)
     end
@@ -1622,18 +1622,18 @@ end
         # the input tile element-wise via overlay.
         n = 1024
         tile = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
         copyto!(a, Float32.(range(0.1f0, stop=π, length=n)))
         fill!(b, 0f0)
 
-        cuTileCPU.parallel_for(math_mix_kernel, (a, b, ct.Constant(tile));
+        MLIRKernels.parallel_for(math_mix_kernel, (a, b, ct.Constant(tile));
                                blocks = cld(n, tile))
         # Reference: same Julia expression on host.
         ref = abs.(floor.(sin.(a) .+ tanh.(log.(a) .+ cos.(a))))
         @test b ≈ ref rtol=1e-4
 
-        mlir = cuTileCPU.code_mlir(math_mix_kernel, (a, b, ct.Constant(tile)))
+        mlir = MLIRKernels.code_mlir(math_mix_kernel, (a, b, ct.Constant(tile)))
         for op in ("math.sin", "math.cos", "math.log", "math.tanh",
                    "math.floor", "math.absf")
             @test occursin(op, mlir)
@@ -1644,14 +1644,14 @@ end
         # Smoke test the Philox2x32-7 RNG. cuTile decomposes `rand(Float32, (tile,))`
         # to raw integer arithmetic on a per-stream `(counter, seed)` pair; the
         # seed is sourced from the implicit trailing `KernelState.seed` param
-        # that cuTileCPU's `lower_to_mlir` adds after the user args. The launch
+        # that MLIRKernels's `lower_to_mlir` adds after the user args. The launch
         # plumbs `rand(UInt32)` per call into that slot.
         n = 65536
         tile = 16
-        out = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        out = MLIRKernels.aligned_array(Float32, n; alignment=128)
         fill!(out, 0f0)
 
-        cuTileCPU.parallel_for(rand_uniform_kernel, (out, ct.Constant(tile));
+        MLIRKernels.parallel_for(rand_uniform_kernel, (out, ct.Constant(tile));
                                blocks = cld(n, tile))
 
         @test minimum(out) >= 0f0
@@ -1666,16 +1666,16 @@ end
         # Two consecutive launches must produce *different* outputs: the host
         # seeds the launch with `Base.rand(UInt32)` per call, so the streams
         # should diverge.
-        out2 = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        out2 = MLIRKernels.aligned_array(Float32, n; alignment=128)
         fill!(out2, 0f0)
-        cuTileCPU.parallel_for(rand_uniform_kernel, (out2, ct.Constant(tile));
+        MLIRKernels.parallel_for(rand_uniform_kernel, (out2, ct.Constant(tile));
                                blocks = cld(n, tile))
         @test out != out2
 
         # Reflection: MLIR must reference the trailing i32 seed param and the
         # Philox bit-mixing ops (xori on the key, muli widening into the
         # high-half product).
-        mlir = cuTileCPU.code_mlir(rand_uniform_kernel, (out, ct.Constant(tile)))
+        mlir = MLIRKernels.code_mlir(rand_uniform_kernel, (out, ct.Constant(tile)))
         @test occursin("arith.xori", mlir)
         @test occursin("vector.shuffle", mlir)
         @test occursin("arith.uitofp", mlir)
@@ -1690,9 +1690,9 @@ end
         # equal.
         n = 64 * 16
         tile = 16
-        out = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        out = MLIRKernels.aligned_array(Float32, n; alignment=128)
         fill!(out, 0f0)
-        cuTileCPU.parallel_for(rand_uniform_kernel, (out, ct.Constant(tile));
+        MLIRKernels.parallel_for(rand_uniform_kernel, (out, ct.Constant(tile));
                                blocks = cld(n, tile))
         # Reshape to (tile, n_blocks) and compare every pair: at most one pair
         # may happen to coincide (essentially never with random seed).
@@ -1713,10 +1713,10 @@ end
         # the 0.05 tolerance is ample with N=65536.
         n = 65536
         tile = 16
-        out = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        out = MLIRKernels.aligned_array(Float32, n; alignment=128)
         fill!(out, 0f0)
 
-        cuTileCPU.parallel_for(rand_normal_kernel, (out, ct.Constant(tile));
+        MLIRKernels.parallel_for(rand_normal_kernel, (out, ct.Constant(tile));
                                blocks = cld(n, tile))
 
         @test abs(Statistics.mean(out)) < 0.05
@@ -1727,7 +1727,7 @@ end
         @test minimum(out) < -2f0
         @test maximum(out) >  2f0
 
-        mlir = cuTileCPU.code_mlir(rand_normal_kernel, (out, ct.Constant(tile)))
+        mlir = MLIRKernels.code_mlir(rand_normal_kernel, (out, ct.Constant(tile)))
         # Box-Muller uses log, sqrt, sin, cos.
         @test occursin("math.log", mlir)
         @test occursin("math.sqrt", mlir)
@@ -1746,9 +1746,9 @@ end
         #     into a (2, N, BS) packed result for store.
         N = 16
         BS = 2
-        X = cuTileCPU.aligned_array(Float32, (2, N, BS); alignment=128)
-        Y = cuTileCPU.aligned_array(Float32, (2, N, BS); alignment=128)
-        W = cuTileCPU.aligned_array(Float32, (2, N, N); alignment=128)
+        X = MLIRKernels.aligned_array(Float32, (2, N, BS); alignment=128)
+        Y = MLIRKernels.aligned_array(Float32, (2, N, BS); alignment=128)
+        W = MLIRKernels.aligned_array(Float32, (2, N, N); alignment=128)
 
         # Deterministic complex input.
         for b in 1:BS, n in 1:N
@@ -1763,7 +1763,7 @@ end
         end
         fill!(Y, 0f0)
 
-        cuTileCPU.parallel_for(dft_kernel,
+        MLIRKernels.parallel_for(dft_kernel,
             (X, Y, W, ct.Constant(N), ct.Constant(BS)); blocks=1)
 
         # Oracle: hand-rolled DFT via the same W matrix.
@@ -1778,7 +1778,7 @@ end
         # Reflection: walker should emit extract_strided_slice for the r/i
         # split, two vector.contract sites for the two real matmul products,
         # and a final insert_strided_slice (from the leading-axis cat).
-        mlir = cuTileCPU.code_mlir(dft_kernel,
+        mlir = MLIRKernels.code_mlir(dft_kernel,
             (X, Y, W, ct.Constant(N), ct.Constant(BS)))
         @test occursin("vector.extract_strided_slice", mlir)
         @test occursin("vector.insert_strided_slice", mlir)
@@ -1799,13 +1799,13 @@ end
         F0F1 = F0 * F1; F1F2 = F1 * F2; F0F2 = F0 * F2
         BS = 2; D = 2; N2D = N * 2 ÷ D
 
-        x_in  = cuTileCPU.aligned_array(Float32, (D, N2D, BS); alignment=128)
-        y_out = cuTileCPU.aligned_array(Float32, (D, N2D, BS); alignment=128)
-        W0_   = cuTileCPU.aligned_array(Float32, (2, F0, F0); alignment=128)
-        W1_   = cuTileCPU.aligned_array(Float32, (2, F1, F1); alignment=128)
-        W2_   = cuTileCPU.aligned_array(Float32, (2, F2, F2); alignment=128)
-        T0_   = cuTileCPU.aligned_array(Float32, (2, F1F2, F0); alignment=128)
-        T1_   = cuTileCPU.aligned_array(Float32, (2, F2, F1); alignment=128)
+        x_in  = MLIRKernels.aligned_array(Float32, (D, N2D, BS); alignment=128)
+        y_out = MLIRKernels.aligned_array(Float32, (D, N2D, BS); alignment=128)
+        W0_   = MLIRKernels.aligned_array(Float32, (2, F0, F0); alignment=128)
+        W1_   = MLIRKernels.aligned_array(Float32, (2, F1, F1); alignment=128)
+        W2_   = MLIRKernels.aligned_array(Float32, (2, F2, F2); alignment=128)
+        T0_   = MLIRKernels.aligned_array(Float32, (2, F1F2, F0); alignment=128)
+        T1_   = MLIRKernels.aligned_array(Float32, (2, F2, F1); alignment=128)
 
         copyto!(W0_, _dft_matrix(F0))
         copyto!(W1_, _dft_matrix(F1))
@@ -1832,7 +1832,7 @@ end
         end
         fill!(y_out, 0f0)
 
-        cuTileCPU.parallel_for(fft_kernel,
+        MLIRKernels.parallel_for(fft_kernel,
             (x_in, y_out, W0_, W1_, W2_, T0_, T1_,
              ct.Constant(N), ct.Constant(F0), ct.Constant(F1), ct.Constant(F2),
              ct.Constant(F0F1), ct.Constant(F1F2), ct.Constant(F0F2),
@@ -1849,7 +1849,7 @@ end
         @test all(isfinite, y_out)
 
         # Reflection: should contain the new ops + several contracts/transposes.
-        mlir = cuTileCPU.code_mlir(fft_kernel,
+        mlir = MLIRKernels.code_mlir(fft_kernel,
             (x_in, y_out, W0_, W1_, W2_, T0_, T1_,
              ct.Constant(N), ct.Constant(F0), ct.Constant(F1), ct.Constant(F2),
              ct.Constant(F0F1), ct.Constant(F1F2), ct.Constant(F0F2),
@@ -1879,14 +1879,14 @@ end
         D_out = 32
         MAX_PER_EXPERT = 8
 
-        X = cuTileCPU.aligned_array(Float32, (D, num_tokens); alignment=128)
-        Y = cuTileCPU.aligned_array(Float32, (D_out, MAX_PER_EXPERT * num_experts);
+        X = MLIRKernels.aligned_array(Float32, (D, num_tokens); alignment=128)
+        Y = MLIRKernels.aligned_array(Float32, (D_out, MAX_PER_EXPERT * num_experts);
                                     alignment=128)
-        expert_ids = cuTileCPU.aligned_array(Int32, num_tokens; alignment=128)
-        counters = cuTileCPU.aligned_array(Int32, num_experts; alignment=128)
-        slot_tokens = cuTileCPU.aligned_array(Int32, MAX_PER_EXPERT * num_experts;
+        expert_ids = MLIRKernels.aligned_array(Int32, num_tokens; alignment=128)
+        counters = MLIRKernels.aligned_array(Int32, num_experts; alignment=128)
+        slot_tokens = MLIRKernels.aligned_array(Int32, MAX_PER_EXPERT * num_experts;
                                               alignment=128)
-        Wexp = cuTileCPU.aligned_array(Float32, (D_out, D, num_experts);
+        Wexp = MLIRKernels.aligned_array(Float32, (D_out, D, num_experts);
                                        alignment=128)
 
         # Deterministic inputs.
@@ -1904,7 +1904,7 @@ end
         fill!(slot_tokens, Int32(0))
         fill!(Y, 0f0)
 
-        cuTileCPU.@parallel_for blocks = num_tokens moe_routing_kernel(
+        MLIRKernels.@parallel_for blocks = num_tokens moe_routing_kernel(
             X, Y, expert_ids, counters, slot_tokens, Wexp,
             ct.Constant(D), ct.Constant(D_out), ct.Constant(MAX_PER_EXPERT))
 
@@ -1952,7 +1952,7 @@ end
         # (vector.contract), the 3-D weight load with a 1-thick trailing dim
         # (vector<1x32x32xf32>), and a final 2-D vector.transfer_write at a
         # runtime column.
-        mlir = cuTileCPU.code_mlir(moe_routing_kernel,
+        mlir = MLIRKernels.code_mlir(moe_routing_kernel,
             (X, Y, expert_ids, counters, slot_tokens, Wexp,
              ct.Constant(D), ct.Constant(D_out), ct.Constant(MAX_PER_EXPERT)))
         @test occursin("memref.atomic_rmw addi", mlir)
@@ -1976,14 +1976,14 @@ end
         D_out = 32
         MAX_PER_EXPERT = num_tokens  # > any single expert's worst-case count
 
-        X = cuTileCPU.aligned_array(Float32, (D, num_tokens); alignment=128)
-        Y = cuTileCPU.aligned_array(Float32, (D_out, MAX_PER_EXPERT * num_experts);
+        X = MLIRKernels.aligned_array(Float32, (D, num_tokens); alignment=128)
+        Y = MLIRKernels.aligned_array(Float32, (D_out, MAX_PER_EXPERT * num_experts);
                                     alignment=128)
-        expert_ids = cuTileCPU.aligned_array(Int32, num_tokens; alignment=128)
-        counters = cuTileCPU.aligned_array(Int32, num_experts; alignment=128)
-        slot_tokens = cuTileCPU.aligned_array(Int32, MAX_PER_EXPERT * num_experts;
+        expert_ids = MLIRKernels.aligned_array(Int32, num_tokens; alignment=128)
+        counters = MLIRKernels.aligned_array(Int32, num_experts; alignment=128)
+        slot_tokens = MLIRKernels.aligned_array(Int32, MAX_PER_EXPERT * num_experts;
                                               alignment=128)
-        Wexp = cuTileCPU.aligned_array(Float32, (D_out, D, num_experts);
+        Wexp = MLIRKernels.aligned_array(Float32, (D_out, D, num_experts);
                                        alignment=128)
 
         copyto!(X, Float32.(reshape(1:D*num_tokens, (D, num_tokens)) ./
@@ -2000,7 +2000,7 @@ end
         fill!(slot_tokens, Int32(0))
         fill!(Y, 0f0)
 
-        cuTileCPU.@parallel_for blocks = num_tokens moe_routing_kernel(
+        MLIRKernels.@parallel_for blocks = num_tokens moe_routing_kernel(
             X, Y, expert_ids, counters, slot_tokens, Wexp,
             ct.Constant(D), ct.Constant(D_out), ct.Constant(MAX_PER_EXPERT))
 
@@ -2033,17 +2033,17 @@ end
         # Tile shrunk from 32 → 16 to keep vector.transpose cheap.
         BM, BN = 16, 16
         M, N = 64, 32
-        A = cuTileCPU.aligned_array(Float32, M, N; alignment=128)
-        B = cuTileCPU.aligned_array(Float32, N, M; alignment=128)
+        A = MLIRKernels.aligned_array(Float32, M, N; alignment=128)
+        B = MLIRKernels.aligned_array(Float32, N, M; alignment=128)
         copyto!(A, rand(Float32, M, N))
         fill!(B, 0f0)
 
-        cuTileCPU.parallel_for(transpose_kernel,
+        MLIRKernels.parallel_for(transpose_kernel,
                                (A, B, ct.Constant(BM), ct.Constant(BN));
                                blocks = (M ÷ BM, N ÷ BN))
         @test B == permutedims(A, (2, 1))
 
-        mlir = cuTileCPU.code_mlir(transpose_kernel,
+        mlir = MLIRKernels.code_mlir(transpose_kernel,
                                    (A, B, ct.Constant(BM), ct.Constant(BN)))
         @test occursin("vector.transpose", mlir)
     end
@@ -2061,7 +2061,7 @@ end
         b = rand(Float32, n)
         c = zeros(Float32, n)
 
-        k = cuTileCPU.spmd_function(vadd_spmd,
+        k = MLIRKernels.spmd_function(vadd_spmd,
             (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
             lane_width)
         # The `0` in the launch is a placeholder — the lane index is
@@ -2072,7 +2072,7 @@ end
         # Reflection: the emitted MLIR should contain the vector arith op and
         # one of the vector memory ops (transfer_read / gather) at the lane
         # width.
-        mlir = cuTileCPU.code_mlir(vadd_spmd,
+        mlir = MLIRKernels.code_mlir(vadd_spmd,
             (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
             spmd=true, lane_width)
         @test occursin("vector<16xf32>", mlir)
@@ -2095,13 +2095,13 @@ end
         # for supplying aligned buffers (aligned_array).
         n = 1024
         lane_width = 16
-        a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        b = cuTileCPU.aligned_array(Float32, n; alignment=128)
-        c = cuTileCPU.aligned_array(Float32, n; alignment=128)
+        a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        b = MLIRKernels.aligned_array(Float32, n; alignment=128)
+        c = MLIRKernels.aligned_array(Float32, n; alignment=128)
         copyto!(a, rand(Float32, n))
         copyto!(b, rand(Float32, n))
 
-        k = cuTileCPU.spmd_function(vadd_spmd,
+        k = MLIRKernels.spmd_function(vadd_spmd,
             (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
             lane_width, alignment=128)
         k(a, b, c, 0; blocks = cld(n, lane_width))
@@ -2109,7 +2109,7 @@ end
 
         # MLIR should now contain the alignment hint AND a strided<[1]>
         # layout on the memref args.
-        mlir = cuTileCPU.code_mlir(vadd_spmd,
+        mlir = MLIRKernels.code_mlir(vadd_spmd,
             (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
             spmd=true, lane_width, alignment=128)
         @test occursin("memref.assume_alignment", mlir)
@@ -2123,12 +2123,12 @@ end
         end
     end
 
-    # KernelAbstractions CPU backend (cuTileBackend <: KA.GPU). Guarded on KA
+    # KernelAbstractions CPU backend (MLIRBackend <: KA.GPU). Guarded on KA
     # being loadable: the package's own test env (--project=.) has KA only as
     # a weakdep, so this skips there and runs whenever KA is present (e.g. an
     # env that adds it). Validates the fully cuTile-decoupled KA path: KA
     # @kernel → Frontend.structured (own interpreter/intrinsics) → MLIR → clang.
-    @testset "KA: vadd via cuTileBackend (CPU, decoupled)" begin
+    @testset "KA: vadd via MLIRBackend (CPU, decoupled)" begin
         ka_loaded = try
             @eval using KernelAbstractions
             true
@@ -2140,8 +2140,8 @@ end
             @test true  # placeholder so the testset is non-empty
         else
             KA = KernelAbstractions
-            KAExt = Base.get_extension(cuTileCPU, :KernelAbstractionsExt)
-            Backend = KAExt.cuTileBackend
+            KAExt = Base.get_extension(MLIRKernels, :KernelAbstractionsExt)
+            Backend = KAExt.MLIRBackend
             @eval begin
                 @kernel function _ka_vadd!(C, A, B)
                     i = @index(Global, Linear)
@@ -2149,9 +2149,9 @@ end
                 end
             end
             N = 4096; W = 16
-            A = cuTileCPU.aligned_array(Float32, N; alignment=128); copyto!(A, rand(Float32, N))
-            B = cuTileCPU.aligned_array(Float32, N; alignment=128); copyto!(B, rand(Float32, N))
-            C = cuTileCPU.aligned_array(Float32, N; alignment=128); fill!(C, 0f0)
+            A = MLIRKernels.aligned_array(Float32, N; alignment=128); copyto!(A, rand(Float32, N))
+            B = MLIRKernels.aligned_array(Float32, N; alignment=128); copyto!(B, rand(Float32, N))
+            C = MLIRKernels.aligned_array(Float32, N; alignment=128); fill!(C, 0f0)
             (@eval _ka_vadd!)(Backend(), W)(C, A, B; ndrange=N)
             @test C ≈ A .+ B
             # The @noinline global_index marker must survive inference under
@@ -2165,7 +2165,7 @@ end
                 ndro = KA.NDIteration.NDRange{1, grp, wg, Nothing, Nothing}
                 KA.CompilerMetadata{ndr, KA.NDIteration.NoDynamicCheck, Nothing, Nothing, ndro}
             end
-            sci, rt = cuTileCPU.Frontend.structured(gpu_body,
+            sci, rt = MLIRKernels.Frontend.structured(gpu_body,
                 Tuple{ctxT, Vector{Float32}, Vector{Float32}, Vector{Float32}})
             @test rt === Nothing
             @test occursin("global_index", sprint(show, sci))

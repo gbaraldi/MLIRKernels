@@ -7,7 +7,7 @@
 # everything downstream is generated.
 
 using cuTile
-using cuTileCPU
+using MLIRKernels
 using MLIR
 const IR = MLIR.IR
 const MLIRAPI = MLIR.API
@@ -44,9 +44,9 @@ const GPU_PASSES = String[
 ]
 
 function compile_julia_to_cufunction(f, argt; kernel_name="vadd")
-    sci, rettype, _, _ = cuTileCPU._structured_with_analyses(f, argt)
+    sci, rettype, _, _ = MLIRKernels._structured_with_analyses(f, argt)
     @assert rettype === Nothing
-    mod, _, mlir_ctx, _ = cuTileCPU.lower_to_mlir_gpu(sci, argt; kernel_name)
+    mod, _, mlir_ctx, _ = MLIRKernels.lower_to_mlir_gpu(sci, argt; kernel_name)
 
     IR.activate(mlir_ctx)
     pm = IR.PassManager()

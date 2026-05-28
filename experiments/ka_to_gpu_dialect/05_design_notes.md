@@ -48,7 +48,7 @@ hand-written.
                 │                       │                       │
                 ▼                       ▼                       ▼
         CUDA.jl driver          AMDGPU.jl driver          dlopen + ccall
-        (CuModule/CuFunction)   (ROCModule/...)           (this is cuTileCPU)
+        (CuModule/CuFunction)   (ROCModule/...)           (this is MLIRKernels)
 ```
 
 ### `AbstractTarget` hierarchy
@@ -66,7 +66,7 @@ Each target answers three questions (the GPUCompiler `CompilerTarget` shape):
 1. **`mlir_pipeline(::Target)`** → the MLIR pass list. NVVM:
    `nvvm-attach-target{chip,features}` → `gpu-kernel-outlining` →
    `gpu.module(convert-gpu-to-nvvm)` → `convert-{scf,cf,arith,memref,nvvm}-to-llvm`
-   → `gpu-module-to-binary{format=llvm}`. CPU: the existing cuTileCPU
+   → `gpu-module-to-binary{format=llvm}`. CPU: the existing MLIRKernels
    `DEFAULT_PASSES` (+ optionally Polygeist's `affine`/`polygeist` passes
    for tiling/parallelism that upstream MLIR doesn't have).
 2. **`emit_target_asm(::Target, llvm_mod)`** → PTX/HSACO/host `.so`. GPU
@@ -74,11 +74,11 @@ Each target answers three questions (the GPUCompiler `CompilerTarget` shape):
    (experiment 02); CPU shells out to clang.
 3. **`load_and_launch(::Target, asm, args; grid, block)`** → the driver.
    NVVM: `CUDA.CuModule` + `cudacall` (experiment 02/03). ROCDL:
-   AMDGPU.jl's module loader. CPU: `dlopen` + `ccall` (cuTileCPU today).
+   AMDGPU.jl's module loader. CPU: `dlopen` + `ccall` (MLIRKernels today).
 
 ### The generic walker — what's target-parametric
 
-Today cuTileCPU's `lower_to_mlir` always emits `func.func` + `scf.parallel`
+Today MLIRKernels's `lower_to_mlir` always emits `func.func` + `scf.parallel`
 over the grid + vectorized (`vector.transfer_read`) tile bodies — the CPU
 SPMD-on-SIMD model. The GPU target needs a different emission for the same
 SCI:
@@ -165,12 +165,12 @@ stream, module load, kernel launch, memory). We do the same (experiment 02):
 ## Sequenced implementation plan
 
 1. **Generic walker emission strategy** — add `ScalarSIMT` alongside the
-   existing tile/SPMD emission in cuTileCPU's `lower.jl`. Smallest change
+   existing tile/SPMD emission in MLIRKernels's `lower.jl`. Smallest change
    that produces a `gpu.module` from an SCI. Reuses every arith/math/cf
    clause.
 2. **`NVVMTarget` + pipeline + LLVM.jl PTX emit + CUDA.jl launch** — lift
    experiments 02/04 driver code into a reusable `compile(::NVVMTarget, ...)`.
-3. **KA frontend on the GPU target** — the `cuTileBackend` overlay infra
+3. **KA frontend on the GPU target** — the `MLIRBackend` overlay infra
    (already built, `ext/KernelAbstractionsExt.jl`) but with the target set
    to `NVVMTarget` instead of `CPUTarget`. The `__index_Global_Linear`
    overlay → sentinel → `gpu.thread_id + block_id*block_dim` (vs the CPU
@@ -190,10 +190,10 @@ stream, module load, kernel launch, memory). We do the same (experiment 02):
 
 - **cuTile native-GPU comparison** needs Blackwell (sm_100+) — Tile IR is
   unsupported on Hopper. Until then we can only compare cuTile *CPU*
-  (cuTileCPU) against the GPU MLIR path, not cuTile-GPU vs MLIR-GPU.
+  (MLIRKernels) against the GPU MLIR path, not cuTile-GPU vs MLIR-GPU.
 - **Shared memory addressing** — `#gpu.address_space<workgroup>` lowering
   through `convert-gpu-to-nvvm` needs validating (experiment 06/reduction).
 - **Where the package lives** — `MLIRGPUCompiler.jl` as a new package with
-  cuTileCPU becoming its CPU-target reference, or grow cuTileCPU into the
+  MLIRKernels becoming its CPU-target reference, or grow MLIRKernels into the
   multi-target thing and rename. The walker + target abstraction is the
   reusable core either way.

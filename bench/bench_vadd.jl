@@ -1,13 +1,13 @@
-# Compare cuTileCPU's compiled vadd against the Julia broadcast baseline.
+# Compare MLIRKernels's compiled vadd against the Julia broadcast baseline.
 #
 # vadd is memory-bandwidth-bound on CPU: ~3 × n × sizeof(T) bytes touched
 # (2 loads + 1 store per element). Throughput in GB/s is the headline metric.
 #
-# Run: julia -t auto --project=cuTileCPU/bench cuTileCPU/bench/bench_vadd.jl
+# Run: julia -t auto --project=MLIRKernels/bench MLIRKernels/bench/bench_vadd.jl
 
 using cuTile
 const ct = cuTile
-using cuTileCPU
+using MLIRKernels
 using BenchmarkTools, Statistics, Printf
 
 function vadd_kernel(a::ct.TileArray{T,1}, b::ct.TileArray{T,1},
@@ -20,7 +20,7 @@ function vadd_kernel(a::ct.TileArray{T,1}, b::ct.TileArray{T,1},
 end
 
 # Native Julia broadcast baseline. Threaded loop is the closest fair compare
-# to cuTileCPU's OpenMP grid-parallel — single-threaded broadcast is
+# to MLIRKernels's OpenMP grid-parallel — single-threaded broadcast is
 # memory-bandwidth limited for one core, the threaded form for all cores.
 function julia_broadcast!(c, a, b)
     @. c = a + b
@@ -76,23 +76,23 @@ function bench_size(n::Int; tile::Int = 16, alignment::Int = 128, samples::Int=2
     touched_mb = 3 * arr_mb
     println("\n=== n = $n  ($arr_mb MB / array, $touched_mb MB touched / call) ===")
 
-    a = cuTileCPU.aligned_array(Float32, n; alignment)
-    b = cuTileCPU.aligned_array(Float32, n; alignment)
-    c = cuTileCPU.aligned_array(Float32, n; alignment)
+    a = MLIRKernels.aligned_array(Float32, n; alignment)
+    b = MLIRKernels.aligned_array(Float32, n; alignment)
+    c = MLIRKernels.aligned_array(Float32, n; alignment)
     fill!(a, 1f0); fill!(b, 2f0); fill!(c, 0f0)
 
     # Compile + cache (so the first benchmark sample isn't dominated by clang).
-    cuTileCPU.parallel_for(vadd_kernel, (a, b, c, ct.Constant(tile));
+    MLIRKernels.parallel_for(vadd_kernel, (a, b, c, ct.Constant(tile));
                             blocks = n ÷ tile)
     @assert all(==(3f0), c)
 
-    t_ct = time_min(() -> cuTileCPU.parallel_for(vadd_kernel,
+    t_ct = time_min(() -> MLIRKernels.parallel_for(vadd_kernel,
                                                   (a, b, c, ct.Constant(tile));
                                                   blocks = n ÷ tile); samples)
     t_bcast = time_min(() -> julia_broadcast!(c, a, b); samples)
     t_thr   = time_min(() -> julia_threaded!(c, a, b); samples)
 
-    report("cuTileCPU @parallel_for", t_ct,    n, Float32)
+    report("MLIRKernels @parallel_for", t_ct,    n, Float32)
     report("Julia broadcast (.= .+)", t_bcast, n, Float32)
     report("Julia Threads.@threads",  t_thr,   n, Float32)
 end

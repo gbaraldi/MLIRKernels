@@ -1,9 +1,9 @@
-# Matmul GFLOPS comparison: cuTileCPU vs Julia's BLAS (OpenBLAS / MKL by default)
+# Matmul GFLOPS comparison: MLIRKernels vs Julia's BLAS (OpenBLAS / MKL by default)
 # vs Julia hand-rolled triple loop.
 
 using cuTile
 const ct = cuTile
-using cuTileCPU
+using MLIRKernels
 using LinearAlgebra, BenchmarkTools, Printf
 
 function matmul_kernel(A::ct.TileArray{T,2}, B::ct.TileArray{T,2}, C::ct.TileArray{T,2},
@@ -50,21 +50,21 @@ function bench_matmul(M::Int, N::Int, K::Int; BM::Int=64, BN::Int=64, BK::Int=64
     println("\n=== M=$M N=$N K=$K  (tile BM=$BM BN=$BN BK=$BK) ===")
     @assert M % BM == 0 && N % BN == 0 && K % BK == 0
 
-    A = cuTileCPU.aligned_array(Float32, M, K; alignment=128)
-    B = cuTileCPU.aligned_array(Float32, K, N; alignment=128)
-    C = cuTileCPU.aligned_array(Float32, M, N; alignment=128)
+    A = MLIRKernels.aligned_array(Float32, M, K; alignment=128)
+    B = MLIRKernels.aligned_array(Float32, K, N; alignment=128)
+    C = MLIRKernels.aligned_array(Float32, M, N; alignment=128)
     copyto!(A, rand(Float32, M, K))
     copyto!(B, rand(Float32, K, N))
     fill!(C, 0f0)
 
     # Compile once (warm cache).
-    cuTileCPU.parallel_for(matmul_kernel,
+    MLIRKernels.parallel_for(matmul_kernel,
                            (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
                            blocks = (M ÷ BM, N ÷ BN))
     expected = Array(A) * Array(B)
     @assert isapprox(C, expected; rtol=1f-3) "matmul correctness check failed"
 
-    t_ct = time_min(() -> cuTileCPU.parallel_for(matmul_kernel,
+    t_ct = time_min(() -> MLIRKernels.parallel_for(matmul_kernel,
                           (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
                           blocks = (M ÷ BM, N ÷ BN)))
     fill!(C, 0f0)
@@ -87,7 +87,7 @@ function bench_matmul(M::Int, N::Int, K::Int; BM::Int=64, BN::Int=64, BK::Int=64
     end
     t_naive = time_min(() -> triple_loop!(C, A, B))
 
-    report("cuTileCPU @parallel_for", t_ct,    M, N, K)
+    report("MLIRKernels @parallel_for", t_ct,    M, N, K)
     report("Julia BLAS (mul!)",       t_blas,  M, N, K)
     report("Julia naive triple-loop", t_naive, M, N, K)
 end

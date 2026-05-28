@@ -7,7 +7,7 @@
 # CUDA.jl's native SIMT.
 #
 # How it composes the prior pieces:
-#   - `cuTileBackend <: KA.GPU` (ext/KernelAbstractionsExt.jl) makes KA
+#   - `MLIRBackend <: KA.GPU` (ext/KernelAbstractionsExt.jl) makes KA
 #     emit the SIMT `gpu_*` body and overlays the KA intrinsics in
 #     cuTile's method table:
 #         KA.__validindex(ctx)          → true
@@ -29,15 +29,15 @@
 using KernelAbstractions
 const KA = KernelAbstractions
 using cuTile
-using cuTileCPU
+using MLIRKernels
 using MLIR
 const IR = MLIR.IR
 const MLIRAPI = MLIR.API
 using LLVM
 using CUDA
 
-const KAExt = Base.get_extension(cuTileCPU, :KernelAbstractionsExt)
-const cuTileBackend = KAExt.cuTileBackend
+const KAExt = Base.get_extension(MLIRKernels, :KernelAbstractionsExt)
+const MLIRBackend = KAExt.MLIRBackend
 
 # ---------------------------------------------------------------------------
 # The kernel — an unmodified KA @kernel. Same source you'd run on any
@@ -50,7 +50,7 @@ const cuTileBackend = KAExt.cuTileBackend
 end
 
 # Grab the macro-generated SIMT body (`gpu_vadd_ka!`). KA's @kernel emits
-# `gpu_<name>` and `cpu_<name>`; cuTileBackend (<: KA.GPU) selects the
+# `gpu_<name>` and `cpu_<name>`; MLIRBackend (<: KA.GPU) selects the
 # gpu_ one.
 const gpu_body = @eval $(Symbol("gpu_vadd_ka!"))
 
@@ -88,11 +88,11 @@ function compile_ka_to_cufunction(gpu_body, N, W; kernel_name="vadd_ka")
     # quirks.
     AT = Tuple{ctxT, Vector{Float32}, Vector{Float32}, Vector{Float32}}
 
-    sci, rettype = cuTileCPU.Frontend.structured(gpu_body, AT)
+    sci, rettype = MLIRKernels.Frontend.structured(gpu_body, AT)
     rettype === Nothing || @warn "KA gpu body inferred rettype = $rettype (expected Nothing)"
     # ctx is arg-slot 2 (slot 1 is the function itself).
     mod, _, mlir_ctx, kinds =
-        cuTileCPU.lower_to_mlir_gpu(sci, AT; kernel_name, ctx_arg=2)
+        MLIRKernels.lower_to_mlir_gpu(sci, AT; kernel_name, ctx_arg=2)
 
     IR.activate(mlir_ctx)
     println("=== generated gpu.module ===")
@@ -182,7 +182,7 @@ println("\n" * "=" ^ 60)
 println("Same KA @kernel, two backends (N=$N, H100 sm_90)")
 println("=" ^ 60)
 println(rpad("backend", 40), rpad("μs", 10), "GB/s")
-println(rpad("cuTileBackend (MLIR gpu→PTX)", 40),
+println(rpad("MLIRBackend (MLIR gpu→PTX)", 40),
         rpad(round(t_mlir*1e6, digits=2), 10), round(gb/t_mlir, digits=1))
 println(rpad("CUDABackend (GPUCompiler SIMT)", 40),
         rpad(round(t_cuda*1e6, digits=2), 10), round(gb/t_cuda, digits=1))

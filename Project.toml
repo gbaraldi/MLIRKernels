@@ -1,4 +1,4 @@
-name = "cuTileCPU"
+name = "MLIRKernels"
 uuid = "62a3a8c1-3f0e-4d6f-8d0e-7c5f9b3d2a01"
 version = "0.1.0"
 authors = ["gbaraldi"]

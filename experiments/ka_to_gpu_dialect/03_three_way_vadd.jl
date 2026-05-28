@@ -22,7 +22,7 @@
 #     for runtime comparison.
 #   - Runtime in μs and effective DRAM bandwidth (GB/s) for all three.
 
-using cuTileCPU
+using MLIRKernels
 using MLIR
 const IR = MLIR.IR
 using LLVM
@@ -65,7 +65,7 @@ function extract_object_bytes(mod::IR.Module)
 end
 
 function build_mlir_kernel()
-    ctx = cuTileCPU.fresh_context()
+    ctx = MLIRKernels.fresh_context()
     IR.activate(ctx)
     mlir_text = read(joinpath(HERE, "01_handwritten_vadd_gpu.mlir"), String)
     mod = parse(IR.Module, mlir_text)
@@ -310,7 +310,7 @@ println(something(entry_body(simt_ptx), "(no match)"))
 # cuTile:
 #   - Tile IR (cuTile's tileiras → CUBIN backend) is NOT supported on
 #     Hopper (sm_90); it requires Blackwell (sm_100+). On this H100 the
-#     cuTile path can't compile at all. The cuTileCPU package is unaffected
+#     cuTile path can't compile at all. The MLIRKernels package is unaffected
 #     (it never uses tileiras — it re-lowers cuTile's StructuredIRCode via
 #     our own MLIR pipeline), but a *native-GPU* cuTile comparison needs
 #     Blackwell hardware.

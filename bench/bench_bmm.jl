@@ -1,9 +1,9 @@
-# Batched matmul perf: cuTileCPU vs Julia BLAS (strided-batched gemm via mul!
+# Batched matmul perf: MLIRKernels vs Julia BLAS (strided-batched gemm via mul!
 # in a loop) vs naive triple-loop per batch.
 
 using cuTile
 const ct = cuTile
-using cuTileCPU
+using MLIRKernels
 using LinearAlgebra, Printf
 
 function bmm_kernel(A::ct.TileArray{T,3}, B::ct.TileArray{T,3}, C::ct.TileArray{T,3},
@@ -45,19 +45,19 @@ function bench_bmm(batch::Int, M::Int, N::Int, K::Int;
     println("\n=== BS=$batch  M=$M N=$N K=$K  (tile BS=$BS BM=$BM BN=$BN BK=$BK) ===")
     @assert batch % BS == 0 && M % BM == 0 && N % BN == 0 && K % BK == 0
 
-    A = cuTileCPU.aligned_array(Float32, batch, M, K; alignment=128)
-    B = cuTileCPU.aligned_array(Float32, batch, K, N; alignment=128)
-    C = cuTileCPU.aligned_array(Float32, batch, M, N; alignment=128)
+    A = MLIRKernels.aligned_array(Float32, batch, M, K; alignment=128)
+    B = MLIRKernels.aligned_array(Float32, batch, K, N; alignment=128)
+    C = MLIRKernels.aligned_array(Float32, batch, M, N; alignment=128)
     copyto!(A, rand(Float32, batch, M, K))
     copyto!(B, rand(Float32, batch, K, N))
     fill!(C, 0f0)
 
     # Warm cache
-    cuTileCPU.parallel_for(bmm_kernel,
+    MLIRKernels.parallel_for(bmm_kernel,
         (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK), ct.Constant(BS));
         blocks = (batch ÷ BS, M ÷ BM, N ÷ BN))
 
-    t_ct = time_min(() -> cuTileCPU.parallel_for(bmm_kernel,
+    t_ct = time_min(() -> MLIRKernels.parallel_for(bmm_kernel,
         (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK), ct.Constant(BS));
         blocks = (batch ÷ BS, M ÷ BM, N ÷ BN)))
 
@@ -71,7 +71,7 @@ function bench_bmm(batch::Int, M::Int, N::Int, K::Int;
     end)
 
     flops = 2.0 * batch * M * N * K
-    @printf("  cuTileCPU @parallel_for         %9.1f μs  %8.1f GFLOPS\n",
+    @printf("  MLIRKernels @parallel_for         %9.1f μs  %8.1f GFLOPS\n",
             t_ct/1e3, flops / t_ct)
     @printf("  Julia BLAS loop (mul! per slc)  %9.1f μs  %8.1f GFLOPS\n",
             t_blas/1e3, flops / t_blas)

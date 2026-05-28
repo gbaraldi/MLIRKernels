@@ -198,7 +198,7 @@ function (k::CPUKernel)(args...; blocks)
                     (is_spmd ? " required by spmd_function(...; alignment=$(align))" :
                      is_ka   ? " required by ka_function(...; alignment=$(align))" :
                                " required by ArraySpec") *
-                    ". Allocate with `cuTileCPU.aligned_array(...; alignment=$(align))`.")
+                    ". Allocate with `MLIRKernels.aligned_array(...; alignment=$(align))`.")
             end
             push!(descs, pack_memref_descriptor(a))
             push!(pin_targets, a)
@@ -516,13 +516,13 @@ const _ka_kernel_cache = Dict{Tuple{Any, Type, Int, Bool, Int, Int}, CPUKernel}(
 """
     ka_function(f, argtypes::Type; lane_width=16, alignment=16, serial=false) -> CPUKernel
 
-Compile a KernelAbstractions-style `gpu_*` kernel body via cuTileCPU's MLIR
+Compile a KernelAbstractions-style `gpu_*` kernel body via MLIRKernels's MLIR
 pipeline. `argtypes` is `Tuple{CtxType, ArgTypes...}` where the first slot
 is a `KernelAbstractions.CompilerMetadata{…}` type — that slot is *consumed*
 by the KA-intrinsic overlays (see `ext/KernelAbstractionsExt.jl`) and is
 not materialised as an MLIR parameter.
 
-Used internally by `(::Kernel{cuTileBackend})(...)`; users normally don't
+Used internally by `(::Kernel{MLIRBackend})(...)`; users normally don't
 call this directly.
 """
 function ka_function(@nospecialize(f), argtypes::Type;

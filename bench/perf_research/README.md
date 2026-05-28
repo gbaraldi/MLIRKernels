@@ -31,7 +31,7 @@ against OpenBLAS as the reference.
 julia -t auto bench/perf_research/run_bench.jl
 ```
 
-Needs no Julia env setup beyond what cuTileCPU already requires (LLVM_full_jll
+Needs no Julia env setup beyond what MLIRKernels already requires (LLVM_full_jll
 for `mlir-opt`/`mlir-translate`/`clang`, LLVMOpenMP_jll for libomp).
 
 ## Results (M=N=K=1024, F32, 64 threads, cache-flushed)
@@ -122,13 +122,13 @@ In rough priority order:
   modest perf gain. 256 hangs clang -O2 for hours (16M FMAs unrolled).
   Unsustainable.
 
-## What this means for cuTileCPU at the package level
+## What this means for MLIRKernels at the package level
 
 Our matmul at **~27% of BLAS with no hand-tuning is the right place to sit
 for the auto-codegen path** — comparable to Triton-CPU's generic. If a user
 genuinely needs MKL-class matmul, the realistic options are:
 
-- Compose their kernel from `cuTileCPU.aligned_array` + a direct `mul!`
+- Compose their kernel from `MLIRKernels.aligned_array` + a direct `mul!`
   call (uses OpenBLAS — already there)
 - Hand-write multi-level blocking in the cuTile kernel (works today; the
   user owns the cache hierarchy explicitly)

@@ -3,7 +3,7 @@
 # addressing knobs flagged in experiment 03 actually close the gap to
 # CUDA.jl SIMT's PTX.
 
-using cuTileCPU
+using MLIRKernels
 using MLIR
 const IR = MLIR.IR
 using LLVM
@@ -39,7 +39,7 @@ function extract_bc(mod::IR.Module)
 end
 
 function mlir_file_to_ptx(path)
-    ctx = cuTileCPU.fresh_context()
+    ctx = MLIRKernels.fresh_context()
     IR.activate(ctx)
     mod = parse(IR.Module, read(path, String))
     pm = IR.PassManager()

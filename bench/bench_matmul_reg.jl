@@ -4,7 +4,7 @@
 # register-sized — a small (MR, 1) × (1, NR) outer-product accumulated over K,
 # with MR×NR scalars sitting in vector registers across the K loop.
 #
-# Today cuTileCPU's matmul kernel uses 64×64×64 tiles. The vector.contract
+# Today MLIRKernels's matmul kernel uses 64×64×64 tiles. The vector.contract
 # unrolls that into ~4 K straight-line FMAs; clang -O2 takes ~35 s and
 # delivers ~270 GFLOPS (~19 % of OpenBLAS at 1024³).
 #
@@ -15,7 +15,7 @@
 
 using cuTile
 const ct = cuTile
-using cuTileCPU
+using MLIRKernels
 using LinearAlgebra, Printf
 
 # Register-tile matmul. RM, RN are the register tile sizes; K is the
@@ -74,9 +74,9 @@ ngflops(t_ns, M, N, K) = 2.0 * M * N * K / t_ns
 
 function bench(M, N, K)
     println("\n=== M=N=K=$M F32 ===")
-    A = cuTileCPU.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
-    B = cuTileCPU.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
-    C = cuTileCPU.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
+    A = MLIRKernels.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
+    B = MLIRKernels.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
+    C = MLIRKernels.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
 
     # --- Reference for correctness ---
     A_h, B_h = collect(A), collect(B)
@@ -86,7 +86,7 @@ function bench(M, N, K)
     RM, RN = 16, 16
     @assert M % RM == 0 && N % RN == 0
     fill!(C, 0f0)
-    cuTileCPU.parallel_for(matmul_reg_kernel,
+    MLIRKernels.parallel_for(matmul_reg_kernel,
         (A, B, C, ct.Constant(RM), ct.Constant(RN), ct.Constant(K));
         blocks = (M ÷ RM, N ÷ RN))
     rerr = maximum(abs, C .- C_ref) / maximum(abs, C_ref)
@@ -94,7 +94,7 @@ function bench(M, N, K)
             RM, RN, rerr)
 
     if rerr < 1e-3
-        t_reg = time_min(() -> cuTileCPU.parallel_for(matmul_reg_kernel,
+        t_reg = time_min(() -> MLIRKernels.parallel_for(matmul_reg_kernel,
             (A, B, C, ct.Constant(RM), ct.Constant(RN), ct.Constant(K));
             blocks = (M ÷ RM, N ÷ RN)))
     else
@@ -105,11 +105,11 @@ function bench(M, N, K)
     # --- 64-tile reference ---
     BM = BN = BK = 64
     fill!(C, 0f0)
-    cuTileCPU.parallel_for(matmul_tile_kernel,
+    MLIRKernels.parallel_for(matmul_tile_kernel,
         (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
         blocks = (M ÷ BM, N ÷ BN))
     @assert isapprox(C, C_ref; rtol=1e-3) "64-tile matmul gives wrong answer"
-    t_64 = time_min(() -> cuTileCPU.parallel_for(matmul_tile_kernel,
+    t_64 = time_min(() -> MLIRKernels.parallel_for(matmul_tile_kernel,
         (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
         blocks = (M ÷ BM, N ÷ BN)))
 
@@ -129,9 +129,9 @@ end
 
 function bench_tile_sweep(M, N, K)
     println("\n=== Tile-size sweep at M=N=K=$M F32 ===")
-    A = cuTileCPU.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
-    B = cuTileCPU.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
-    C = cuTileCPU.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
+    A = MLIRKernels.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
+    B = MLIRKernels.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
+    C = MLIRKernels.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
     A_h, B_h = collect(A), collect(B)
     C_ref = A_h * B_h
     flops = 2.0 * M * N * K
@@ -148,7 +148,7 @@ function bench_tile_sweep(M, N, K)
     for tile in (8, 16, 32, 64)
         if M % tile != 0; continue; end
         fill!(C, 0f0)
-        cuTileCPU.parallel_for(matmul_tile_kernel,
+        MLIRKernels.parallel_for(matmul_tile_kernel,
             (A, B, C, ct.Constant(tile), ct.Constant(tile), ct.Constant(tile));
             blocks = (M ÷ tile, N ÷ tile))
         if !isapprox(C, C_ref; rtol=1e-3)
@@ -156,7 +156,7 @@ function bench_tile_sweep(M, N, K)
                     tile, tile, tile)
             continue
         end
-        t = time_min(() -> cuTileCPU.parallel_for(matmul_tile_kernel,
+        t = time_min(() -> MLIRKernels.parallel_for(matmul_tile_kernel,
             (A, B, C, ct.Constant(tile), ct.Constant(tile), ct.Constant(tile));
             blocks = (M ÷ tile, N ÷ tile)))
         @printf("  tile %3dx%3dx%3d:        %8.1f μs  %8.1f GFLOPS  (%.0f%% of BLAS)\n",
@@ -168,14 +168,14 @@ function bench_tile_sweep(M, N, K)
     for (RM, RN) in ((16, 16), (32, 32))
         if M % RM != 0 || N % RN != 0; continue; end
         fill!(C, 0f0)
-        cuTileCPU.parallel_for(matmul_reg_kernel,
+        MLIRKernels.parallel_for(matmul_reg_kernel,
             (A, B, C, ct.Constant(RM), ct.Constant(RN), ct.Constant(K));
             blocks = (M ÷ RM, N ÷ RN))
         if !isapprox(C, C_ref; rtol=1e-3)
             @printf("  reg %dx%d (K-unblocked):    WRONG\n", RM, RN)
             continue
         end
-        t = time_min(() -> cuTileCPU.parallel_for(matmul_reg_kernel,
+        t = time_min(() -> MLIRKernels.parallel_for(matmul_reg_kernel,
             (A, B, C, ct.Constant(RM), ct.Constant(RN), ct.Constant(K));
             blocks = (M ÷ RM, N ÷ RN)))
         @printf("  reg %dx%d (K=%d steps):     %8.1f μs  %8.1f GFLOPS  (%.0f%% of BLAS)\n",

@@ -1,10 +1,10 @@
 # Matmul perf diagnostic — check the thread count we're using, whether
-# OpenBLAS is using the same count, and how cuTileCPU matmul scales with
+# OpenBLAS is using the same count, and how MLIRKernels matmul scales with
 # tile size + thread count.
 
 using cuTile
 const ct = cuTile
-using cuTileCPU
+using MLIRKernels
 using LinearAlgebra, Printf
 
 function matmul_kernel(A::ct.TileArray{T,2}, B::ct.TileArray{T,2}, C::ct.TileArray{T,2},
@@ -44,22 +44,22 @@ ngflops(t_ns, M, N, K) = 2.0 * M * N * K / t_ns
 
 # Get OpenMP's view of the thread count. ccall library expression must be a
 # const at parse time, so we bind to a const module-level alias.
-const LIBOMP = cuTileCPU.LIBOMP
+const LIBOMP = MLIRKernels.LIBOMP
 omp_max_threads() = Int(ccall((:omp_get_max_threads, LIBOMP), Cint, ()))
 omp_num_procs() = Int(ccall((:omp_get_num_procs, LIBOMP), Cint, ()))
 omp_set_threads!(n::Int) = ccall((:omp_set_num_threads, LIBOMP), Cvoid, (Cint,), Cint(n))
 
 function bench_one(M, N, K; BM=64, BN=64, BK=64, label="")
-    A = cuTileCPU.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
-    B = cuTileCPU.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
-    C = cuTileCPU.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
+    A = MLIRKernels.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
+    B = MLIRKernels.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
+    C = MLIRKernels.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
 
     # warm
-    cuTileCPU.parallel_for(matmul_kernel,
+    MLIRKernels.parallel_for(matmul_kernel,
         (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
         blocks = (M ÷ BM, N ÷ BN))
 
-    t = time_min(() -> cuTileCPU.parallel_for(matmul_kernel,
+    t = time_min(() -> MLIRKernels.parallel_for(matmul_kernel,
         (A, B, C, ct.Constant(BM), ct.Constant(BN), ct.Constant(BK));
         blocks = (M ÷ BM, N ÷ BN)))
     @printf("  %-40s %8.1f μs  %8.1f GFLOPS\n",
@@ -76,10 +76,10 @@ function main()
 
     M = N = K = 1024
 
-    # 1. cuTileCPU at different tile sizes. Cap at 128 — at 256 the
+    # 1. MLIRKernels at different tile sizes. Cap at 128 — at 256 the
     # `vector.contract` outerproduct lowering produces enough unrolled LLVM
     # IR (~O(N^3) FMA insts per kernel body) that clang -O2 hangs.
-    println("=== cuTileCPU matmul @ M=N=K=$M, default OpenMP threads ===")
+    println("=== MLIRKernels matmul @ M=N=K=$M, default OpenMP threads ===")
     for tile in (32, 64, 128)
         if M % tile == 0
             bench_one(M, N, K; BM=tile, BN=tile, BK=tile, label="BM=BN=BK=$tile")
@@ -87,8 +87,8 @@ function main()
     end
     println()
 
-    # 2. cuTileCPU with restricted thread counts
-    println("=== cuTileCPU matmul @ M=N=K=$M, BM=BN=BK=64, thread sweep ===")
+    # 2. MLIRKernels with restricted thread counts
+    println("=== MLIRKernels matmul @ M=N=K=$M, BM=BN=BK=64, thread sweep ===")
     saved = omp_max_threads()
     try
         for nthr in (1, 2, 4, 8, 16, 32, 64)
@@ -103,9 +103,9 @@ function main()
 
     # 3. OpenBLAS with restricted thread counts
     println("=== OpenBLAS matmul @ M=N=K=$M, thread sweep ===")
-    A = cuTileCPU.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
-    B = cuTileCPU.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
-    C = cuTileCPU.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
+    A = MLIRKernels.aligned_array(Float32, M, K; alignment=128); copyto!(A, rand(Float32, M, K))
+    B = MLIRKernels.aligned_array(Float32, K, N; alignment=128); copyto!(B, rand(Float32, K, N))
+    C = MLIRKernels.aligned_array(Float32, M, N; alignment=128); fill!(C, 0f0)
     saved_blas = BLAS.get_num_threads()
     try
         for nthr in (1, 2, 4, 8, 16, 32, 64)

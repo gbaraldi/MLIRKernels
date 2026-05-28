@@ -1,4 +1,4 @@
-# cuTileCPU.jl
+# MLIRKernels.jl
 
 A CPU backend for [cuTile.jl](https://github.com/JuliaGPU/cuTile.jl). Takes a
 cuTile kernel + arg types, runs cuTile's existing inference and structurization
@@ -16,7 +16,7 @@ kernel-side changes needed.
 **283 tests passing on Julia 1.13 + MLIR_jll v20.** Every flagship kernel from
 cuTile.jl's perf-table works on CPU.
 
-| Kernel | cuTileCPU |
+| Kernel | MLIRKernels |
 |---|---|
 | Vector add (F32/F16/BF16) | ✓ |
 | Matrix transpose | ✓ |
@@ -65,7 +65,7 @@ false` at runtime.
 ## Quick start
 
 ```julia
-using cuTile, cuTileCPU
+using cuTile, MLIRKernels
 const ct = cuTile
 
 # Plain cuTile kernel — identical to what the CUDA backend compiles.
@@ -80,13 +80,13 @@ end
 # The kernel's TileArray ArraySpec demands 128-byte alignment by default;
 # Julia's Vector{T} only guarantees 16. Use aligned_array.
 n = 1024
-a = cuTileCPU.aligned_array(Float32, n; alignment=128)
-b = cuTileCPU.aligned_array(Float32, n; alignment=128)
-c = cuTileCPU.aligned_array(Float32, n; alignment=128)
+a = MLIRKernels.aligned_array(Float32, n; alignment=128)
+b = MLIRKernels.aligned_array(Float32, n; alignment=128)
+c = MLIRKernels.aligned_array(Float32, n; alignment=128)
 copyto!(a, 1:n); copyto!(b, 101:100+n); fill!(c, 0f0)
 
 # Explicit parallel-for is the natural launch surface.
-cuTileCPU.@parallel_for blocks = n ÷ 16  vadd(a, b, c, ct.Constant(16))
+MLIRKernels.@parallel_for blocks = n ÷ 16  vadd(a, b, c, ct.Constant(16))
 @assert c ≈ a .+ b
 ```
 
@@ -103,7 +103,7 @@ function vadd_spmd(a::Vector{Float32}, b::Vector{Float32},
     return
 end
 
-k = cuTileCPU.spmd_function(vadd_spmd,
+k = MLIRKernels.spmd_function(vadd_spmd,
     (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
     lane_width=16, alignment=128)
 k(a, b, c, 0; blocks = cld(n, 16))
@@ -186,11 +186,11 @@ back to `arith.constant dense<[0..N-1]>` on 18).
 ## Module layout
 
 ```
-cuTileCPU/
+MLIRKernels/
 ├── Project.toml
 ├── README.md                      ← you are here
 ├── src/
-│   ├── cuTileCPU.jl               ← module entry; fresh_context() + @with_* macros
+│   ├── MLIRKernels.jl               ← module entry; fresh_context() + @with_* macros
 │   ├── allocator.jl               ← aligned_array (posix_memalign + unsafe_wrap)
 │   ├── lower.jl                   ← StructuredIRCode → MLIR walker (~50 clauses)
 │   ├── compile.jl                 ← in-process pass pipeline + clang
@@ -240,7 +240,7 @@ back-to-back samples produce inflated cache-resident numbers — see
 
 ### vadd (memory-bandwidth-bound)
 
-| n | per-array | touched | cuTileCPU | Julia broadcast | `Threads.@threads` |
+| n | per-array | touched | MLIRKernels | Julia broadcast | `Threads.@threads` |
 |---|---|---|---|---|---|
 | 64 K | 256 KB | 0.8 MB | 11 GB/s | **38 GB/s** | 2.4 GB/s |
 | 1 M | 4 MB | 13 MB | **185 GB/s** | 35 GB/s | 34 GB/s |
@@ -253,7 +253,7 @@ At DRAM scale (256 M = 1 GB/array): **~7× faster than serial Julia broadcast,
 ArraySpec-driven alignment + strided layout produces tighter code than
 hand-rolled threaded Julia.
 
-At small N (< 64 K): cuTileCPU loses to serial broadcast because OpenMP
+At small N (< 64 K): MLIRKernels loses to serial broadcast because OpenMP
 fork/join overhead (~70 μs floor) dominates the work. Fixable by compiling a
 serial variant; not done yet.
 
@@ -261,7 +261,7 @@ serial variant; not done yet.
 
 64-thread, BM=BN=BK=64 tiles (default contract-lowering on MLIR 19+).
 
-| Shape | cuTileCPU (`vector.contract`) | cuTileCPU (`matmul_reg`, rank-1 outer-product) | OpenBLAS | Naive |
+| Shape | MLIRKernels (`vector.contract`) | MLIRKernels (`matmul_reg`, rank-1 outer-product) | OpenBLAS | Naive |
 |---|---|---|---|---|
 | 1024³ | 399 GFLOPS | **~920 GFLOPS (~65%)** | 1418 | 39 |
 

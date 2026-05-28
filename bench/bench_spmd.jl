@@ -5,7 +5,7 @@
 
 using cuTile
 const ct = cuTile
-using cuTileCPU
+using MLIRKernels
 using Printf
 
 # Tile-based (cuTile-style) vadd — uses TileArray + ct.bid + ct.load/store.
@@ -58,21 +58,21 @@ function bench(n)
     println("\n=== n = $n  ($(n * sizeof(Float32) / 1e6) MB / array) ===")
 
     # Tile-based path — aligned buffers, ct.Constant(16) tile size.
-    a_t = cuTileCPU.aligned_array(Float32, n; alignment=128)
-    b_t = cuTileCPU.aligned_array(Float32, n; alignment=128)
-    c_t = cuTileCPU.aligned_array(Float32, n; alignment=128)
+    a_t = MLIRKernels.aligned_array(Float32, n; alignment=128)
+    b_t = MLIRKernels.aligned_array(Float32, n; alignment=128)
+    c_t = MLIRKernels.aligned_array(Float32, n; alignment=128)
     copyto!(a_t, rand(Float32, n))
     copyto!(b_t, rand(Float32, n))
 
-    cuTileCPU.@parallel_for blocks = cld(n, 16) vadd_tile(a_t, b_t, c_t, ct.Constant(16))
+    MLIRKernels.@parallel_for blocks = cld(n, 16) vadd_tile(a_t, b_t, c_t, ct.Constant(16))
     @assert c_t ≈ a_t .+ b_t
 
-    t_tile = time_min(() -> cuTileCPU.@parallel_for blocks = cld(n, 16) vadd_tile(
+    t_tile = time_min(() -> MLIRKernels.@parallel_for blocks = cld(n, 16) vadd_tile(
         a_t, b_t, c_t, ct.Constant(16)))
 
     # SPMD path, unaligned — plain Vector{Float32}, alignment=16 default.
     a_s = rand(Float32, n); b_s = rand(Float32, n); c_s = zeros(Float32, n)
-    k_spmd = cuTileCPU.spmd_function(vadd_spmd,
+    k_spmd = MLIRKernels.spmd_function(vadd_spmd,
         (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
         lane_width=16)
     k_spmd(a_s, b_s, c_s, 0; blocks = cld(n, 16))
@@ -80,10 +80,10 @@ function bench(n)
     t_spmd = time_min(() -> k_spmd(a_s, b_s, c_s, 0; blocks = cld(n, 16)))
 
     # SPMD aligned — same kernel, alignment=128, aligned host buffers.
-    a_a = cuTileCPU.aligned_array(Float32, n; alignment=128); copyto!(a_a, a_s)
-    b_a = cuTileCPU.aligned_array(Float32, n; alignment=128); copyto!(b_a, b_s)
-    c_a = cuTileCPU.aligned_array(Float32, n; alignment=128); fill!(c_a, 0f0)
-    k_spmd_aligned = cuTileCPU.spmd_function(vadd_spmd,
+    a_a = MLIRKernels.aligned_array(Float32, n; alignment=128); copyto!(a_a, a_s)
+    b_a = MLIRKernels.aligned_array(Float32, n; alignment=128); copyto!(b_a, b_s)
+    c_a = MLIRKernels.aligned_array(Float32, n; alignment=128); fill!(c_a, 0f0)
+    k_spmd_aligned = MLIRKernels.spmd_function(vadd_spmd,
         (Vector{Float32}, Vector{Float32}, Vector{Float32}, Int);
         lane_width=16, alignment=128)
     k_spmd_aligned(a_a, b_a, c_a, 0; blocks = cld(n, 16))

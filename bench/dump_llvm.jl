@@ -3,7 +3,7 @@
 
 using cuTile
 const ct = cuTile
-using cuTileCPU
+using MLIRKernels
 
 # Same kernels as bench_matmul_reg.jl
 function matmul_reg_kernel(A::ct.TileArray{T,2}, B::ct.TileArray{T,2},
@@ -37,15 +37,15 @@ function matmul_tile_kernel(A::ct.TileArray{T,2}, B::ct.TileArray{T,2},
 end
 
 M = N = K = 1024
-A = cuTileCPU.aligned_array(Float32, M, K; alignment=128)
-B = cuTileCPU.aligned_array(Float32, K, N; alignment=128)
-C = cuTileCPU.aligned_array(Float32, M, N; alignment=128)
+A = MLIRKernels.aligned_array(Float32, M, K; alignment=128)
+B = MLIRKernels.aligned_array(Float32, K, N; alignment=128)
+C = MLIRKernels.aligned_array(Float32, M, N; alignment=128)
 
 mkpath("llvm_dump")
 
 # Contract path (tile 16×16×16 — the best contract result)
 println("Dumping contract LLVM (tile 16×16×16, 1024³)...")
-ll_contract = cuTileCPU.code_llvm(matmul_tile_kernel,
+ll_contract = MLIRKernels.code_llvm(matmul_tile_kernel,
     (A, B, C, ct.Constant(16), ct.Constant(16), ct.Constant(16));
     n_grid_dims=2)
 write("llvm_dump/contract_16.ll", ll_contract)
@@ -53,7 +53,7 @@ println("  $(count('\n', ll_contract)) lines → llvm_dump/contract_16.ll")
 
 # Contract path tile 64×64×64
 println("Dumping contract LLVM (tile 64×64×64, 1024³)...")
-ll_contract_64 = cuTileCPU.code_llvm(matmul_tile_kernel,
+ll_contract_64 = MLIRKernels.code_llvm(matmul_tile_kernel,
     (A, B, C, ct.Constant(64), ct.Constant(64), ct.Constant(64));
     n_grid_dims=2)
 write("llvm_dump/contract_64.ll", ll_contract_64)
@@ -61,7 +61,7 @@ println("  $(count('\n', ll_contract_64)) lines → llvm_dump/contract_64.ll")
 
 # Register tile path
 println("Dumping reg-tile LLVM (16×16, K=1024)...")
-ll_reg = cuTileCPU.code_llvm(matmul_reg_kernel,
+ll_reg = MLIRKernels.code_llvm(matmul_reg_kernel,
     (A, B, C, ct.Constant(16), ct.Constant(16), ct.Constant(1024));
     n_grid_dims=2)
 write("llvm_dump/reg_16.ll", ll_reg)

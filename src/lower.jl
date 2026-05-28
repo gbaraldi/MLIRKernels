@@ -141,7 +141,7 @@ function mlir_elem_type(T::Type)
     T === UInt32   && return IR.Type(Int32)
     T === UInt64   && return IR.Type(Int64)
     T === Bool     && return IR.Type(Bool)
-    error("cuTileCPU: unsupported element type $T")
+    error("MLIRKernels: unsupported element type $T")
 end
 
 # Build a splat DenseElements attribute for a vector type. Reactant exposes
@@ -233,7 +233,7 @@ function mlir_type_for(@nospecialize(T))
         v === nothing || return v
     end
     T isa Type && T <: Number && return mlir_elem_type(T)
-    error("cuTileCPU: cannot map type $T to MLIR")
+    error("MLIRKernels: cannot map type $T to MLIR")
 end
 
 # TileArray{T,N,Spec()} → memref<?x?xT, strided<[…]>>. When `spec.contiguous`,
@@ -453,7 +453,7 @@ function lower_to_mlir(sci::StructuredIRCode, argtypes::Type;
                     push!(param_kinds, :scalar)
                     push!(param_specs, nothing)
                 else
-                    error("cuTileCPU: unsupported arg type $AT_wide at slot $i")
+                    error("MLIRKernels: unsupported arg type $AT_wide at slot $i")
                 end
             end
 
@@ -689,7 +689,7 @@ function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
                         push!(param_kinds, :scalar)
                     end
                 else
-                    error("cuTileCPU SPMD: unsupported arg type $AT_wide at slot $i")
+                    error("MLIRKernels SPMD: unsupported arg type $AT_wide at slot $i")
                 end
             end
 
@@ -886,7 +886,7 @@ function lower_to_mlir_ka(sci::StructuredIRCode, argtypes::Type;
                     push!(param_julia_types, AT_wide)
                     push!(param_kinds, :scalar)
                 else
-                    error("cuTileCPU KA: unsupported arg type $AT_wide at slot $i " *
+                    error("MLIRKernels KA: unsupported arg type $AT_wide at slot $i " *
                           "(only AbstractArray + Number args are wired up; the " *
                           "first non-Const arg is consumed as the KA ctx)")
                 end
@@ -1100,7 +1100,7 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                         push!(param_kinds, :scalar)
                     end
                 else
-                    error("cuTileCPU GPU: unsupported arg type $AT_wide at slot $i")
+                    error("MLIRKernels GPU: unsupported arg type $AT_wide at slot $i")
                 end
             end
 
@@ -1278,7 +1278,7 @@ function walk_stmt!(lc::LowerCtx, idx::Int, @nospecialize(stmt), @nospecialize(t
         end
         return resolve_value_or_const(lc, inner)
     end
-    error("cuTileCPU.walk_stmt!: unhandled stmt $stmt at %$idx (typ=$typ)")
+    error("MLIRKernels.walk_stmt!: unhandled stmt $stmt at %$idx (typ=$typ)")
 end
 
 function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
@@ -1292,7 +1292,7 @@ function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
         lc.sentinels[idx] = :boundscheck
         return nothing
     end
-    error("cuTileCPU.walk_expr!: unhandled Expr head :$(e.head) at %$idx ($e)")
+    error("MLIRKernels.walk_expr!: unhandled Expr head :$(e.head) at %$idx ($e)")
 end
 
 # Resolve an operand to an MLIR Value (or `nothing` if it's tracked-only).
@@ -1789,7 +1789,7 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         return nothing
     end
 
-    error("cuTileCPU.walk_call!: unhandled callee $fname " *
+    error("MLIRKernels.walk_call!: unhandled callee $fname " *
           "(callee=$callee, args=$args)")
 end
 

@@ -5,7 +5,7 @@
 # Once this compiles + lands a runnable PTX kernel, we know the
 # MLIR→NVVM→PTX path works end-to-end via MLIR.jl on this MLIR_jll.
 
-using cuTileCPU
+using MLIRKernels
 using MLIR
 const IR = MLIR.IR
 
@@ -23,7 +23,7 @@ mlir_text = read(joinpath(HERE, "01_handwritten_vadd_gpu.mlir"), String)
 #
 # Two things mirror the CPU pipeline we already use:
 #   - In-process via MLIR.jl PassManager (no shell-out to mlir-opt).
-#   - `_pipeline_str` from cuTileCPU automatically nests `convert-gpu-to-nvvm`
+#   - `_pipeline_str` from MLIRKernels automatically nests `convert-gpu-to-nvvm`
 #     under `gpu.module(...)` because it's a `gpu::GPUModuleOp`-anchored pass
 #     (same `_FUNC_LEVEL_PASSES`-style nesting trick we used for
 #     `lower-vector-multi-reduction` under func.func).
@@ -51,12 +51,12 @@ const GPU_PASSES = String[
     "gpu-module-to-binary{format=isa}",
 ]
 
-# Have to override cuTileCPU's `_FUNC_LEVEL_PASSES` for our gpu.module
+# Have to override MLIRKernels's `_FUNC_LEVEL_PASSES` for our gpu.module
 # nesting — for the POC we just build the pipeline string by hand here
 # (the nested ones are already `gpu.module(...)` wrapped in the array above).
 _pipeline_str(passes) = "builtin.module(" * join(passes, ",") * ")"
 
-ctx = cuTileCPU.fresh_context()
+ctx = MLIRKernels.fresh_context()
 IR.activate(ctx)
 
 mod = parse(IR.Module, mlir_text)

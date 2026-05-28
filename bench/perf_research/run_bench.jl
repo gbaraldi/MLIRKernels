@@ -13,7 +13,7 @@ const LIBOMP_DIR = "/home/gbaraldi/.julia/artifacts/899764f4e46a2e2a6f6351ad5c22
 
 # === pipelines ===
 
-# Contract path: what cuTileCPU's DEFAULT_PASSES currently uses.
+# Contract path: what MLIRKernels's DEFAULT_PASSES currently uses.
 const CONTRACT_PASSES = String[
     "--lower-vector-multi-reduction",
     "--convert-vector-to-scf",
