@@ -27,6 +27,7 @@ const _memref = Dialects.memref
 const _scf    = Dialects.scf
 const _vector = Dialects.vector
 const _math   = Dialects.math
+const _gpu    = Dialects.gpu
 
 # ----------------------------------------------------------------------------
 # Lowering context
@@ -966,6 +967,169 @@ function lower_to_mlir_ka(sci::StructuredIRCode, argtypes::Type;
                 end
 
                 _func.return_(IR.Value[])
+            end
+        end
+    end
+    return (mod_ref[], param_julia_types, ctx, param_kinds)
+end
+
+# ----------------------------------------------------------------------------
+# GPU SIMT entrypoint (gpu dialect → NVVM/ROCDL)
+# ----------------------------------------------------------------------------
+#
+# Emits a `gpu.module { gpu.func @k kernel { … } }` for a SIMT kernel of
+# shape
+#
+#     function k(arr1, ..., arrK, n::Integer, gid::Integer)
+#         if gid <= n
+#             @inbounds arr1[gid] = arr2[gid] + arr3[gid]
+#         end
+#         return
+#     end
+#
+# where the trailing `gid` is the *global thread index* (1-based, Julia
+# semantics). Unlike the CPU SPMD path which makes the lane a
+# `vector<W × iX>` and wraps the body in `scf.parallel`, here:
+#
+#   • The kernel body IS the per-thread body — no scf.parallel, no grid
+#     loop. The host launches `block × grid` threads via gpu.launch_func
+#     (or, in the experiments, cudacall after lowering to PTX).
+#   • `gid` is bound to a *scalar* index:
+#         gid = gpu.thread_id.x + gpu.block_id.x * gpu.block_dim.x + 1
+#     (the +1 makes it 1-based to match Julia indexing; memoryrefnew
+#     subtracts 1 to get the 0-based memref index).
+#   • Array args become `memref<?xT, #gpu.address_space<global>>` so the
+#     pointers are global-qualified and no `cvta.to.global` is emitted
+#     (see experiment 04).
+#   • Because `gid` is scalar, the SHARED SPMD walker clauses
+#     (`emit_spmd_memoryrefnew/get/set!`) take their `isempty(idx_shape)`
+#     scalar branches → `memref.load`/`memref.store`. One thread = one
+#     element. `_spmd_harmonise` is a no-op on all-scalar operands.
+#   • The `if gid <= n` guard is a real `arith.cmpi` (not the `:boundscheck`
+#     sentinel), so `emit_if!` emits a normal `scf.if` — kept, as GPU
+#     needs it for the tail block.
+#
+# `gid` is still tracked via `lc.lane_arg`, and the
+# `__cutilecpu_spmd_lane_id` sentinel clause returns `lc.arg_vals[lane_arg]`
+# unchanged — so a KA `__index_Global_Linear` overlay routed through this
+# entrypoint also works (with `__validindex` providing the `gid <= n`
+# guard or `true` for exact-multiple launches).
+function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
+                           kernel_name::String, module_name::String="kernels",
+                           lane_idx_type::Type=Int32)
+    ctx = fresh_context()
+    mod_ref = Ref{IR.Module}()
+    param_julia_types = Type[]
+    param_kinds = Symbol[]
+
+    @with_context ctx begin
+        IR.load_all_available_dialects()
+        mod = IR.Module(IR.Location())
+        mod_ref[] = mod
+        # `gpu.container_module` marks the top-level module as holding
+        # gpu.modules — required by the gpu→nvvm pipeline.
+        IR.setattr!(IR.Operation(mod), "gpu.container_module", IR.UnitAttribute())
+
+        @with_module mod begin
+            lc = LowerCtx(ctx, mod)
+            lc.spmd = true                 # reuse the scalar-index SPMD clauses
+            lc.lane_width = 1
+            lc.lane_idx_type = lane_idx_type
+
+            idx_t = IR.IndexType()
+            global_attr = parse(IR.Attribute, "#gpu.address_space<global>")
+            lane_t = mlir_elem_type(lane_idx_type)
+
+            # Identify the lane arg (trailing Integer) and classify the rest.
+            lane_slot = 0
+            for (i, AT) in enumerate(sci.argtypes)
+                i == 1 && continue
+                widenconst(AT) <: Integer && (lane_slot = i)
+            end
+            lane_slot == 0 && error(
+                "lower_to_mlir_gpu: kernel must end with a scalar global-index " *
+                "arg (e.g. `gid::Int32`)")
+            lc.lane_arg = lane_slot
+
+            param_mlir_types = IR.Type[]
+            param_arg_slots = Int[]
+            for (i, AT) in enumerate(sci.argtypes)
+                i == 1 && continue
+                if AT isa Core.Const
+                    lc.arg_const[i] = AT.val
+                    continue
+                end
+                AT_wide = widenconst(AT)
+                if AT_wide <: AbstractArray
+                    eT = eltype(AT_wide)
+                    N  = ndims(AT_wide)
+                    shape = fill(Int(IR.dynsize()), N)
+                    mr = IR.MemRefType(mlir_elem_type(eT), shape,
+                                       IR.Attribute(), global_attr)
+                    push!(param_mlir_types, mr)
+                    push!(param_arg_slots, i)
+                    push!(param_julia_types, AT_wide)
+                    push!(param_kinds, :memref)
+                    lc.arg_elem_types[i] = eT
+                elseif AT_wide <: Number
+                    if i == lane_slot
+                        lc.lane_idx_type = AT_wide
+                    else
+                        push!(param_mlir_types, mlir_elem_type(AT_wide))
+                        push!(param_arg_slots, i)
+                        push!(param_julia_types, AT_wide)
+                        push!(param_kinds, :scalar)
+                    end
+                else
+                    error("cuTileCPU GPU: unsupported arg type $AT_wide at slot $i")
+                end
+            end
+
+            ftype = IR.FunctionType(param_mlir_types, IR.Type[])
+
+            # gpu.module @<module_name> { ... }
+            gmod_block = IR.Block(IR.Type[], IR.Location[])
+            gmod_region = IR.Region()
+            push!(gmod_region, gmod_block)
+            gmodop = _gpu.module_(; sym_name=IR.Attribute(module_name),
+                                  bodyRegion=gmod_region)
+            push!(IR.body(mod), gmodop)
+
+            @with_block gmod_block begin
+                # gpu.func @<kernel_name>(...) kernel { ... }
+                arg_locs = [IR.Location() for _ in 1:length(param_mlir_types)]
+                entry = IR.Block(param_mlir_types, arg_locs)
+                fbody = IR.Region()
+                push!(fbody, entry)
+                # `_gpu.func` auto-appends to the active block (gmod_block).
+                funcop = _gpu.func(; function_type=IR.Attribute(ftype), body=fbody)
+                IR.setattr!(funcop, "sym_name", IR.Attribute(kernel_name))
+                IR.setattr!(funcop, "gpu.kernel", IR.UnitAttribute())
+
+                # Bind func params.
+                for (k, slot) in enumerate(param_arg_slots)
+                    lc.arg_vals[slot] = IR.argument(entry, k)
+                end
+
+                @with_block entry begin
+                    # gid = thread_id.x + block_id.x * block_dim.x + 1
+                    dimx = parse(IR.Attribute, "#gpu<dim x>")
+                    tid  = IR.result(_gpu.thread_id(; result_0=idx_t, dimension=dimx))
+                    bid  = IR.result(_gpu.block_id(; result_0=idx_t, dimension=dimx))
+                    bdim = IR.result(_gpu.block_dim(; result_0=idx_t, dimension=dimx))
+                    off  = IR.result(_arith.muli(bid, bdim; result=idx_t))
+                    gid_idx = IR.result(_arith.addi(off, tid; result=idx_t))
+                    one_idx = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
+                    gid1_idx = IR.result(_arith.addi(gid_idx, one_idx; result=idx_t))
+                    # Cast to the lane integer type (e.g. i32) — matches the
+                    # kernel's `gid::Int32` so the `gid <= n` cmpi is well-typed.
+                    gid_int = IR.result(_arith.index_cast(gid1_idx; out=lane_t))
+                    lc.arg_vals[lane_slot] = gid_int
+                    push!(lc.bids, bid)
+
+                    walk_block!(lc, sci.entry)
+                    _gpu.return_(IR.Value[])
+                end
             end
         end
     end
