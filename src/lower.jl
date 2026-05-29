@@ -1246,7 +1246,8 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             # the bogus "throw" never happens (we replace it with the RMW).
             return emit_spmd_atomic_modifyindex!(lc, args[2:end], typ)
         elseif fname === :throw || fname === :throw_complex_domainerror ||
-               fname === :throw_inexacterror || fname === :throw_overflowerror
+               fname === :throw_inexacterror || fname === :throw_overflowerror ||
+               fname === :_throw_dmrs
             # Dead inside elided bounds-check IfOps; if we hit it here the
             # walker is processing a live throw, which the SPMD MVP doesn't
             # support. `throw_complex_domainerror` is the guard `Base.sqrt`
@@ -1425,7 +1426,7 @@ const _RAW_CORE_INTRINSICS = Set{Symbol}([
     :slt_int, :sle_int, :ult_int, :ule_int, :eq_int, :ne_int,
     :lt_float, :le_float, :eq_float, :ne_float,
     :sext_int, :zext_int, :trunc_int, :bitcast,
-    :sitofp, :fptosi,
+    :sitofp, :fptosi, :fpext, :fptrunc,
     :ifelse, Symbol("==="),
     # Unary float math intrinsics (raw Julia names; the named-intrinsic path
     # uses :absf/:sqrt/etc, but the Frontend path hands them raw). One operand,
@@ -1556,7 +1557,7 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :ne_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.NotEqual, ComparisonOrdering.Unordered], typ)
     # Width / type conversions. Raw arg order is (to_type, value).
     if name === :sext_int || name === :zext_int || name === :trunc_int ||
-       name === :sitofp || name === :fptosi
+       name === :sitofp || name === :fptosi || name === :fpext || name === :fptrunc
         target_T = something(resolve_const(lc, args[1]), args[1])
         target_T isa Type || error("$name: target type must be a Type, got $(args[1])")
         v = resolve_value_or_const(lc, args[2])
@@ -1577,6 +1578,8 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
         name === :trunc_int && return IR.result(_arith.trunci(v; out=out_t))
         name === :sitofp    && return IR.result(_arith.sitofp(v; out=out_t))
         name === :fptosi    && return IR.result(_arith.fptosi(v; out=out_t))
+        name === :fpext     && return IR.result(_arith.extf(v; out=out_t))    # Float32→Float64
+        name === :fptrunc   && return IR.result(_arith.truncf(v; out=out_t))  # Float64→Float32
     elseif name === :bitcast
         # Raw `bitcast(T, x)`; emit_bitcast! expects (value, type) → swap.
         return emit_bitcast!(lc, Any[args[2], args[1]], typ)

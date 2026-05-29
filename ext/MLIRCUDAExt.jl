@@ -55,6 +55,13 @@ Base.pointer(a::MLIRArray) = pointer(a.data)
 Base.copyto!(d::MLIRArray, s::AbstractArray) = (copyto!(d.data, s); d)
 Base.copyto!(d::AbstractArray, s::MLIRArray) = (copyto!(d, s.data); d)
 Base.copyto!(d::MLIRArray, s::MLIRArray) = (copyto!(d.data, s.data); d)
+# A view of an MLIRArray must copy to the host via the wrapped CuArray: the
+# generic `AbstractArray` path is element-wise `getindex`, which trips CUDA's
+# scalar-indexing guard. (AK's reduce/scan copy partial results with
+# `Vector(@view dst[1:len])`.)
+_cuview(s::SubArray{<:Any,<:Any,<:MLIRArray}) = view(parent(s).data, parentindices(s)...)
+Base.copyto!(d::Array, s::SubArray{<:Any,<:Any,<:MLIRArray}) = (copyto!(d, _cuview(s)); d)
+Base.Array(s::SubArray{T,N,<:MLIRArray}) where {T,N} = Array(_cuview(s))
 CUDA.unsafe_free!(a::MLIRArray) = CUDA.unsafe_free!(a.data)
 
 # ----------------------------------------------------------------------------
