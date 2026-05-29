@@ -67,6 +67,13 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         c = mk(zeros(Float32, n)); copyto!(c, a); CUDA.synchronize()
         @test A(c) == A(a)
 
+        # Array manipulation whose copy kernels positionally `getfield` a range /
+        # wrapper arg (`getfield(arg, 1)`), not by name.
+        seq = mk(collect(Float32, 1:n))
+        @test A(seq[10:20]) == collect(Float32, 10:20)            # getindex range
+        @test A(vcat(a, b)) == vcat(A(a), A(b))                   # vcat
+        let m = mk(rand(Float32, 16, 4)); @test A(hcat(m, m)) == hcat(A(m), A(m)); end
+
         # Base reductions → GPUArrays.mapreducedim! → our single-workgroup
         # grid-stride reduce kernel (@localmem tree reduce). `count`/`any`/`all`
         # exercise the Bool→Int width coercion; max/min the new maxnumf/minnumf.

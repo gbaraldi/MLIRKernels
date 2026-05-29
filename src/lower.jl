@@ -2110,15 +2110,20 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     end
     if obj isa Argument
         field = args[2]
-        fld_sym = field isa QuoteNode ? field.value :
-                  field isa Symbol    ? field :
-                  error("getfield: field must be Symbol/QuoteNode, got $field")
+        fld = field isa QuoteNode ? field.value :
+              (field isa Symbol || field isa Integer) ? field :
+              something(resolve_const(lc, field), field)
+        (fld isa Symbol || fld isa Integer) ||
+            error("getfield: field must be Symbol or Int, got $field")
         # Flattened struct/closure/wrapped-array arg: resolve `getfield(arg, fld)`
-        # against the captured field-path tree.
+        # against the captured field-path tree (accepts fieldnames AND positional/
+        # tuple indices, e.g. `getfield(range_arg, 1)`).
         if obj.n in lc.flattened_slots
-            return _resolve_captured!(lc, idx, obj.n, (fld_sym,))
+            return _resolve_captured!(lc, idx, obj.n, (fld,))
         end
-        lc.field_refs[idx] = (obj.n, fld_sym)
+        fld isa Symbol ||
+            error("getfield: positional field $fld on non-flattened arg $(obj.n) unsupported")
+        lc.field_refs[idx] = (obj.n, fld)
         return nothing
     elseif obj isa SSAValue
         # A getfield reaching a non-leaf intermediate of a flattened arg
