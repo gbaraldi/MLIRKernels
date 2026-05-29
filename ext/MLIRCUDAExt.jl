@@ -23,6 +23,9 @@ const IR = MLIR.IR
 const MLIRAPI = MLIR.API
 using LLVM
 using CUDA
+import CUDA_Compiler_jll
+import GPUArrays
+using GPUArraysCore: GPUArraysCore, AbstractGPUArray, AbstractGPUArrayStyle
 
 struct MLIRCUDABackend <: KA.GPU end
 
@@ -37,7 +40,13 @@ struct MLIRCUDABackend <: KA.GPU end
 # We can't instead define `get_backend(::CuArray)` — that belongs to CUDA.jl's
 # CUDABackend. The wrapper is host-indexable (for verification) and marshals by
 # unwrapping to the inner CuArray.
-struct MLIRArray{T,N} <: AbstractArray{T,N}
+#
+# `<: AbstractGPUArray` (not just `AbstractArray`) makes GPUArrays' generic
+# `broadcast`/`map!`/`fill!`/`mapreduce`/`sort` dispatch here: those are KA
+# kernels launched via `get_backend`, so they compile through MLIRKernels. The
+# scalar `getindex`/`setindex!` defer to the CuArray (CUDA's scalar-indexing
+# guard still fires unless `@allowscalar`).
+struct MLIRArray{T,N} <: AbstractGPUArray{T,N}
     data::CuArray{T,N}
 end
 
@@ -52,6 +61,28 @@ Base.similar(a::MLIRArray, ::Type{T}, dims::Dims) where {T} = MLIRArray(similar(
 Base.similar(::Type{MLIRArray{T}}, dims::Dims) where {T} = MLIRArray(CuArray{T}(undef, dims))
 Base.Array(a::MLIRArray) = Array(a.data)
 Base.pointer(a::MLIRArray) = pointer(a.data)
+Base.strides(a::MLIRArray) = strides(a.data)
+Base.elsize(::Type{MLIRArray{T,N}}) where {T,N} = sizeof(T)
+Base.unsafe_convert(::Type{CUDA.CuPtr{T}}, a::MLIRArray{T}) where {T} =
+    Base.unsafe_convert(CUDA.CuPtr{T}, a.data)
+
+# ---- broadcasting ----------------------------------------------------------
+# A broadcast `a .+ b` over MLIRArrays must (1) produce an MLIRArray and (2)
+# launch GPUArrays' broadcast kernel through our backend. Both follow from a
+# BroadcastStyle that is an `AbstractGPUArrayStyle` (so GPUArrays' overrides win
+# over Base's scalar fallback) plus a `similar` that allocates an MLIRArray.
+struct MLIRArrayStyle{N} <: AbstractGPUArrayStyle{N} end
+MLIRArrayStyle(::Val{N}) where {N} = MLIRArrayStyle{N}()
+MLIRArrayStyle{M}(::Val{N}) where {N,M} = MLIRArrayStyle{N}()
+Base.Broadcast.BroadcastStyle(::Type{<:MLIRArray{T,N}}) where {T,N} = MLIRArrayStyle{N}()
+Base.similar(bc::Base.Broadcast.Broadcasted{MLIRArrayStyle{N}}, ::Type{T}, dims) where {T,N} =
+    MLIRArray(CuArray{T}(undef, length.(dims)))
+# GPUArrays materialises contiguous views / reshape / reinterpret via `derive`
+# (a new array sharing storage). Delegate to the wrapped CuArray and rewrap, so a
+# `view(::MLIRArray, …)` stays an MLIRArray (get_backend → our backend) instead of
+# erroring. (AcceleratedKernels' block reductions `view` the source.)
+GPUArrays.derive(::Type{T}, a::MLIRArray, osize::Dims, offset::Int) where {T} =
+    MLIRArray(GPUArrays.derive(T, a.data, osize, offset))
 Base.copyto!(d::MLIRArray, s::AbstractArray) = (copyto!(d.data, s); d)
 Base.copyto!(d::AbstractArray, s::MLIRArray) = (copyto!(d, s.data); d)
 Base.copyto!(d::MLIRArray, s::MLIRArray) = (copyto!(d.data, s.data); d)
@@ -78,6 +109,20 @@ KA.functional(::MLIRCUDABackend) = CUDA.functional()
 KA.supports_atomics(::MLIRCUDABackend) = true
 # Data movement (host↔device, device↔device) defers to CUDA's copyto!.
 KA.copyto!(::MLIRCUDABackend, dst, src) = (Base.copyto!(unwrap(dst), unwrap(src)); dst)
+
+# GPUArrays' generic `map!`/`broadcast` call `KA.launch_config(kernel, ndrange,
+# workgroupsize)` and launch with `config[1]`/`config[2]`. Our launcher takes
+# `ndrange`/`workgroupsize` directly and pads+masks the grid, so we just
+# normalise to tuples and pick a default block size. (iterspace/dynamic — the
+# 3rd/4th elements KA's own launcher uses — are unused by GPUArrays.)
+@inline function KA.launch_config(::KA.Kernel{MLIRCUDABackend}, ndrange, workgroupsize)
+    ndrange isa Integer && (ndrange = (ndrange,))
+    workgroupsize isa Integer && (workgroupsize = (workgroupsize,))
+    if workgroupsize === nothing
+        workgroupsize = ntuple(d -> d == 1 ? min(256, ndrange[d]) : 1, length(ndrange))
+    end
+    return ndrange, workgroupsize, nothing, nothing
+end
 
 # ----------------------------------------------------------------------------
 # GPU compilation: SCI → gpu.module → PTX → CuFunction (cached).
@@ -119,19 +164,39 @@ function _run_passes!(mod, mlir_ctx, passes)
     return mod
 end
 
-# gpu.binary{format=llvm} bitcode → (LLVM.Module, PTX string). The driver JITs
-# PTX → SASS at module load.
+# Resolve libdevice externs (`__nv_fabsf`, `__nv_sqrtf`, …) that the gpu→nvvm
+# pipeline emits for math ops, by linking NVIDIA's libdevice bitcode. We can't
+# reuse GPUCompiler's `link_libraries!`/`compile` — those are keyed on a
+# `CompilerJob` built from a Julia `MethodInstance`, which we don't have (our IR
+# comes from MLIR, not Julia inference). So we link directly with LLVM.jl's
+# `link!(...; only_needed=true)` — the job-free path GPUCompiler's own
+# deprecation notice recommends — pulling the .bc from `CUDA_Compiler_jll`. The
+# NVPTX backend runs NVVMReflect during codegen, resolving libdevice's
+# `__nvvm_reflect` calls. No-op when there are no `__nv_*` references.
+function _link_libdevice!(lmod)
+    any(f -> LLVM.isdeclaration(f) && startswith(LLVM.name(f), "__nv_"),
+        LLVM.functions(lmod)) || return
+    lib = parse(LLVM.Module, read(CUDA_Compiler_jll.libdevice); lazy=true)
+    LLVM.triple!(lib, LLVM.triple(lmod))
+    LLVM.datalayout!(lib, LLVM.datalayout(lmod))
+    LLVM.link!(lmod, lib; only_needed=true)
+    return
+end
+
+# gpu.binary{format=llvm} bitcode → (LLVM.Module, PTX string), with libdevice
+# linked. The driver JITs PTX → SASS at module load.
 function _bitcode_to_ptx(bc; sm="sm_90", feat="+ptx80")
     lctx = LLVM.Context()
-    lmod = LLVM.context!(lctx) do
-        parse(LLVM.Module, bc)
+    return LLVM.context!(lctx) do
+        lmod = parse(LLVM.Module, bc)
+        triple = "nvptx64-nvidia-cuda"
+        LLVM.triple!(lmod, triple)
+        _link_libdevice!(lmod)            # parse libdevice in the SAME context, then link
+        tm = LLVM.TargetMachine(LLVM.Target(; triple), triple, sm, feat)
+        LLVM.asm_verbosity!(tm, true)
+        ptx = String(LLVM.emit(tm, lmod, LLVM.API.LLVMAssemblyFile))
+        return lmod, ptx
     end
-    triple = "nvptx64-nvidia-cuda"
-    LLVM.triple!(lmod, triple)
-    tm = LLVM.TargetMachine(LLVM.Target(; triple), triple, sm, feat)
-    LLVM.asm_verbosity!(tm, true)
-    ptx = String(LLVM.emit(tm, lmod, LLVM.API.LLVMAssemblyFile))
-    return lmod, ptx
 end
 
 # Env-var kernel dumping. `MLIRKERNELS_DUMP` = a comma-separated subset of
@@ -331,7 +396,7 @@ function _host_argtype(@nospecialize(T::Type))
     end
 end
 
-function _resolve_wgsize(obj::KA.Kernel{MLIRCUDABackend}, workgroupsize)
+function _resolve_wgsize(obj::KA.Kernel{MLIRCUDABackend}, workgroupsize, nd::Tuple)
     wg_T = KA.workgroupsize(obj)
     if wg_T <: NDI.StaticSize
         static = NDI.get(wg_T)
@@ -343,7 +408,12 @@ function _resolve_wgsize(obj::KA.Kernel{MLIRCUDABackend}, workgroupsize)
         end
         return static
     end
-    workgroupsize === nothing && return (256,)
+    # Default block: up to 256 lanes along dim 1, singletons elsewhere — and the
+    # SAME rank as the ndrange (GPUArrays' broadcast launches an N-D ndrange with
+    # no workgroupsize, so a fixed `(256,)` would mismatch the rank).
+    if workgroupsize === nothing
+        return ntuple(d -> d == 1 ? min(256, nd[1]) : 1, length(nd))
+    end
     workgroupsize isa Integer && return (workgroupsize,)
     return Tuple(workgroupsize)
 end
@@ -376,8 +446,8 @@ function _resolve_ndrange(obj::KA.Kernel{MLIRCUDABackend}, ndrange)
 end
 
 function _launch_setup(obj::KA.Kernel{MLIRCUDABackend}, args, ndrange, workgroupsize)
-    wg = _resolve_wgsize(obj, workgroupsize)
     nd = _resolve_ndrange(obj, ndrange)
+    wg = _resolve_wgsize(obj, workgroupsize, nd)
     length(wg) == length(nd) || error(
         "MLIRCUDABackend: ndrange $nd ($(length(nd))-D) and workgroupsize $wg " *
         "($(length(wg))-D) must have the same number of dimensions.")
