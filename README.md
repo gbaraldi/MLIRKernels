@@ -91,6 +91,13 @@ println(code_llvm(vadd_spmd, (Vector{Float32}, Vector{Float32}, Vector{Float32},
 `examples/reflection_and_perf.jl` prints all five GPU levels for vadd and
 benchmarks the MLIR backend against CUDA.jl's native KA backend.
 
+To dump kernels as they compile (without editing code — handy when a kernel is
+launched deep inside a library like AcceleratedKernels), set `MLIRKERNELS_DUMP`
+to a comma-separated subset of `sci,mlir,lowered,llvm,ptx` (or `all`); each
+requested level is printed to stderr per kernel. `MLIRKERNELS_DUMP_FILTER=<substr>`
+restricts it to kernels whose name contains `<substr>`. E.g.
+`MLIRKERNELS_DUMP=sci MLIRKERNELS_DUMP_FILTER=vadd julia …`.
+
 ## Architecture
 
 ```

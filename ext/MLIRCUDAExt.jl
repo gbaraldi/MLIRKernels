@@ -134,10 +134,44 @@ function _bitcode_to_ptx(bc; sm="sm_90", feat="+ptx80")
     return lmod, ptx
 end
 
+# Env-var kernel dumping. `MLIRKERNELS_DUMP` = a comma-separated subset of
+# sci,mlir,lowered,llvm,ptx (or "all") prints those levels for every GPU kernel
+# as it compiles; `MLIRKERNELS_DUMP_FILTER=<substr>` restricts to kernels whose
+# name contains <substr>. Best-effort (dumps whatever stages succeed) and goes
+# to stderr, so it works even when a kernel is launched deep inside a library.
+const _DUMP_ORDER = (:sci, :mlir, :lowered, :llvm, :ptx)
+
+function _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims)
+    spec = get(ENV, "MLIRKERNELS_DUMP", "")
+    isempty(spec) && return
+    filt = get(ENV, "MLIRKERNELS_DUMP_FILTER", "")
+    (isempty(filt) || occursin(filt, String(kname))) || return
+    want = spec == "all" ? collect(_DUMP_ORDER) :
+           Symbol[Symbol(strip(s)) for s in split(spec, ',') if !isempty(strip(s))]
+    idxs = filter(!isnothing, [findfirst(==(l), _DUMP_ORDER) for l in want])
+    isempty(idxs) && return
+    upto = _DUMP_ORDER[maximum(idxs)]
+    stages = try
+        _codegen_stages(f, full_argtypes; sm, feat, upto, nd_dims)
+    catch e
+        printstyled(stderr, "===== [MLIRKernels dump] $kname: staging failed at :$upto =====\n";
+                    color=:red, bold=true)
+        showerror(stderr, e); println(stderr)
+        return
+    end
+    for lvl in _DUMP_ORDER
+        (lvl in want && haskey(stages, lvl)) || continue
+        printstyled(stderr, "===== [MLIRKernels dump] $kname :$lvl =====\n"; color=:cyan, bold=true)
+        println(stderr, stages[lvl])
+    end
+    return
+end
+
 function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80", nd_dims=Int[])
     key = (f, full_argtypes, sm, feat, nd_dims)
     haskey(_gpu_cache, key) && return _gpu_cache[key]
     kname = _sym(f)
+    _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims)
 
     sci, rettype = FE.structured(f, full_argtypes)
     (rettype === Nothing || rettype === Union{}) ||
