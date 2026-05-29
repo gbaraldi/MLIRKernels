@@ -64,7 +64,14 @@ module Intrinsics
     @noinline group_size() = compilerbarrier(:type, zero(Int32))::Int32
 
     # Workgroup barrier (CPU: no-op; GPU: gpu.barrier). Returns nothing.
-    @noinline barrier() = compilerbarrier(:type, nothing)
+    # `Base.donotdelete` is essential: the barrier has no result and is otherwise
+    # effect-free, so without it DCE deletes the call before the walker sees it
+    # and `@synchronize` silently vanishes — fatal for cross-lane shared memory
+    # (the reads race ahead of the writes). Same fix as `atomic_index!`.
+    @noinline function barrier()
+        Base.donotdelete(0)
+        return compilerbarrier(:type, nothing)
+    end
 
     # Atomic read-modify-write at a 1-based linear index. The KA extension
     # overlays `Atomix.modify!(IndexableRef, op, x, ord)` — i.e. `KA.@atomic` /
@@ -98,6 +105,19 @@ module Intrinsics
         compilerbarrier(:type, ntuple(_ -> zero(Int), Val(N)))::NTuple{N,Int}
     @noinline group_ntuple(::Val{N}) where {N} =
         compilerbarrier(:type, ntuple(_ -> zero(Int), Val(N)))::NTuple{N,Int}
+
+    # Workgroup shared memory (`@localmem T dims`). The KA extension overlays
+    # `SharedMemory(T, Val(dims), Val(id))` onto this marker; the walker emits a
+    # workgroup-address-space `memref.alloca` of shape `dims` and routes
+    # `shared[…]` accesses to it. Returns an `Array{T,N}` so indexing lowers via
+    # the same memoryref path as a normal array arg. `Base.donotdelete` makes the
+    # call `!effect_free` so it survives DCE and isn't CSE-merged across distinct
+    # `@localmem` declarations (each must be its own buffer).
+    @noinline function shared_alloc(::Type{T}, ::Val{Dims}) where {T, Dims}
+        Base.donotdelete(T, Dims)
+        return compilerbarrier(:type,
+            Array{T, length(Dims)}(undef, Dims))::Array{T, length(Dims)}
+    end
 end
 
 # Predicate mirroring cuTile's `isintrinsic`: a function defined in our

@@ -118,6 +118,17 @@ mutable struct LowerCtx
     # 1-tuple for the plain 1-D path.
     wg_dims::Vector{Int}
     nd_dims::Vector{Int}
+    # ----- @localmem / SharedMemory -----
+    # SSA id → (workgroup-space memref alloca, element type). Keyed by both the
+    # `shared_alloc` marker result and the `getfield(shared, :ref)` SSA, so
+    # memoryrefnew/get/set on a `@localmem` buffer route to the alloca instead
+    # of an argument-backed memref.
+    local_memrefs::Dict{Int, Tuple{IR.Value, Type}}
+    # The gpu.module body block (GPU path only). `@localmem` buffers are emitted
+    # as workgroup-space `memref.global`s here (siblings of the gpu.func), which
+    # gpu-to-nvvm lowers to real `.shared` — unlike `memref.alloca(workgroup)`,
+    # which mis-lowers to a per-thread local depot. `nothing` on the CPU path.
+    gpu_module_block::Union{Nothing, IR.Block}
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -132,7 +143,8 @@ LowerCtx(ctx, mod) = LowerCtx(
     IR.Value[], IR.Value[],
     Set{Int}(), nothing,
     false, 16, 0, Int64,
-    Int[], Int[])
+    Int[], Int[],
+    Dict{Int, Tuple{IR.Value, Type}}(), nothing)
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -1126,6 +1138,7 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
             gmodop = _gpu.module_(; sym_name=IR.Attribute(module_name),
                                   bodyRegion=gmod_region)
             push!(IR.body(mod), gmodop)
+            lc.gpu_module_block = gmod_block   # @localmem globals go here
 
             @with_block gmod_block begin
                 # gpu.func @<kernel_name>(...) kernel { ... }
@@ -1897,11 +1910,20 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         return nothing
     end
 
+    # `@localmem T dims` (Frontend.Intrinsics.shared_alloc) → a workgroup-space
+    # `memref.alloca`, tracked so `shared[…]` accesses route to it.
+    if fname === :shared_alloc && lc.spmd
+        return emit_shared_alloc!(lc, idx, args)
+    end
+
     # Workgroup barrier marker (`Frontend.Intrinsics.barrier`, from KA
-    # `@synchronize`). CPU SIMD has no warp barrier → no-op. (GPU barrier is
-    # a future step; on the SIMT GPU path with `__validindex→true` and no
-    # cross-lane communication, the no-op is correct for the current scope.)
+    # `@synchronize`). On the GPU SIMT path it's a real `gpu.barrier` (threads
+    # are hardware lanes, so it actually synchronizes shared-memory writes/reads).
+    # On the CPU SIMD path the W lanes are SIMD lanes of one thread executing in
+    # lockstep, so a barrier is a no-op (the scatter→gather data dependency
+    # already orders shared writes before reads — see project_simt_over_cpu_simd).
     if fname === :barrier && lc.spmd
+        lc.lane_width == 1 && _gpu.barrier()
         return nothing
     end
 
@@ -2938,6 +2960,13 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
         lc.field_refs[idx] = (obj.n, fld_sym)
         return nothing
     elseif obj isa SSAValue
+        # `@localmem`-rooted: `getfield(shared, :ref)` on a shared_alloc result.
+        # Propagate the (alloca, elem_T) so memoryrefnew on this ref hits the
+        # workgroup buffer.
+        if haskey(lc.local_memrefs, obj.id)
+            lc.local_memrefs[idx] = lc.local_memrefs[obj.id]
+            return nothing
+        end
         # KernelState-rooted: `getfield(kernel_state_ssa, :seed)` → seed param.
         if obj.id in lc.kernel_state_ssas
             fld_sym = if args[2] isa QuoteNode
@@ -3943,6 +3972,51 @@ end
 # `Base.modifyindex_atomic!(mem, order, op, val, i)` — the CPU-array target of
 # KA `@atomic arr[i] op= x`. On the SPMD path the index `i` is the per-lane
 # bucket (a lane vector, e.g. `idx[lane]`), so this is a SCATTER of W atomic
+# `@localmem T dims` → a `memref.alloca` of static shape `dims`, in the
+# workgroup address space on the GPU SIMT path (real shared memory; `gpu.barrier`
+# synchronises it). The buffer is accessed only via the kernel's own
+# (column-major) linearisation, so its physical layout is irrelevant — but
+# `size(shared,1)` must equal `dims[1]`, which (with the Julia↔MLIR dim reversal
+# of `:size`/`memref.dim`) means the static shape is `reverse(dims)`. We register
+# the alloca in `lc.local_memrefs` so the marker result (and `getfield(_,:ref)`
+# on it) route memoryrefnew/get/set to this buffer instead of an arg memref.
+function emit_shared_alloc!(lc::LowerCtx, idx::Int, args)
+    length(args) >= 2 || error("shared_alloc: expected (T, Val{Dims}), got $args")
+    T = args[1] isa Type ? args[1] : something(resolve_const(lc, args[1]), nothing)
+    T isa Type || error("shared_alloc: element type must be a Type, got $(args[1])")
+    vd = args[2]
+    Dims = vd isa Val ? typeof(vd).parameters[1] :
+           (vd isa Type && vd <: Val) ? vd.parameters[1] :
+           error("shared_alloc: dims must be Val{Dims}, got $vd")
+    dims = Tuple(Dims)
+    elem = mlir_elem_type(T)
+    shape = Int[reverse(dims)...]
+    if lc.lane_width == 1
+        # GPU: a workgroup-space `memref.global` sibling of the gpu.func +
+        # `memref.get_global`. gpu-to-nvvm lowers this to real `.shared`.
+        # (`memref.alloca(workgroup)` mis-lowers to a per-thread local depot.)
+        lc.gpu_module_block !== nothing ||
+            error("shared_alloc: gpu.module block unavailable for @localmem")
+        ws = parse(IR.Attribute, "#gpu.address_space<workgroup>")
+        memref_t = IR.MemRefType(elem, shape, IR.Attribute(), ws)
+        sym = "__shmem_$(idx)"   # unique per @localmem site (marker SSA id)
+        @with_block lc.gpu_module_block begin
+            _memref.global_(; sym_name=IR.Attribute(sym),
+                            sym_visibility=IR.Attribute("private"),
+                            type=IR.Attribute(memref_t))
+        end
+        buf = IR.result(_memref.get_global(; result=memref_t,
+                        name=parse(IR.Attribute, "@" * sym)))
+        lc.local_memrefs[idx] = (buf, T)
+    else
+        # CPU SPMD: a plain per-block (default-space) alloca.
+        memref_t = IR.MemRefType(elem, shape, IR.Attribute(), IR.Attribute())
+        alloca = IR.result(_memref.alloca(IR.Value[], IR.Value[]; memref=memref_t))
+        lc.local_memrefs[idx] = (alloca, T)
+    end
+    return nothing
+end
+
 # N-D workgroup index reconstruction for `@index(Global/Local/Group, NTuple)`.
 # The workgroup is flattened to a single `vector<W>` lane (W = prod(wg_dims))
 # and the grid to a 1-D `scf.parallel`; we recover each Julia (column-major)
@@ -4053,21 +4127,28 @@ function emit_spmd_atomic_modifyindex!(lc::LowerCtx, args, @nospecialize(typ))
         error("modifyindex_atomic!: expected (mem, order, op, val, i), got $args")
     mem_ref, _order, op_ref, val_ref, idx_ref = args[1], args[2], args[3], args[4], args[5]
 
-    # Base memref + element type from the array arg.
-    arg_id =
-        if mem_ref isa SSAValue && haskey(lc.field_refs, mem_ref.id)
-            (aid, fld) = lc.field_refs[mem_ref.id]
-            fld === :ref || error("modifyindex_atomic!: mem must be getfield(arr,:ref), got :$fld")
-            aid
-        elseif mem_ref isa Argument
-            mem_ref.n
+    # Base memref + element type. An `@atomic` on a `@localmem` buffer roots at
+    # a shared_alloc (in lc.local_memrefs); otherwise at an array arg (an
+    # Argument or `getfield(arr,:ref)` tracked in lc.field_refs).
+    base, elem_T =
+        if mem_ref isa SSAValue && haskey(lc.local_memrefs, mem_ref.id)
+            (buf, et) = lc.local_memrefs[mem_ref.id]
+            (_flatten_memref(buf), et)
         else
-            error("modifyindex_atomic!: cannot trace mem operand $mem_ref to an array arg")
+            arg_id =
+                if mem_ref isa SSAValue && haskey(lc.field_refs, mem_ref.id)
+                    (aid, fld) = lc.field_refs[mem_ref.id]
+                    fld === :ref || error("modifyindex_atomic!: mem must be getfield(arr,:ref), got :$fld")
+                    aid
+                elseif mem_ref isa Argument
+                    mem_ref.n
+                else
+                    error("modifyindex_atomic!: cannot trace mem operand $mem_ref to an array arg")
+                end
+            haskey(lc.arg_vals, arg_id) ||
+                error("modifyindex_atomic!: no bound memref for arg $arg_id")
+            (lc.arg_vals[arg_id], lc.arg_elem_types[arg_id])
         end
-    haskey(lc.arg_vals, arg_id) ||
-        error("modifyindex_atomic!: no bound memref for arg $arg_id")
-    base = lc.arg_vals[arg_id]
-    elem_T = lc.arg_elem_types[arg_id]
 
     # Reduction op → memref.atomic_rmw kind keyword.
     op_sym = callee_name(op_ref)
@@ -4173,6 +4254,13 @@ end
 
 function emit_spmd_memoryrefnew!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     ref_ref = args[1]
+    # `@localmem` buffer: ref roots at a shared_alloc (workgroup memref), not an
+    # arg. Flatten the rank-N alloca to rank-1 for the linear index, same as args.
+    if ref_ref isa SSAValue && haskey(lc.local_memrefs, ref_ref.id)
+        (alloca, elem_T) = lc.local_memrefs[ref_ref.id]
+        base_memref = _flatten_memref(alloca)
+        return _emit_spmd_offset!(lc, idx, args, base_memref, elem_T)
+    end
     ref_ref isa SSAValue && haskey(lc.field_refs, ref_ref.id) ||
         error("SPMD memoryrefnew: ref operand must be `getfield(arr, :ref)`, got $ref_ref")
     (arg_id, fld) = lc.field_refs[ref_ref.id]
@@ -4182,6 +4270,12 @@ function emit_spmd_memoryrefnew!(lc::LowerCtx, idx::Int, args, @nospecialize(typ
     # linearises to one index, so flatten to rank-1 for the gather/scatter/load.
     base_memref = _flatten_memref(lc.arg_vals[arg_id])
     elem_T = lc.arg_elem_types[arg_id]
+    return _emit_spmd_offset!(lc, idx, args, base_memref, elem_T)
+end
+
+# Shared tail of emit_spmd_memoryrefnew!: record the OffsetInfo (1-based Julia
+# index → 0-based) for a resolved (base_memref, elem_T).
+function _emit_spmd_offset!(lc::LowerCtx, idx::Int, args, base_memref, elem_T)
 
     # Index: typically the lane Argument (varying vector). Materialise it; if
     # it's a scalar (uniform load), we'll bypass gather and use a scalar

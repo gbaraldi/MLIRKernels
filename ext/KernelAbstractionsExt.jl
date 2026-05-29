@@ -89,9 +89,15 @@ struct MLIRBackend <: KA.GPU end
 # cross-lane communication this is correct for the current scope.
 @overlay FE.METHOD_TABLE KA.__synchronize() = FE.Intrinsics.barrier()
 
-# `SharedMemory` / `Scratchpad` — not yet wired up (Phase B / B7,B8).
-@overlay FE.METHOD_TABLE KA.SharedMemory(::Type{T}, ::Val, ::Val) where {T} =
-    error("MLIRBackend: @localmem / SharedMemory not yet implemented")
+# `@localmem T dims` → `SharedMemory(T, Val(dims), Val(id))`. Map onto the
+# `shared_alloc` marker (dropping the gensym id — the walker emits a distinct
+# alloca per call site anyway, and the marker's `donotdelete` blocks CSE).
+# The walker lowers it to a workgroup-address-space `memref.alloca` (real GPU
+# shared memory on the SIMT path); `@synchronize` becomes a `gpu.barrier`.
+@overlay FE.METHOD_TABLE KA.SharedMemory(::Type{T}, ::Val{Dims}, ::Val) where {T, Dims} =
+    FE.Intrinsics.shared_alloc(T, Val(Dims))
+
+# `@private` / Scratchpad — not yet wired up.
 @overlay FE.METHOD_TABLE KA.Scratchpad(ctx, ::Type, ::Val) =
     error("MLIRBackend: @private / Scratchpad not yet implemented")
 

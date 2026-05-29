@@ -2371,6 +2371,41 @@ end
             am = CUDA.CuArray(ah); bm = CUDA.CuArray(bbh); om = CUDA.zeros(Float32, 8, 6)
             (@eval _g_matmul!)(GPUB(), (4, 2))(om, am, bm; ndrange=(8, 6)); CUDA.synchronize()
             @test maximum(abs.(Array(om) .- ah * bbh)) < 1f-3
+
+            # @localmem: workgroup-space memref.global + real gpu.barrier.
+            @eval begin
+                using KernelAbstractions: @localmem, @synchronize
+                using Atomix: @atomic
+                # cross-lane: reverse within each block through shared memory
+                @kernel function _g_shrev!(out, @Const(inp))
+                    gid = @index(Global, Linear); lid = @index(Local, Linear)
+                    s = @localmem Float32 (256,)
+                    @inbounds s[lid] = inp[gid]
+                    @synchronize
+                    @inbounds out[gid] = s[256 - lid + 1]
+                end
+                # atomic-on-shared: per-block reduction
+                @kernel function _g_blocksum!(out, @Const(inp))
+                    gid = @index(Global, Linear); gi = @index(Group, Linear)
+                    acc = @localmem Float32 (1,)
+                    @inbounds acc[1] = 0f0
+                    @synchronize
+                    @atomic acc[1] += inp[gid]
+                    @synchronize
+                    @inbounds out[gi] = acc[1]
+                end
+            end
+            Nl = 1024; Wl = 256; NBl = Nl ÷ Wl
+            inl = CUDA.CuArray(rand(Float32, Nl)); ihl = Array(inl)
+            orl = CUDA.zeros(Float32, Nl)
+            (@eval _g_shrev!)(GPUB(), Wl)(orl, inl; ndrange=Nl); CUDA.synchronize()
+            refrev = similar(ihl)
+            for b in 0:(NBl-1), k in 1:Wl; refrev[b*Wl+k] = ihl[b*Wl + (Wl-k+1)]; end
+            @test Array(orl) == refrev                       # cross-lane shared + barrier
+            osum = CUDA.zeros(Float32, NBl)
+            (@eval _g_blocksum!)(GPUB(), Wl)(osum, inl; ndrange=Nl); CUDA.synchronize()
+            refsum = [sum(ihl[(b*Wl+1):((b+1)*Wl)]) for b in 0:(NBl-1)]
+            @test isapprox(Array(osum), refsum; rtol=1f-4)   # atomic-on-shared
         end
     end
 
