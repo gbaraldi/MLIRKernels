@@ -51,6 +51,15 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         p = mk(rand(Float32, n) .+ 0.5f0)
         @test A(sqrt.(abs.(p))) ≈ sqrt.(abs.(A(p)))
 
+        # Transcendentals (Base.sin etc. → math.sin → __nv_sinf via libdevice) and
+        # rounding / fma intrinsics (floor_llvm→math.floor, muladd_float→math.fma).
+        for f in (sin, cos, exp, log, tanh, cbrt, floor)
+            @test A(f.(p)) ≈ f.(A(p))
+        end
+        @test A(p .^ 3.0f0) ≈ A(p) .^ 3.0f0                       # ^ → math.powf
+        @test A(muladd.(p, p, p)) ≈ muladd.(A(p), A(p), A(p))     # → math.fma
+        @test A(copysign.(p, .-p)) ≈ copysign.(A(p), .-A(p))      # → math.copysign
+
         # device↔device copyto! through the backend.
         c = mk(zeros(Float32, n)); copyto!(c, a); CUDA.synchronize()
         @test A(c) == A(a)

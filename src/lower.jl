@@ -1400,9 +1400,41 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             value=IR.Attribute(true, IR.Type(Bool)), result=IR.Type(Bool)))
     end
 
+    # Named transcendental / rounding math functions reached as plain Julia calls
+    # (`Base.sin(::Float32)` etc. don't inline) → the MLIR math dialect.
+    let mop = get(_MATH_UNARY, fname, nothing)
+        mop !== nothing && return emit_unary_math!(lc, args, mop, typ)
+    end
+
+    # `^` on a float base → math.powf (float exponent) / math.fpowi (int exponent).
+    if fname === :^ && length(args) == 2
+        base = resolve_value_or_const(lc, args[1])
+        ex   = resolve_value_or_const(lc, args[2])
+        if base !== nothing && ex !== nothing && _float_width(IR.type(base)) != 0
+            bt = IR.type(base)
+            _int_width(IR.type(ex)) != 0 &&
+                return IR.result(_math.fpowi(base, ex; result=bt))
+            return IR.result(_math.powf(base, _coerce_to_type!(ex, bt); result=bt))
+        end
+    end
+
     error("MLIRKernels.walk_call!: unhandled callee $fname " *
           "(callee=$callee, args=$args)")
 end
+
+# Plain-Julia unary math callees (`Base.sin` etc. that survive inference as a
+# call rather than inlining to primitives) → math-dialect ops. In the gpu→nvvm
+# pipeline the transcendentals lower to libdevice (`__nv_sinf`, …), which the PTX
+# step links; the rounding ops lower natively.
+const _MATH_UNARY = Dict{Symbol,Any}(
+    :sin => _math.sin, :cos => _math.cos, :tan => _math.tan,
+    :sinh => _math.sinh, :cosh => _math.cosh, :tanh => _math.tanh,
+    :asin => _math.asin, :acos => _math.acos, :atan => _math.atan,
+    :exp => _math.exp, :exp2 => _math.exp2, :expm1 => _math.expm1,
+    :log => _math.log, :log2 => _math.log2, :log10 => _math.log10, :log1p => _math.log1p,
+    :sqrt => _math.sqrt, :cbrt => _math.cbrt,
+    :floor => _math.floor, :ceil => _math.ceil, :trunc => _math.trunc,
+)
 
 # Resolve the two operands of a binary arith op (lifting Julia literals /
 # Const-args to arith.constant if needed) and emit `op_fn(a, b)`.
@@ -1486,6 +1518,9 @@ const _RAW_CORE_INTRINSICS = Set{Symbol}([
     # uses :absf/:sqrt/etc, but the Frontend path hands them raw). One operand,
     # operand-typed result — vector-aware via emit_unary_math!.
     :abs_float, :sqrt_llvm, :sqrt_llvm_fast,
+    # Rounding + fused-multiply-add float intrinsics → math dialect.
+    :floor_llvm, :ceil_llvm, :trunc_llvm, :rint_llvm,
+    :copysign_float, :muladd_float, :fma_float,
     # Integer div/rem (incl. the overflow/zero-"checked" variants — the check is
     # a div-by-zero guard the kernel is responsible for; we emit the unchecked
     # arith op). Needed e.g. by the steprange_last overlay's unsigned rem.
@@ -1651,6 +1686,15 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :abs_float      && return emit_unary_math!(lc, args, _math.absf, typ)
     name === :sqrt_llvm      && return emit_unary_math!(lc, args, _math.sqrt, typ)
     name === :sqrt_llvm_fast && return emit_unary_math!(lc, args, _math.sqrt, typ)
+    # Rounding intrinsics (Julia's `floor`/`ceil`/`trunc`/`round` inline to these).
+    name === :floor_llvm     && return emit_unary_math!(lc, args, _math.floor, typ)
+    name === :ceil_llvm      && return emit_unary_math!(lc, args, _math.ceil, typ)
+    name === :trunc_llvm     && return emit_unary_math!(lc, args, _math.trunc, typ)
+    name === :rint_llvm      && return emit_unary_math!(lc, args, _math.roundeven, typ)
+    # copysign (binary) and muladd/fma (ternary) → math.copysign / math.fma.
+    name === :copysign_float && return emit_binary_math!(lc, args, _math.copysign)
+    (name === :muladd_float || name === :fma_float) &&
+        return emit_ternary_math!(lc, args, _math.fma)
     # Integer comparisons → emit_cmpi! with synthesized (pred, signedness).
     name === :slt_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThan, SG.Signed], typ)
     name === :sle_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThanOrEqual, SG.Signed], typ)
@@ -1658,7 +1702,7 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :ule_int && return emit_cmpi!(lc, Any[args[1], args[2], CP.LessThanOrEqual, SG.Unsigned], typ)
     name === :eq_int  && return emit_cmpi!(lc, Any[args[1], args[2], CP.Equal, SG.Signed], typ)
     name === :ne_int  && return emit_cmpi!(lc, Any[args[1], args[2], CP.NotEqual, SG.Signed], typ)
-    name === Symbol("===") && return emit_cmpi!(lc, Any[args[1], args[2], CP.Equal, SG.Signed], typ)
+    name === Symbol("===") && return emit_egal!(lc, args, typ)
     # Float comparisons → emit_cmpf!.
     name === :lt_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.LessThan], typ)
     name === :le_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.LessThanOrEqual], typ)
@@ -1808,6 +1852,27 @@ function emit_unary_math!(lc::LowerCtx, args, op_fn, @nospecialize(typ))
     return IR.result(op_fn(a; result=IR.type(a)))
 end
 
+# Binary float math (`math.copysign`): operands share the result type.
+function emit_binary_math!(lc::LowerCtx, args, op_fn)
+    a = resolve_value_or_const(lc, args[1])
+    b = resolve_value_or_const(lc, args[2])
+    (a === nothing || b === nothing) && error("$(op_fn): unresolved operands")
+    a, b = _spmd_harmonise(lc, a, b)
+    return IR.result(op_fn(a, b; result=IR.type(a)))
+end
+
+# Ternary float math (`math.fma` — for `muladd_float`/`fma_float`): all three
+# operands share the result type.
+function emit_ternary_math!(lc::LowerCtx, args, op_fn)
+    a = resolve_value_or_const(lc, args[1])
+    b = resolve_value_or_const(lc, args[2])
+    c = resolve_value_or_const(lc, args[3])
+    (a === nothing || b === nothing || c === nothing) &&
+        error("$(op_fn): unresolved operands")
+    a, b, c = _spmd_harmonise(lc, a, b, c)
+    return IR.result(op_fn(a, b, c; result=IR.type(a)))
+end
+
 # Intrinsics.fma(x, y, z) → math.fma. Same vector shape across all
 # three operands.
 
@@ -1816,6 +1881,39 @@ end
 
 # cmpi(lhs, rhs, predicate::ComparisonPredicate.T, sign::Signedness.T)
 # → arith.cmpi with the matching i64 predicate attribute.
+# Reinterpret a float Value as a same-width signless integer (vector-aware).
+# `===` on floats is a bitwise egal that lands in `emit_cmpi!`, but `arith.cmpi`
+# is integer-only — so bitcast f16/f32/f64 → i16/i32/i64 first.
+function _bitcast_float_to_int!(v::IR.Value)
+    t = IR.type(v)
+    fw = _float_width(t)
+    fw == 0 && return v
+    iet = IR.Type(fw == 16 ? Int16 : fw == 32 ? Int32 : Int64)
+    if IR.isvector(t)
+        return IR.result(_vector.bitcast(v;
+                   result=IR.VectorType(1, Int[Int(size(t, 1))], iet)))
+    end
+    return IR.result(_arith.bitcast(v; out=iet))
+end
+
+# `Core.===` (egal): bitwise equality. Detect the operand type at emission and
+# emit the right op — integers compare directly with `cmpi eq`; floats compare
+# bit patterns (NaN===NaN true, 0.0===-0.0 false), so reinterpret them as
+# integers first. (`cmpf oeq` would be wrong: it follows IEEE, not bit equality.)
+function emit_egal!(lc::LowerCtx, args, @nospecialize(typ))
+    a = resolve_value_or_const(lc, args[1])
+    b = resolve_value_or_const(lc, args[2])
+    (a === nothing || b === nothing) &&
+        error("===: unresolved operands ($(args[1]), $(args[2]))")
+    a, b = _spmd_harmonise(lc, a, b)
+    a = _bitcast_float_to_int!(a)        # no-op on integers
+    b = _bitcast_float_to_int!(b)
+    a, b = _harmonise_binop_widths(a, b, nothing)
+    pred = IR.Attribute(cmpi_predicate_code(ComparisonPredicate.Equal, Signedness.Signed),
+                        IR.Type(Int64))
+    return IR.result(_arith.cmpi(a, b; predicate=pred))
+end
+
 function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
     a = resolve_value_or_const(lc, args[1])
     b = resolve_value_or_const(lc, args[2])
