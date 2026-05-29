@@ -906,7 +906,8 @@ end
 # Returns the terminator's MLIR Value-list (or empty Vec) for callers that
 # care (currently unused; we emit the terminator op inline).
 function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
-                     yield_types::Vector{Type}=Type[])
+                     yield_types::Vector{Type}=Type[],
+                     carried_types::Vector{IR.Type}=IR.Type[])
     for (idx, entry) in block
         stmt = entry.stmt
         typ  = entry.type
@@ -982,9 +983,10 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         cond = resolve_value_or_const(lc, term.condition)
         cond === nothing && error("scf.condition: cannot resolve condition $(term.condition)")
         fwd = IR.Value[]
-        for v in term.args
+        for (k, v) in enumerate(term.args)
             r = resolve_value_or_const(lc, v)
             r === nothing && error("scf.condition: cannot resolve forwarded operand $v")
+            k <= length(carried_types) && (r = _coerce_to_type!(r, carried_types[k]))
             push!(fwd, r)
         end
         _scf.condition(cond, fwd)
@@ -995,9 +997,10 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         term isa YieldOp ||
             error("walk_block!(:while_after): expected YieldOp, got $(typeof(term))")
         vals = IR.Value[]
-        for v in term.values
+        for (k, v) in enumerate(term.values)
             r = resolve_value_or_const(lc, v)
             r === nothing && error("scf.yield: cannot resolve operand $v")
+            k <= length(carried_types) && (r = _coerce_to_type!(r, carried_types[k]))
             push!(vals, r)
         end
         _scf.yield(vals)
@@ -1403,13 +1406,55 @@ end
 
 # Resolve the two operands of a binary arith op (lifting Julia literals /
 # Const-args to arith.constant if needed) and emit `op_fn(a, b)`.
-function emit_binop_value!(lc::LowerCtx, args, op_fn)
+function emit_binop_value!(lc::LowerCtx, args, op_fn, @nospecialize(result_T)=nothing)
     a = resolve_value_or_const(lc, args[1])
     b = resolve_value_or_const(lc, args[2])
     (a === nothing || b === nothing) &&
         error("$(op_fn): unresolved operands ($(args[1]), $(args[2]))")
     a, b = _spmd_harmonise(lc, a, b)
+    a, b = _harmonise_binop_widths(a, b, result_T)
     return IR.result(op_fn(a, b))
+end
+
+# `arith.{addi,muli,addf,…}` require all operands and the result to share a type.
+# Julia's typed IR normally guarantees this, but the numeric-union scf.if result
+# promotion can widen one operand (e.g. an `Int32` index added to an `Int64`-
+# promoted if-result), and constants may materialise at a different width. The
+# statement's inferred Julia type is authoritative, so coerce both operands to it
+# (vector-aware, via `_coerce_numeric!`); with no result type, widen the narrower
+# operand to the wider. Signed integers assumed (MLIR int types are signless).
+# Collapse a numeric union (`Union{Int32,Int64}`) to its promoted concrete type;
+# pass a concrete numeric type through; `nothing` for anything else. Shared by the
+# scf.if yield promotion and the binop/select width harmonisation.
+function _promote_numeric_type(@nospecialize(T))
+    if T isa Union
+        members = Base.uniontypes(T)
+        all(m -> m isa Type && m <: Number, members) || return nothing
+        return reduce(promote_type, members)
+    elseif T isa Type && T <: Number
+        return T
+    end
+    return nothing
+end
+
+function _harmonise_binop_widths(a::IR.Value, b::IR.Value, @nospecialize(result_T))
+    pt = _promote_numeric_type(result_T)
+    if pt !== nothing
+        return _coerce_numeric!(a, pt), _coerce_numeric!(b, pt)
+    end
+    ta, tb = IR.type(a), IR.type(b)
+    ta == tb && return a, b
+    wa, wb = _int_width(ta), _int_width(tb)
+    if wa != 0 && wb != 0
+        return wa < wb ? (IR.result(_arith.extsi(a; out=tb)), b) :
+                         (a, IR.result(_arith.extsi(b; out=ta)))
+    end
+    fa, fb = _float_width(ta), _float_width(tb)
+    if fa != 0 && fb != 0
+        return fa < fb ? (IR.result(_arith.extf(a; out=tb)), b) :
+                         (a, IR.result(_arith.extf(b; out=ta)))
+    end
+    error("binop: cannot harmonise operand types $ta / $tb")
 end
 
 # ----------------------------------------------------------------------------
@@ -1524,6 +1569,28 @@ function _coerce_numeric!(v::IR.Value, target_T::Type)
     end
 end
 
+# Coerce `v` to a target MLIR type (scalar, signed-int assumed). Used at scf
+# control-flow edges (while carried values) where the target is an MLIR type
+# rather than a Julia type. No-op when already matching; leaves non-numerics be.
+function _coerce_to_type!(v::IR.Value, target_t::IR.Type)
+    src = IR.type(v)
+    src == target_t && return v
+    si, di = _int_width(src), _int_width(target_t)
+    sf, df = _float_width(src), _float_width(target_t)
+    if si != 0 && di != 0
+        return di > si ? IR.result(_arith.extsi(v; out=target_t)) :
+               IR.result(_arith.trunci(v; out=target_t))
+    elseif sf != 0 && df != 0
+        return df > sf ? IR.result(_arith.extf(v; out=target_t)) :
+               IR.result(_arith.truncf(v; out=target_t))
+    elseif si != 0 && df != 0
+        return IR.result(_arith.sitofp(v; out=target_t))
+    elseif sf != 0 && di != 0
+        return IR.result(_arith.fptosi(v; out=target_t))
+    end
+    return v
+end
+
 # Integer shift: `arith.{shl,shr*}i` require both operands to share a type, but
 # Julia hands the count as an `Int` (so e.g. `lshr_int(::UInt8, ::Int)` arrives
 # as i8/i64). Coerce the count to the shifted value's width.
@@ -1547,23 +1614,23 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     CP = ComparisonPredicate
     SG = Signedness
     # Float / int arithmetic — operand-inferred result, vector-harmonised.
-    name === :add_float && return emit_binop_value!(lc, args, _arith.addf)
-    name === :sub_float && return emit_binop_value!(lc, args, _arith.subf)
-    name === :mul_float && return emit_binop_value!(lc, args, _arith.mulf)
-    name === :div_float && return emit_binop_value!(lc, args, _arith.divf)
-    name === :add_int   && return emit_binop_value!(lc, args, _arith.addi)
-    name === :sub_int   && return emit_binop_value!(lc, args, _arith.subi)
-    name === :mul_int   && return emit_binop_value!(lc, args, _arith.muli)
-    name === :and_int   && return emit_binop_value!(lc, args, _arith.andi)
-    name === :or_int    && return emit_binop_value!(lc, args, _arith.ori)
-    name === :xor_int   && return emit_binop_value!(lc, args, _arith.xori)
+    name === :add_float && return emit_binop_value!(lc, args, _arith.addf, typ)
+    name === :sub_float && return emit_binop_value!(lc, args, _arith.subf, typ)
+    name === :mul_float && return emit_binop_value!(lc, args, _arith.mulf, typ)
+    name === :div_float && return emit_binop_value!(lc, args, _arith.divf, typ)
+    name === :add_int   && return emit_binop_value!(lc, args, _arith.addi, typ)
+    name === :sub_int   && return emit_binop_value!(lc, args, _arith.subi, typ)
+    name === :mul_int   && return emit_binop_value!(lc, args, _arith.muli, typ)
+    name === :and_int   && return emit_binop_value!(lc, args, _arith.andi, typ)
+    name === :or_int    && return emit_binop_value!(lc, args, _arith.ori, typ)
+    name === :xor_int   && return emit_binop_value!(lc, args, _arith.xori, typ)
     name === :shl_int   && return emit_shift!(lc, args, _arith.shli)    # shift left
     name === :lshr_int  && return emit_shift!(lc, args, _arith.shrui)   # logical >>
     name === :ashr_int  && return emit_shift!(lc, args, _arith.shrsi)   # arithmetic >>
-    (name === :udiv_int || name === :checked_udiv_int) && return emit_binop_value!(lc, args, _arith.divui)
-    (name === :sdiv_int || name === :checked_sdiv_int) && return emit_binop_value!(lc, args, _arith.divsi)
-    (name === :urem_int || name === :checked_urem_int) && return emit_binop_value!(lc, args, _arith.remui)
-    (name === :srem_int || name === :checked_srem_int) && return emit_binop_value!(lc, args, _arith.remsi)
+    (name === :udiv_int || name === :checked_udiv_int) && return emit_binop_value!(lc, args, _arith.divui, typ)
+    (name === :sdiv_int || name === :checked_sdiv_int) && return emit_binop_value!(lc, args, _arith.divsi, typ)
+    (name === :urem_int || name === :checked_urem_int) && return emit_binop_value!(lc, args, _arith.remui, typ)
+    (name === :srem_int || name === :checked_srem_int) && return emit_binop_value!(lc, args, _arith.remsi, typ)
     if name === :neg_float
         v = resolve_value_or_const(lc, args[1])
         v === nothing && error("neg_float: unresolved operand")
@@ -1634,6 +1701,9 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
         (c === nothing || x === nothing || y === nothing) &&
             error("ifelse: unresolved operands")
         x, y = _spmd_harmonise(lc, x, y)
+        # select requires both arms share the result type; a numeric-union arm can
+        # arrive at a different width (e.g. `ifelse(c, i::Int32, j::Int64)`).
+        x, y = _harmonise_binop_widths(x, y, typ)
         if IR.isvector(IR.type(x)) && !IR.isvector(IR.type(c))
             n = Int(size(IR.type(x), 1))
             c = _broadcast_to_match(c, IR.VectorType(1, Int[n], IR.Type(Bool)))
@@ -1765,6 +1835,9 @@ function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
     # the other side is varying (e.g. `gid < n` masks, or a lane-vector vs
     # scalar-literal compare).
     a, b = _spmd_harmonise(lc, a, b)
+    # cmpi requires both operands to share a type; a numeric-union if-result can
+    # arrive wider than its peer, so widen the narrower (no result type → wider).
+    a, b = _harmonise_binop_widths(a, b, nothing)
     # arith.cmpi result is i1; for tile element type Bool yields i1 (or
     # vector<...xi1>). Result type is inferred by the op builder since we
     # don't pass it.
@@ -1800,6 +1873,7 @@ function emit_cmpf!(lc::LowerCtx, args, @nospecialize(typ))
     # emits, comparing the lane vector against a scalar 0.0) needs the scalar
     # broadcast to the lane vector width so both operands share a type.
     a, b = _spmd_harmonise(lc, a, b)
+    a, b = _harmonise_binop_widths(a, b, nothing)   # widen narrower float operand
     return IR.result(_arith.cmpf(a, b; predicate=pred_attr))
 end
 
@@ -2272,7 +2346,7 @@ function emit_while!(lc::LowerCtx, idx::Int, op::WhileOp, @nospecialize(typ))
         for (k, ba) in enumerate(op.before.args)
             lc.block_args[ba.id] = IR.argument(before_block, k)
         end
-        walk_block!(lc, op.before; kind=:while_before)
+        walk_block!(lc, op.before; kind=:while_before, carried_types=iter_types)
     end
 
     after_region = IR.Region()
@@ -2282,7 +2356,7 @@ function emit_while!(lc::LowerCtx, idx::Int, op::WhileOp, @nospecialize(typ))
         for (k, ba) in enumerate(op.after.args)
             lc.block_args[ba.id] = IR.argument(after_block, k)
         end
-        walk_block!(lc, op.after; kind=:while_after)
+        walk_block!(lc, op.after; kind=:while_after, carried_types=iter_types)
     end
 
     whileop = _scf.while_(init_vals; results=iter_types,
