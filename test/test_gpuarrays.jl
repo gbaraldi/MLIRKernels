@@ -59,6 +59,9 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         @test A(p .^ 3.0f0) ≈ A(p) .^ 3.0f0                       # ^ → math.powf
         @test A(muladd.(p, p, p)) ≈ muladd.(A(p), A(p), A(p))     # → math.fma
         @test A(copysign.(p, .-p)) ≈ copysign.(A(p), .-A(p))      # → math.copysign
+        # hypot: an elided `sqrt` domain-error throw makes one `scf.if` branch
+        # return early; it must yield poison matching the result arity.
+        @test A(hypot.(p, p)) ≈ hypot.(A(p), A(p))
 
         # device↔device copyto! through the backend.
         c = mk(zeros(Float32, n)); copyto!(c, a); CUDA.synchronize()

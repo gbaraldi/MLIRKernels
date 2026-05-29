@@ -913,9 +913,10 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         typ  = entry.type
         if stmt isa Core.ReturnNode
             # Some structurization shapes still place ReturnNode in the body
-            # rather than terminator (very rare). Treat as early return.
+            # rather than terminator (very rare). Treat as early return: yield
+            # poison matching the IfOp's result arity (see the terminator case).
             if kind === :if
-                _scf.yield(IR.Value[])
+                _scf.yield(IR.Value[undef_value(lc, T) for T in yield_types])
                 return
             end
             continue
@@ -930,10 +931,11 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         return
     elseif kind === :if
         if term isa Core.ReturnNode
-            # Early return from the kernel via this branch. Inside scf.if we
-            # can only emit scf.yield. Use no operands (the `scf.if` was
-            # constructed with empty result types in this case).
-            _scf.yield(IR.Value[])
+            # A branch that returns early (e.g. an elided `throw` — like `sqrt`'s
+            # domain guard in `hypot`). `scf.if` requires both branches to yield
+            # the IfOp's results, but this path is dead (it returned), so yield
+            # poison matching the result arity (empty when the IfOp has none).
+            _scf.yield(IR.Value[undef_value(lc, T) for T in yield_types])
             return
         elseif term isa YieldOp
             vals = IR.Value[]
