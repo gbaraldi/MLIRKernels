@@ -260,23 +260,31 @@ end
 
 # Device array types trip scalar-indexing guards during inference; map them to
 # the host `Array` of the same eltype/rank (which lowers identically).
+# Does a type contain a device array anywhere in its parameter tree?
+_has_device_array(@nospecialize(x)) = false
+function _has_device_array(@nospecialize(T::Type))
+    (T <: CuArray || T <: MLIRArray) && return true
+    isconcretetype(T) && isstructtype(T) &&
+        any(p -> _has_device_array(p), T.parameters)
+end
+
 _host_argtype(::Type{<:CuArray{T,N}}) where {T,N} = Array{T,N}
 _host_argtype(::Type{<:MLIRArray{T,N}}) where {T,N} = Array{T,N}
 function _host_argtype(@nospecialize(T::Type))
-    # A closure/functor capturing device arrays: its type params ARE the
-    # captured field types, so rebuild it with each device-array param remapped
-    # to a host Array. Then inference indexes the captures via Array's getindex
-    # (no GPUArrays.assertscalar in the kernel IR), while marshalling still
-    # unwraps the real device arrays. Element type/ndims are unchanged, so the
-    # flattened memref params match.
-    if T <: Function && isstructtype(T) && !isempty(T.parameters)
-        try
-            return T.name.wrapper{map(_host_argtype, collect(T.parameters))...}
-        catch
-            return T
-        end
+    # A wrapper/closure carrying device arrays (a closure's captures, a
+    # SubArray's `.parent`, …): rebuild the type with every device-array type
+    # param remapped to a host Array, recursively. Then inference indexes those
+    # arrays via Array's getindex (no GPUArrays.assertscalar in the kernel IR)
+    # and inlines; marshalling still unwraps the real device arrays. Element
+    # type/ndims are unchanged, so the flattened memref params match. Only Type
+    # params are remapped — value params (ndims, flags) are kept verbatim.
+    _has_device_array(T) || return T
+    try
+        return T.name.wrapper{map(p -> p isa Type ? _host_argtype(p) : p,
+                                  collect(T.parameters))...}
+    catch
+        return T
     end
-    return T
 end
 
 function _resolve_wgsize(obj::KA.Kernel{MLIRCUDABackend}, workgroupsize)

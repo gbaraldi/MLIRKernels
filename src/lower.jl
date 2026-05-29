@@ -111,6 +111,13 @@ mutable struct LowerCtx
     # to the synthetic slot's memref).
     captured::Dict{Tuple{Int, Symbol}, Tuple{Int, Symbol}}
     array_ssa::Dict{Int, Int}
+    # `Expr(:new, T, fields...)` struct construction (e.g. KA's `@Const` +
+    # `inbounds=true` wraps a read-only array in `Base.Experimental.Const`):
+    # SSA → (struct type, field operands). `getfield(new_ssa, :field)` extracts.
+    new_structs::Dict{Int, Tuple{Any, Vector{Any}}}
+    # SSA → an Argument/SSAValue it transparently aliases (e.g. the array a
+    # `getfield(Const, :a)` yields). Resolved at the top of getfield/resolve.
+    aliases::Dict{Int, Any}
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -125,7 +132,8 @@ LowerCtx(ctx, mod) = LowerCtx(
     false, 16, 0, Int64,
     Int[], Int[],
     Dict{Int, Tuple{IR.Value, Type, Vector{Int}}}(), nothing,
-    Dict{Tuple{Int, Symbol}, Tuple{Int, Symbol}}(), Dict{Int, Int}())
+    Dict{Tuple{Int, Symbol}, Tuple{Int, Symbol}}(), Dict{Int, Int}(),
+    Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}())
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -678,6 +686,46 @@ end
 # `__index_Global_Linear(ctx)` overlay rewrites to the sentinel, and the
 # ctx itself is never referenced as data. When `ctx_arg === nothing` we
 # use the plain-Julia shape (trailing Integer `gid`).
+# Recursively flatten a struct/closure/wrapped-array arg into GPU func params:
+# a DenseArray field → memref param, a Number field → scalar param, a singleton
+# field (e.g. a captured user function) → skipped, a nested struct/tuple field →
+# recurse. Each leaf gets a synthetic (negative) slot, bound in
+# arg_vals/arg_elem_types. Only the arg's DIRECT fields (`is_top`) are recorded
+# in `lc.captured`, so the walker can resolve `getfield(arg, :field)`; nested
+# leaves get params (for marshalling consistency) but aren't directly addressed.
+# Returns the updated synthetic-slot counter.
+function _flatten_struct_arg!(lc::LowerCtx, @nospecialize(T), arg_slot::Int,
+                              is_top::Bool, syn::Int, param_mlir_types,
+                              param_arg_slots, param_julia_types, param_kinds,
+                              global_attr)
+    for fn in fieldnames(T)
+        FT = fieldtype(T, fn)
+        Base.issingletontype(FT) && continue
+        if FT <: DenseArray
+            syn -= 1
+            mrc = IR.MemRefType(mlir_elem_type(eltype(FT)),
+                                fill(Int(IR.dynsize()), ndims(FT)),
+                                IR.Attribute(), global_attr)
+            push!(param_mlir_types, mrc); push!(param_arg_slots, syn)
+            push!(param_julia_types, FT); push!(param_kinds, :memref)
+            lc.arg_elem_types[syn] = eltype(FT)
+            is_top && (lc.captured[(arg_slot, fn)] = (syn, :memref))
+        elseif FT <: Number
+            syn -= 1
+            push!(param_mlir_types, mlir_elem_type(FT)); push!(param_arg_slots, syn)
+            push!(param_julia_types, FT); push!(param_kinds, :scalar)
+            is_top && (lc.captured[(arg_slot, fn)] = (syn, :scalar))
+        elseif isstructtype(FT) && !isempty(fieldnames(FT))
+            syn = _flatten_struct_arg!(lc, FT, arg_slot, false, syn,
+                       param_mlir_types, param_arg_slots, param_julia_types,
+                       param_kinds, global_attr)
+        else
+            error("MLIRKernels GPU: capture field $fn::$FT (slot $arg_slot) unsupported")
+        end
+    end
+    return syn
+end
+
 function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                            kernel_name::String, module_name::String="kernels",
                            lane_idx_type::Type=Int32,
@@ -763,35 +811,13 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                         push!(param_kinds, :scalar)
                     end
                 else
-                    # Closure / functor: flatten captured fields into their own
-                    # params. Array/scalar captures → memref/scalar params at
-                    # synthetic (negative) slots; singleton captures (e.g. a
-                    # captured user function) inline away and need no param.
+                    # Closure / functor / wrapped array (SubArray, range, …):
+                    # recursively flatten captured fields into their own params.
                     (isstructtype(AT_wide) && !isempty(fieldnames(AT_wide))) ||
                         error("MLIRKernels GPU: unsupported arg type $AT_wide at slot $i")
-                    for fn in fieldnames(AT_wide)
-                        FT = fieldtype(AT_wide, fn)
-                        Base.issingletontype(FT) && continue
-                        syn_counter -= 1; syn = syn_counter
-                        if FT <: DenseArray
-                            eTc = eltype(FT); Nc = ndims(FT)
-                            mrc = IR.MemRefType(mlir_elem_type(eTc),
-                                                fill(Int(IR.dynsize()), Nc),
-                                                IR.Attribute(), global_attr)
-                            push!(param_mlir_types, mrc); push!(param_arg_slots, syn)
-                            push!(param_julia_types, FT); push!(param_kinds, :memref)
-                            lc.arg_elem_types[syn] = eTc
-                            lc.captured[(i, fn)] = (syn, :memref)
-                        elseif FT <: Number
-                            push!(param_mlir_types, mlir_elem_type(FT))
-                            push!(param_arg_slots, syn)
-                            push!(param_julia_types, FT); push!(param_kinds, :scalar)
-                            lc.captured[(i, fn)] = (syn, :scalar)
-                        else
-                            error("MLIRKernels GPU: closure capture $fn::$FT " *
-                                  "at slot $i unsupported")
-                        end
-                    end
+                    syn_counter = _flatten_struct_arg!(lc, AT_wide, i, true,
+                        syn_counter, param_mlir_types, param_arg_slots,
+                        param_julia_types, param_kinds, global_attr)
                 end
             end
 
@@ -988,6 +1014,15 @@ function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
         # body with an `Expr(:loopinfo, "julia.simdloop"/"julia.unroll", …)`
         # hint. It's a pure optimisation directive (the loop is semantically a
         # plain scf.for); drop it and let LLVM/ptxas unroll/vectorise.
+        return nothing
+    elseif e.head === :new
+        # Struct construction. No IR is emitted; we record the field operands so
+        # a later `getfield(new_ssa, :field)` extracts them. The case that arises
+        # in practice is `Base.Experimental.Const(arr)` (KA's `@Const` +
+        # `inbounds=true`) — a transparent read-only-array wrapper.
+        T = e.args[1] isa Type ? e.args[1] :
+            something(resolve_const(lc, e.args[1]), nothing)
+        lc.new_structs[idx] = (T, collect(Any, e.args[2:end]))
         return nothing
     end
     error("MLIRKernels.walk_expr!: unhandled Expr head :$(e.head) at %$idx ($e)")
@@ -1696,6 +1731,25 @@ end
 # control-flow op or a tracked tuple) forms.
 function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     obj = args[1]
+    # Resolve through transparent aliases (e.g. the array that `getfield(Const,
+    # :a)` yielded) so `getfield(alias, :field)` reaches the real Argument/SSA.
+    while obj isa SSAValue && haskey(lc.aliases, obj.id)
+        obj = lc.aliases[obj.id]
+    end
+    # `getfield(new_struct, :field)`: extract the recorded field operand. If it
+    # is an Argument/SSAValue, alias this result to it (so further getfield/
+    # indexing routes through); otherwise resolve it to a Value.
+    if obj isa SSAValue && haskey(lc.new_structs, obj.id)
+        (T, ops) = lc.new_structs[obj.id]
+        fld = args[2] isa QuoteNode ? args[2].value : args[2]
+        fi = fld isa Symbol ? Base.fieldindex(T, fld) : Int(fld)
+        operand = ops[fi]
+        if operand isa Argument || operand isa SSAValue
+            lc.aliases[idx] = operand
+            return nothing
+        end
+        return resolve_value_or_const(lc, operand)
+    end
     if obj isa Argument
         field = args[2]
         fld_sym = field isa QuoteNode ? field.value :
