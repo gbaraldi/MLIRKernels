@@ -1,5 +1,5 @@
-# test_spmd.jl — the SPMD (ISPC-style scalar→vector) path. Plain-Julia kernels,
-# no cuTile. Exercises spmd_function / lower_to_mlir_spmd.
+# test_spmd.jl — the SPMD (ISPC-style scalar→vector) path. Plain-Julia kernels.
+# Exercises spmd_function / lower_to_mlir_spmd.
 
 # Lane kernel: plain Julia (no Tile/ct.*); the trailing `i::Int` is the lane index.
 function vadd_spmd(a::Vector{Float32}, b::Vector{Float32},
@@ -49,8 +49,8 @@ end
 @testset "SPMD: vadd with alignment=128" begin
     # Same kernel as the basic SPMD vadd test, but with the explicit
     # `alignment=128` kwarg. The walker emits memref.assume_alignment
-    # and a strided<[1]> layout — matching what the cuTile (TileArray)
-    # path gets from ArraySpec. Closes the DRAM-scale perf gap between
+    # and a strided<[1]> layout, which lets the vectorizer assume unit stride.
+    # Closes the DRAM-scale perf gap between
     # SPMD and tile (see bench/bench_spmd.jl). Caller is responsible
     # for supplying aligned buffers (aligned_array).
     n = 1024

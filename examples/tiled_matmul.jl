@@ -1,5 +1,5 @@
-# Tiled matmul: correctness + benchmark vs naive / CUDA.jl KA / CUBLAS.
-# The tiled @kernel itself is filled in from the design workflow (see TILED block).
+# Tiled shared-memory matmul on the GPU SIMT path: correctness + benchmark vs
+# the naive kernel, CUDA.jl's native KA backend, and CUBLAS.
 using MLIRKernels, KernelAbstractions, CUDA, LLVM, Atomix, Printf
 using LinearAlgebra
 const KA = KernelAbstractions
@@ -17,10 +17,8 @@ const MLIRB = ext.MLIRCUDABackend
     @inbounds C[i, j] = acc
 end
 
-# ---- TILED (placeholder; replaced after design workflow) -------------------
-# --- tiled kernel (safe nested-loop structure) ---
-# Tiled matmul (square, K an exact multiple of TILE).
-# Structure proven safe by the nested-loop repro: the inner-product accumulator
+# ---- tiled (square, K an exact multiple of TILE) ---------------------------
+# The inner-product accumulator
 # `out` is LOCAL to each k-tile iteration (reset each outer iter) and folded
 # into the outer register accumulator `acc` AFTER the inner loop — never one
 # accumulator carried through both loop levels (that trips the structurizer).

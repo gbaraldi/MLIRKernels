@@ -1,5 +1,5 @@
-# Host-side launch: cpu_function (mirrors cuTile.cufunction) + the
-# CPUKernel callable that ccalls into the JIT'd entry point.
+# Host-side compile + launch: spmd_function / ka_function build a CPUKernel; the
+# CPUKernel callable ccalls into the JIT'd entry point.
 
 # MLIR memref C-interface descriptor for rank-N memrefs:
 #   struct MemRefDesc{T, N} {
@@ -103,8 +103,7 @@ function (k::CPUKernel)(args...; blocks)
                 error("CPUKernel: too many runtime args")
             k.param_kinds[param_idx] === :memref ||
                 error("CPUKernel: param #$param_idx expected scalar, got array")
-            # Alignment check: cuTile-mode always checks (per-arg from
-            # ArraySpec); SPMD-mode checks only when the user requested an
+            # Alignment check: only when the kernel was compiled with an
             # alignment > Julia's default 16 (param_alignments populated).
             if !(is_spmd || is_ka) || align_idx ≤ length(k.param_alignments)
                 align = k.param_alignments[align_idx]
@@ -224,8 +223,8 @@ end
 #
 # Alignment hints: SPMD accepts an optional `alignment` kwarg. When >16,
 # each array arg gets a `memref.assume_alignment %arg, N` at func entry and
-# a `strided<[1, ?, …]>` layout in the memref type — the same alignment-
-# proof machinery the cuTile path inherits from `ArraySpec`. At DRAM-scale
+# a `strided<[1, ?, …]>` layout in the memref type — alignment-proof machinery
+# for the vectorizer. At DRAM-scale
 # memory-bandwidth-bound workloads this is the difference between
 # `vmovaps` and `vmovups` in the inner loop. Users must pass buffers that
 # actually meet the alignment (e.g. via `aligned_array(T, n; alignment=N)`);
@@ -255,9 +254,8 @@ function spmd_function(@nospecialize(f), argtypes::Type;
     key = (f, argtypes, 1, serial, lane_width, alignment)
     haskey(_spmd_kernel_cache, key) && return _spmd_kernel_cache[key]::CPUKernel
 
-    # Standalone inference — no cuTile interpreter. Plain-Julia SPMD kernels
-    # use no cuTile tile intrinsics, so Frontend.structured (own interpreter,
-    # own Intrinsics, default opt params) is all that's needed.
+    # Plain-Julia SPMD kernels are inferred via Frontend.structured (own
+    # interpreter, own Intrinsics, default opt params).
     sci, rettype = Frontend.structured(f, argtypes)
     rettype === Nothing ||
         error("spmd_function: kernel must return Nothing, got $rettype")
@@ -284,8 +282,8 @@ function spmd_function(@nospecialize(f), argtypes::Type;
 end
 
 # Tuple overload: accepts either a tuple of Julia *types* (e.g.
-# `(Vector{Float32}, Int)`) or a tuple of runtime *values*. SPMD doesn't
-# apply `cuTileconvert`; args stay as their plain Julia types.
+# `(Vector{Float32}, Int)`) or a tuple of runtime *values* — args stay as their
+# plain Julia types.
 function spmd_function(@nospecialize(f), args::Tuple; kwargs...)
     if all(a -> a isa Type, args)
         tt = Tuple{args...}
@@ -322,7 +320,7 @@ function ka_function(@nospecialize(f), argtypes::Type;
     haskey(_ka_kernel_cache, key) && return _ka_kernel_cache[key]::CPUKernel
 
     # Standalone inference via Frontend (KA overlays live in
-    # Frontend.METHOD_TABLE — see ext/KernelAbstractionsExt.jl). No cuTile.
+    # Frontend.METHOD_TABLE — see ext/KernelAbstractionsExt.jl).
     sci, rettype = Frontend.structured(f, argtypes)
     # `Union{}` is allowed: a KA kernel whose only effect is an `@atomic`
     # infers as `Union{}` because `Base.modifyindex_atomic!` doesn't resolve

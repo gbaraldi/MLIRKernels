@@ -2,7 +2,7 @@
 #
 # Pipeline:
 #   Julia kernel + argtypes
-#     → ct.code_structured(f, argtypes; optimize=true)  [cuTile: target-agnostic]
+#     → optimized StructuredIRCode
 #         runs canonicalize → constprop → FMA fusion → CSE → alias
 #         → token order → RNG lowering → LICM → divisibility/bounds
 #         → no-wrap → DCE; we receive the optimized SCI.
@@ -11,9 +11,9 @@
 #         strided-layout info from ArraySpec.
 #
 # Argument model:
-#   Each TileArray<T,N,Spec> becomes ONE `memref<?x...xT, strided<[…]>>` arg.
-#   The flat (ptr, sizes…, strides…) destructuring the bytecode target uses is
-#   *not* done here — the memref descriptor ABI carries that information.
+#   Each array arg becomes ONE `memref<?x...xT, strided<[…]>>` arg.
+#   A flat (ptr, sizes…, strides…) destructuring is *not* done here — the
+#   memref descriptor ABI carries that information.
 #   `Constant{T,V}` args contribute no func parameter; values inline.
 #
 # Grid:
@@ -33,7 +33,7 @@ const _gpu    = Dialects.gpu
 # Lowering context
 # ----------------------------------------------------------------------------
 
-# A PartitionView in cuTile = a memref + per-block tile shape (+ elem type).
+# A partition view = a memref + per-block tile shape (+ elem type).
 # When a load happens at index (%bid_1, …, %bid_N), the memref offset along
 # axis k is `%bid_k * tile_shape[k]`. We carry the source memref + tile shape
 # + element type so load/store sites can synthesize offsets + correct vector
@@ -44,7 +44,7 @@ struct PartitionInfo
     elem_type::Type
 end
 
-# A TensorView in cuTile = (ptr, sizes, strides) from a TileArray, plus the
+# A tensor view = (ptr, sizes, strides) from an array, plus the
 # element type. Tracked-only (no IR emitted) — the downstream partition_view
 # reads `.base` (memref Value) and `.elem_type` to build PartitionInfo.
 struct TensorViewInfo
@@ -84,7 +84,7 @@ mutable struct LowerCtx
     tuples::Dict{Int, Vector{Any}}             # SSA → component refs
     # SSAs that are sentinels (e.g. boundscheck) — extract to a marker.
     sentinels::Dict{Int, Symbol}
-    # Per-arg element types — sci.argtypes[slot] for TileArray slots.
+    # Per-arg element types — sci.argtypes[slot] for array slots.
     arg_elem_types::Dict{Int, Type}
     # Grid bid Values, one per grid dim, x/y/z order.
     bids::Vector{IR.Value}
@@ -166,8 +166,8 @@ function mlir_elem_type(T::Type)
     error("MLIRKernels: unsupported element type $T")
 end
 
-# Build a splat DenseElements attribute for a vector type. Reactant exposes
-# `Base.fill(::T, shaped_type)` overloads only for {Bool, Int8/32/64,
+# Build a splat DenseElements attribute for a vector type. The MLIR wrapper
+# exposes `Base.fill(::T, shaped_type)` overloads only for {Bool, Int8/32/64,
 # UInt8/32/64, Float32, Float64}. For Float16 / BFloat16 we go through the
 # generic `Base.fill(attr::Attribute, shaped_type)` path which calls
 # `mlirDenseElementsAttrSplatGet` under the hood.
@@ -204,7 +204,7 @@ function _emit_step_vec(vec_t, elem_T::Type, N::Int)
     return IR.result(_arith.constant(; value=attr, result=vec_t))
 end
 
-# MLIR vector type from a cuTile Julia (col-major) tile shape + Julia element
+# MLIR vector type from a Julia (col-major) tile shape + Julia element
 # type. If the shape is empty (`()` — a 0-D / scalar tile), returns the scalar
 # elem MLIR type instead of `vector<f32>` (which isn't a valid MLIR type).
 function mlir_tile_type(shape::Tuple, T::Type)
@@ -215,41 +215,23 @@ end
 mlir_tile_type(shape::AbstractVector{<:Integer}, T::Type) =
     mlir_tile_type(Tuple(shape), T)
 
-# Julia tile-element type for a cuTile-style tile Julia type (Tile{T,Shape},
-# IntTile{Shape,T}, FloatTile{Shape,T}, Tile{Bool,Shape}). Returns `nothing` if
-# `T` is not a tile.
-
-# Julia tile-shape tuple for a cuTile tile type. Returns `()` for scalar tiles.
-
-# MLIR vector type for a cuTile Tile Julia type. For 0-D tiles returns the
-# scalar element type.
-
-# Map any cuTile / Julia type to an MLIR type (scalar or vector).
-
-# TileArray{T,N,Spec()} → memref<?x?xT, strided<[…]>>. When `spec.contiguous`,
-# encode unit stride on the innermost (col-major) dim — gives LLVM a
-# compile-time proof of contiguous access.
-
 
 # ----------------------------------------------------------------------------
-# Divisibility annotations on TileArray kernel args
+# Divisibility annotations on array kernel args
 # ----------------------------------------------------------------------------
 #
 # At func entry we already emit `memref.assume_alignment %arg, N` (covers the
 # base pointer / leading dim). The non-leading dims have dynamic (`?`) strides
 # in the memref's `strided<…>` layout — MLIR's strided-layout attribute can't
 # carry divisibility info, so the alignment proof for vector loads / stores
-# along those dims can't come from the type. The bytecode path solves this
-# with `AssumeOp(DivBy(n))` predicates derived from cuTile's
-# divisibility/bounds analyses; here we mirror that idea by emitting
+# along those dims can't come from the type. We supply it by emitting
 # `llvm.intr.assume((stride % n) == 0)` on each stride, which the
 # `MemorySSA`-aware passes downstream of `mlir-translate --mlir-to-llvmir`
-# fold into the same vectorizer alignment fact.
+# fold into the vectorizer alignment fact.
 #
-# Input chain comes from `ct.arg_chain(argT, [3, i])` — the spec-only
-# kernel-arg chain (an upper bound on what any consumer would derive); the
-# dataflow results are queried at consumer sites, not at entry. This matches
-# what cuTile's `apply_arg_assume_predicates!` does for the bytecode target.
+# The divisibility info comes from the spec-only kernel-arg chain (an upper
+# bound on what any consumer would derive); the dataflow results are queried
+# at consumer sites, not at entry.
 
 
 
@@ -265,7 +247,7 @@ mlir_tile_type(shape::AbstractVector{<:Integer}, T::Type) =
 # Compiles a Julia function of shape
 #
 #     function k(arr1::Vector{T1}, ..., arrK::Vector{TK}, i::Int)
-#         @inbounds arr1[i] = arr2[i] + arr3[i]   # plain Julia, no Tile/ct.*
+#         @inbounds arr1[i] = arr2[i] + arr3[i]   # plain Julia, scalar code
 #         return
 #     end
 #
@@ -349,8 +331,7 @@ function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
                     # Layout: with alignment > 16 we also encode a
                     # `strided<[1, ?, …]>` layout (unit stride on the
                     # fastest dim). This + `memref.assume_alignment` is
-                    # what the cuTile path emits to get aligned vector
-                    # loads at DRAM scale.
+                    # what gets aligned vector loads at DRAM scale.
                     layout = if alignment > 16
                         strides_mlir = Vector{String}(undef, N)
                         for k in 1:N
@@ -494,7 +475,7 @@ end
 #         @active_lane = KA.__validindex(__ctx__)              # overlay → true
 #         if @active_lane
 #             i = KA.__index_Global_Linear(__ctx__)            # overlay →
-#                                                              # __cutilecpu_spmd_lane_id()
+#                                                              # global_index()
 #             @inbounds C[i] = A[i] + B[i]
 #         end
 #     end
@@ -502,10 +483,10 @@ end
 # The first arg is the KA `__ctx__` (a `CompilerMetadata{…}` struct). With the
 # overlay set up in `ext/KernelAbstractionsExt.jl`, the body never reads any
 # field of `__ctx__` — every reference to it has been folded to either a
-# constant or a call to the sentinel function `__cutilecpu_spmd_lane_id()`.
+# constant or a call to the sentinel function `global_index()`.
 # We therefore don't materialise the ctx as an MLIR parameter at all; we just
 # use its arg slot as the SPMD `lane_arg` so the existing walker
-# infrastructure (the lane vector, `__cutilecpu_spmd_lane_id` clause) lights
+# infrastructure (the lane vector, lane-index sentinel clause) lights
 # up unchanged.
 function lower_to_mlir_ka(sci::StructuredIRCode, argtypes::Type;
                           kernel_name::String, lane_width::Int=16,
@@ -705,14 +686,14 @@ end
 #     sentinel), so `emit_if!` emits a normal `scf.if` — kept, as GPU
 #     needs it for the tail block.
 #
-# `gid` is still tracked via `lc.lane_arg`, and the
-# `__cutilecpu_spmd_lane_id` sentinel clause returns `lc.arg_vals[lane_arg]`
-# unchanged — so a KA `__index_Global_Linear` overlay routed through this
+# `gid` is still tracked via `lc.lane_arg`, and the lane-index sentinel
+# clause returns `lc.arg_vals[lane_arg]` unchanged — so a KA
+# `__index_Global_Linear` overlay routed through this
 # entrypoint also works (with `__validindex` providing the `gid <= n`
 # guard or `true` for exact-multiple launches).
 # `ctx_arg`: when set, the lane comes from a *non*-trailing arg — the slot
 # is treated like the KA `__ctx__` (skipped as a func param, its value is
-# the synthesized global thread index via the `__cutilecpu_spmd_lane_id`
+# the synthesized global thread index via the lane-index
 # sentinel). This is how a KernelAbstractions `gpu_*` body lowers: the
 # `__index_Global_Linear(ctx)` overlay rewrites to the sentinel, and the
 # ctx itself is never referenced as data. When `ctx_arg === nothing` we
@@ -1072,7 +1053,7 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
         # A Symbol or Type literal — handled by callers that special-case it.
         return nothing
     elseif op isa GlobalRef
-        # Module-level binding (e.g. `cuTile.PHILOX_W`). If it resolves to a
+        # Module-level binding (e.g. a global constant). If it resolves to a
         # `Number`, materialise as an `arith.constant`; otherwise leave for
         # the caller to special-case (Types are handled via resolve_const).
         v = try
@@ -1119,10 +1100,9 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
 
     if fname === :kernel_state
         # `Intrinsics.kernel_state()` returns the host-supplied `KernelState`
-        # struct (single `seed::UInt32` field). cuTile's bytecode codegen
-        # binds this to the lazy arg-ref for the implicit trailing arg slot;
-        # we instead tag the SSA so the immediate `getfield(_, :seed)` resolves
-        # to the seed param. No IR is emitted for the intrinsic itself.
+        # struct (single `seed::UInt32` field). We tag the SSA so the immediate
+        # `getfield(_, :seed)` resolves to the seed param bound at func entry.
+        # No IR is emitted for the intrinsic itself.
         push!(lc.kernel_state_ssas, idx)
         return nothing
 
@@ -1132,13 +1112,13 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             error("get_tile_block_id: axis must be const, got $(args[1])")
         ax = Int(axis)
         i32_t = IR.Type(Int32)
-        # cuTile's `rng_key` reads axes 0..2 unconditionally even on a 1-D
-        # grid — beyond the actual grid the device-side semantics yield 0.
+        # `rng_key` reads axes 0..2 unconditionally even on a 1-D grid —
+        # beyond the actual grid the device-side semantics yield 0.
         # Return constant Int32(0) for axes beyond our runtime grid rank.
         if ax + 1 > length(lc.bids)
             return IR.result(_arith.constant(; value=IR.Attribute(Int32(0))))
         end
-        # bid is `index` in MLIR but typed as Int32 in cuTile. Cast so
+        # bid is `index` in MLIR but the intrinsic is typed Int32. Cast so
         # subsequent arithmetic (addi/cmpi/exti) sees a matching i32 type.
         # Tile-load index ops re-cast back via `cast_to_index`.
         bid_idx = lc.bids[ax + 1]
@@ -1232,7 +1212,7 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         return emit_binop_value!(lc, args, _arith.andi)
 
     elseif fname === :shli
-        # cuTile Intrinsics.shli(a, b) — logical left shift.
+        # Intrinsics.shli(a, b) — logical left shift.
         return emit_binop_value!(lc, args, _arith.shli)
 
     elseif fname === :cmpi
@@ -1298,22 +1278,18 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         end
     end
 
-    # Raw Core.Intrinsics / builtins from the Frontend (non-cuTile) path —
-    # see `emit_raw_core_intrinsic!`. The cuTile tile path never produces
-    # these (its passes rewrite them to cuTile Intrinsics handled above), so
-    # this is dead on that path.
+    # Raw Core.Intrinsics / builtins from the Frontend — see
+    # `emit_raw_core_intrinsic!`. These are the plain-Julia op names that
+    # weren't rewritten to the named Intrinsics handled above.
     if fname in _RAW_CORE_INTRINSICS
         return emit_raw_core_intrinsic!(lc, fname, args, typ)
     end
 
-    # Lane-index sentinel. The Frontend's `Frontend.Intrinsics.global_index`
-    # (and the legacy KA-overlay sentinels) mark the global thread index;
-    # the walker binds it to the lane value synthesized per grid step — a
-    # `vector<W×iX>` on the CPU/SPMD path, or a scalar `gpu.thread_id +
+    # Lane-index sentinel. `Frontend.Intrinsics.global_index` marks the global
+    # thread index; the walker binds it to the lane value synthesized per grid
+    # step — a `vector<W×iX>` on the CPU/SPMD path, or a scalar `gpu.thread_id +
     # block_id*block_dim` on the GPU SIMT path.
-    if (fname === :global_index || fname === :__cutilecpu_spmd_lane_id ||
-        fname === :__ka_lane_id) &&
-       lc.spmd && haskey(lc.arg_vals, lc.lane_arg)
+    if fname === :global_index && lc.spmd && haskey(lc.arg_vals, lc.lane_arg)
         return lc.arg_vals[lc.lane_arg]
     end
 
@@ -1421,19 +1397,17 @@ end
 # Raw Core.Intrinsics / builtins (the Frontend path)
 # ----------------------------------------------------------------------------
 #
-# The cuTile *tile* path runs cuTile's `canonicalize!` → `lower_intr_pass!`,
-# which rewrites raw `Core.Intrinsics.add_float` → cuTile `Intrinsics.addf`
-# etc. (see cuTile.jl/src/compiler/transform/canonicalize.jl INTRINSIC_RULES).
-# The standalone `Frontend.structured` path (src/frontend.jl) does NOT run
-# those rules — it hands the walker the *raw* Julia intrinsic names. So the
-# walker recognises both: the cuTile-rewritten names (above) and the raw
-# names here, routing both to the same `_arith`/`_math` emitters.
+# Some passes canonicalize raw `Core.Intrinsics.add_float` to the named
+# `Intrinsics.addf` etc. The standalone `Frontend.structured` path
+# (src/frontend.jl) does NOT run those rewrites — it hands the walker the
+# *raw* Julia intrinsic names. So the walker recognises both: the named
+# Intrinsics (above) and the raw names here, routing both to the same
+# `_arith`/`_math` emitters.
 #
-# Mirrors INTRINSIC_RULES, PLUS the integer width-conversions
-# (`sext_int`/`zext_int`/`trunc_int`) that cuTile's rules omit — those
-# surface in plain Julia from `Int32` index widening (`a[gid::Int32]`),
-# which cuTile kernels never trigger. All emitters are vector-aware so they
-# work on SPMD lane vectors.
+# This set covers the float/int arithmetic intrinsics PLUS the integer
+# width-conversions (`sext_int`/`zext_int`/`trunc_int`) needed for plain-Julia
+# `Int32` index widening (`a[gid::Int32]`). All emitters are vector-aware so
+# they work on SPMD lane vectors.
 const _RAW_CORE_INTRINSICS = Set{Symbol}([
     :add_float, :sub_float, :mul_float, :div_float, :neg_float,
     :add_int, :sub_int, :mul_int, :neg_int,
@@ -1443,8 +1417,8 @@ const _RAW_CORE_INTRINSICS = Set{Symbol}([
     :sext_int, :zext_int, :trunc_int, :bitcast,
     :sitofp, :fptosi,
     :ifelse, Symbol("==="),
-    # Unary float math intrinsics (raw Julia names; cuTile rewrites these to
-    # :absf/:sqrt/etc, but the Frontend path hands them raw). One operand,
+    # Unary float math intrinsics (raw Julia names; the named-intrinsic path
+    # uses :absf/:sqrt/etc, but the Frontend path hands them raw). One operand,
     # operand-typed result — vector-aware via emit_unary_math!.
     :abs_float, :sqrt_llvm, :sqrt_llvm_fast,
     # Integer div/rem (incl. the overflow/zero-"checked" variants — the check is
@@ -1516,8 +1490,8 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
         return IR.result(_arith.xori(v, _const_like(v, _allones_of_elem(IR.type(v)))))
     end
     # Unary float math. `Base.abs(::AbstractFloat)` → :abs_float (single op);
-    # `Base.sqrt(::Float32/64)` → :sqrt_llvm. cuTile rewrites these to
-    # :absf/:sqrt; the Frontend hands them raw. Same op as the cuTile-named
+    # `Base.sqrt(::Float32/64)` → :sqrt_llvm. The named-intrinsic path uses
+    # :absf/:sqrt; the Frontend hands them raw. Same op as the named-intrinsic
     # dispatch, vector-aware via emit_unary_math!.
     name === :abs_float      && return emit_unary_math!(lc, args, _math.absf, typ)
     name === :sqrt_llvm      && return emit_unary_math!(lc, args, _math.sqrt, typ)
@@ -1632,25 +1606,25 @@ function _broadcast_to_match(v::IR.Value, vec_t)
     return IR.result(_vector.broadcast(v; vector=vec_t))
 end
 
-# cuTile Intrinsics.mulhii(a, b) — high half of the unsigned-widened product.
+# Intrinsics.mulhii(a, b) — high half of the unsigned-widened product.
 # Implemented as: widen both operands by `extui` to 2W bits, multiply with
 # nuw, shift right by W, then truncate back to W. On vector operands the
 # arith ops broadcast naturally.
 
-# cuTile Intrinsics.shri(a, b, signedness) — arithmetic / logical right shift.
+# Intrinsics.shri(a, b, signedness) — arithmetic / logical right shift.
 
-# cuTile Intrinsics.trunci(x, T) — narrow integer cast to type T.
+# Intrinsics.trunci(x, T) — narrow integer cast to type T.
 
-# cuTile Intrinsics.itof(x, F, signedness) — int → float convert.
+# Intrinsics.itof(x, F, signedness) — int → float convert.
 
-# cuTile Intrinsics.negf(x) → arith.negf. Result type matches operand.
+# Intrinsics.negf(x) → arith.negf. Result type matches operand.
 
-# cuTile Intrinsics.cat((lhs, rhs), axis::Int) — concatenate two tiles along
+# Intrinsics.cat((lhs, rhs), axis::Int) — concatenate two tiles along
 # `axis` (0-indexed Julia col-major). For 1-D tiles, lowers to `vector.shuffle`
 # with the identity-then-shifted lane permutation. For N-D tiles, lowers via
 # two `vector.insert_strided_slice` ops into a zero-initialised result.
 
-# cuTile Intrinsics.extract(tile, index, shape) — extract a non-overlapping
+# Intrinsics.extract(tile, index, shape) — extract a non-overlapping
 # subtile at slice (index) of size (shape). Both `index` and `shape` are in
 # Julia col-major order; `index` is 0-indexed (frontend already converted from
 # 1-based). Lowers to `vector.extract_strided_slice`, with axes reversed for
@@ -1660,10 +1634,10 @@ end
 # expect for their offsets/sizes/strides attributes (a `DenseArrayAttr` is silently
 # dropped by the create-op state).
 
-# cuTile Intrinsics.get_num_tile_blocks(axis) — grid extent along the given
+# Intrinsics.get_num_tile_blocks(axis) — grid extent along the given
 # 0-indexed axis. For axes within the runtime grid, return `index_cast` of
 # the grid Value (held by the outer wrapper) cast to i32. For axes beyond
-# the grid (cuTile's `rng_key` always reads axes 0..1 even on 1-D launches),
+# the grid (`rng_key` always reads axes 0..1 even on 1-D launches),
 # return constant Int32(1).
 
 # Unary math op (math.exp, math.log, …). Result type comes from the operand
@@ -1674,13 +1648,13 @@ function emit_unary_math!(lc::LowerCtx, args, op_fn, @nospecialize(typ))
     return IR.result(op_fn(a; result=IR.type(a)))
 end
 
-# cuTile Intrinsics.fma(x, y, z) → math.fma. Same vector shape across all
+# Intrinsics.fma(x, y, z) → math.fma. Same vector shape across all
 # three operands.
 
-# cuTile Intrinsics.maxi(a, b, signedness)/mini(a, b, signedness) → arith
+# Intrinsics.maxi(a, b, signedness)/mini(a, b, signedness) → arith
 # max{s,u}i / min{s,u}i. Signedness is the 3rd arg.
 
-# cuTile cmpi(lhs, rhs, predicate::ComparisonPredicate.T, sign::Signedness.T)
+# cmpi(lhs, rhs, predicate::ComparisonPredicate.T, sign::Signedness.T)
 # → arith.cmpi with the matching i64 predicate attribute.
 function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
     a = resolve_value_or_const(lc, args[1])
@@ -1702,7 +1676,7 @@ function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
     # scalar-literal compare).
     a, b = _spmd_harmonise(lc, a, b)
     # arith.cmpi result is i1; for tile element type Bool yields i1 (or
-    # vector<...xi1>). Result type is inferred by Reactant wrapper since we
+    # vector<...xi1>). Result type is inferred by the op builder since we
     # don't pass it.
     return IR.result(_arith.cmpi(a, b; predicate=pred_attr))
 end
@@ -1718,7 +1692,7 @@ function cmpi_predicate_code(pred::ComparisonPredicate.T, signed::Signedness.T)
     error("cmpi: unsupported predicate $pred")
 end
 
-# cuTile cmpf(lhs, rhs, predicate::ComparisonPredicate.T, [ordering])
+# cmpf(lhs, rhs, predicate::ComparisonPredicate.T, [ordering])
 function emit_cmpf!(lc::LowerCtx, args, @nospecialize(typ))
     a = resolve_value_or_const(lc, args[1])
     b = resolve_value_or_const(lc, args[2])
@@ -1750,24 +1724,24 @@ function cmpf_predicate_code(pred::ComparisonPredicate.T, ord::ComparisonOrderin
     error("cmpf: unsupported predicate $pred")
 end
 
-# cuTile exti(x, target_jl_type, sign) → arith.extsi / arith.extui
+# exti(x, target_jl_type, sign) → arith.extsi / arith.extui
 
-# cuTile Intrinsics.cldi(lhs, rhs, sign) → arith.ceildivsi / arith.ceildivui.
+# Intrinsics.cldi(lhs, rhs, sign) → arith.ceildivsi / arith.ceildivui.
 
-# cuTile Intrinsics.remi(lhs, rhs, sign) → arith.remsi / arith.remui.
+# Intrinsics.remi(lhs, rhs, sign) → arith.remsi / arith.remui.
 # Surfaces from `rem(::IntTile, ::Integer)` (and tile/tile variants); the
 # atomic histogram path uses this for bucket = v % n_buckets.
 
-# cuTile Intrinsics.fldi(lhs, rhs, sign) → arith.floordivsi / arith.divui.
+# Intrinsics.fldi(lhs, rhs, sign) → arith.floordivsi / arith.divui.
 # `fldi` is signed floor-division (rounding toward -∞) for signed args; on
 # the unsigned side it coincides with truncated division (`arith.divui`).
 
-# cuTile Intrinsics.mma(lhs, rhs, acc) — matrix-multiply-accumulate in
-# TileIR-row-major form. The cuTile frontend's `muladd(a, b, acc)` for
-# Julia 2-D tiles becomes `Intrinsics.mma(b, a, acc)` (see operations.jl);
-# the batched (≥3-D × ≥3-D) path flattens trailing batch dims to a single
-# leading "batch" in TileIR row-major and then calls `Intrinsics.mma(b, a, acc)`
-# with operands of TileIR shape (B, …).
+# Intrinsics.mma(lhs, rhs, acc) — matrix-multiply-accumulate in
+# TileIR-row-major form. The frontend's `muladd(a, b, acc)` for Julia 2-D
+# tiles becomes `Intrinsics.mma(b, a, acc)`; the batched (≥3-D × ≥3-D) path
+# flattens trailing batch dims to a single leading "batch" in TileIR
+# row-major and then calls `Intrinsics.mma(b, a, acc)` with operands of
+# TileIR shape (B, …).
 #
 # 2-D case. In TileIR / MLIR row-major coordinates:
 #   lhs (the "%50 = b_julia" operand) has shape (N_iter, K_iter)
@@ -1779,7 +1753,7 @@ end
 #   acc: (m, n, k) -> (n, m)
 # Iterator types: [parallel(m), parallel(n), reduction(k)].
 #
-# 3-D batched case. cuTile's batched-mma `_muladd` (operations.jl:1195) reshapes
+# 3-D batched case. The batched-mma `_muladd` reshapes
 # operands so that, in Julia col-major, lhs is `(K, N, B_flat)`, rhs is
 # `(M, K, B_flat)`, and acc is `(M, N, B_flat)`. After Julia→TileIR axis
 # reversal (`mlir_tile_type`), in MLIR row-major coordinates:
@@ -1792,44 +1766,43 @@ end
 #   acc: (b, m, n, k) -> (b, n, m)
 # Iterator types: [parallel(b), parallel(m), parallel(n), reduction(k)].
 #
-# We dispatch on the rank of `acc` (which is also the rank of lhs/rhs in cuTile's
+# We dispatch on the rank of `acc` (which is also the rank of lhs/rhs in the
 # canonical batched form): 2 → plain matmul, 3 → batched matmul. Higher ranks
-# don't occur because cuTile pre-flattens batch dims to a single axis.
+# don't occur because batch dims are pre-flattened to a single axis.
 
-# cuTile Intrinsics.broadcast(src, target_shape_tuple) → vector.broadcast.
+# Intrinsics.broadcast(src, target_shape_tuple) → vector.broadcast.
 # `src` can be a scalar literal, a Const-arg scalar, a 0-D / smaller tile.
 
-# cuTile Intrinsics.reshape(tile, target_shape_tuple) → vector.shape_cast.
+# Intrinsics.reshape(tile, target_shape_tuple) → vector.shape_cast.
 
-# cuTile Intrinsics.permute(tile, perm) → vector.transpose.
+# Intrinsics.permute(tile, perm) → vector.transpose.
 #
-# `perm` is a 0-indexed Julia (col-major) permutation. cuTile's frontend
-# already lowered `permutedims(tile, (2, 1))` to `Intrinsics.permute(tile, (1, 0))`,
+# `perm` is a 0-indexed Julia (col-major) permutation. The frontend already
+# lowered `permutedims(tile, (2, 1))` to `Intrinsics.permute(tile, (1, 0))`,
 # i.e. 1-indexed Julia → 0-indexed Julia. We need an MLIR (row-major) perm.
 #
-# Mapping (see cuTile.jl/src/compiler/intrinsics/core.jl `emit_intrinsic!`
-# for Intrinsics.permute): given Julia 0-indexed perm `julia_perm`, the
-# row-major (MLIR) permutation is
+# Mapping: given Julia 0-indexed perm `julia_perm`, the row-major (MLIR)
+# permutation is
 #   mlir_perm[i] = n - 1 - julia_perm[n - 1 - i]   for i in 0:n-1.
 # The result MLIR vector type is the input MLIR vector type with its dims
 # reordered by `mlir_perm`.
 
-# cuTile Intrinsics.constant(shape::Tuple, value, T) → arith.constant of a
+# Intrinsics.constant(shape::Tuple, value, T) → arith.constant of a
 # splat dense<value> : vector<...xT> when `value` is a compile-time literal.
-# When `value` is a runtime SSA (cuTile's `fill(scalar, dims)` overlay uses
+# When `value` is a runtime SSA (the `fill(scalar, dims)` overlay uses
 # this form to broadcast a scalar to a tile), we instead lower to
 # `vector.broadcast` of the scalar Value.
 
-# cuTile Intrinsics.reduce((tile,), axis::Int, combiner, (identities,)) →
+# Intrinsics.reduce((tile,), axis::Int, combiner, (identities,)) →
 # Tuple{Tile{..., reduced_shape_with_1_in_axis}}. Lowers to
 # vector.multi_reduction + vector.shape_cast (to re-add the size-1 dim that
-# cuTile's reduce semantics preserves).
+# reduce semantics preserves).
 
-# Map a cuTile combiner function + element type to a vector.kind name.
+# Map a combiner function + element type to a vector.kind name.
 
-# Handle Base.getfield in both Argument-rooted (TileArray's ptr/sizes/strides
-# fields) and SSA-rooted (extract from a multi-result control-flow op or a
-# tracked tuple) forms.
+# Handle Base.getfield in both Argument-rooted (an array view's
+# ptr/sizes/strides fields) and SSA-rooted (extract from a multi-result
+# control-flow op or a tracked tuple) forms.
 function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     obj = args[1]
     if obj isa Argument
@@ -1895,7 +1868,7 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
             (arg_id, fld) = lc.field_refs[obj.id]
             memref_v = lc.arg_vals[arg_id]
             if fld === :sizes || fld === :size
-                # `:sizes` is cuTile's TileArray dims field; `:size` is a plain
+                # `:sizes` is an array view's dims field; `:size` is a plain
                 # Julia `Array`'s dims tuple (`getfield(A, :size)[k]`, the form
                 # `size(A, k)` and N-D `A[i,j]` linearisation expand to). Both
                 # resolve a per-dim extent the same way.
@@ -2075,8 +2048,8 @@ function emit_for!(lc::LowerCtx, idx::Int, op::ForOp, @nospecialize(typ))
     step_raw  = resolve_value_or_const(lc, op.step)
     (lower_raw === nothing || upper_raw === nothing || step_raw === nothing) &&
         error("scf.for: cannot resolve bounds (lower=$(op.lower), upper=$(op.upper), step=$(op.step))")
-    # Cast bounds to `index`. cuTile's IRStructurizer normalises range
-    # iteration so that the recorded `upper` is already the half-open end
+    # Cast bounds to `index`. The IRStructurizer normalises range iteration
+    # so that the recorded `upper` is already the half-open end
     # (i.e. the SCI emits `%upper = addi(%n, 1)` for an inclusive `1:n`).
     # We therefore do NOT add another 1 here.
     lower_v = cast_to_index(lower_raw)
@@ -2093,7 +2066,7 @@ function emit_for!(lc::LowerCtx, idx::Int, op::ForOp, @nospecialize(typ))
         push!(iter_types, IR.type(v))
     end
 
-    # The MLIR scf.for block args are [index_iv, iter_args...]. The cuTile
+    # The MLIR scf.for block args are [index_iv, iter_args...]. The
     # iv_arg type is Int32/Int64 — cast back inside the body.
     block_arg_types = IR.Type[idx_t; iter_types]
     block_arg_locs  = [IR.Location() for _ in 1:length(block_arg_types)]
@@ -2102,7 +2075,7 @@ function emit_for!(lc::LowerCtx, idx::Int, op::ForOp, @nospecialize(typ))
     push!(body_region, body_block)
 
     @with_block body_block begin
-        # IV: cast index → cuTile IV type.
+        # IV: cast index → kernel IV type.
         iv_index = IR.argument(body_block, 1)
         iv_jltype = op.iv_arg.type
         iv_mlir_t = if iv_jltype isa Type && iv_jltype <: Number
@@ -2152,13 +2125,13 @@ end
 # Gather/scatter (irregular index load/store)
 # ----------------------------------------------------------------------------
 
-# cuTile Intrinsics.iota((N,), T) → an `IntTile{(N,), T}` with values 0..N-1.
+# Intrinsics.iota((N,), T) → an `IntTile{(N,), T}` with values 0..N-1.
 # We materialise this as `vector.step` (which produces vector<Nxindex>),
-# then `arith.index_cast` to vector<NxiK>. cuTile produces Int32 indices by
-# default; the cast is mandatory because downstream cmpi/addi/bitcast all
+# then `arith.index_cast` to vector<NxiK>. Indices are Int32 by default;
+# the cast is mandatory because downstream cmpi/addi/bitcast all
 # expect the iK element type rather than `index`.
 
-# cuTile Intrinsics.bitcast(src, target_T) — a signless reinterpret. For tile
+# Intrinsics.bitcast(src, target_T) — a signless reinterpret. For tile
 # operands whose source MLIR type already matches the target MLIR element
 # type (typical for Int32↔UInt32 / Int64↔UInt64 — MLIR is signless), this is
 # a no-op. Otherwise we emit `arith.bitcast` (scalar) or `vector.bitcast`
@@ -2169,7 +2142,7 @@ function emit_bitcast!(lc::LowerCtx, args, @nospecialize(typ))
     target_T = something(resolve_const(lc, args[2]), args[2])
     target_T isa Type ||
         error("bitcast: target type must be a Type, got $target_T")
-    # In SPMD mode the cuTile-inferred `typ` may be a 0-D tile (scalar) but the
+    # In SPMD mode the inferred `typ` may be a 0-D tile (scalar) but the
     # actual operand is a lane-wide vector — derive the output type from the
     # operand's shape, not from `typ`.
     src_t = IR.type(v)
@@ -2189,23 +2162,8 @@ function emit_bitcast!(lc::LowerCtx, args, @nospecialize(typ))
     end
 end
 
-# cuTile Intrinsics.offset(ptr_tile, idx_tile) — builds a pointer tile.
-# Tracked-only: we record the source memref (from the ptr operand's
-# field-ref) plus the index Value. The downstream gather/scatter consumes
-# this OffsetInfo.
-
-# cuTile Intrinsics.load_ptr_tko(offset, latency, mask, padding, token) →
-# `vector.gather %base[%c0], %indices, %mask, %pass_thru : memref<...>,
-#  vector<Nxi32>, vector<Nxi1>, vector<NxT> into vector<NxT>`
-# args = [offset_ssa, latency, mask, padding, token]
-
-# cuTile Intrinsics.store_ptr_tko(offset, values, latency, mask, token) →
-# `vector.scatter %base[%c0], %indices, %mask, %values : memref<...>,
-#  vector<Nxi32>, vector<Nxi1>, vector<NxT>`
-
 # Resolve `mask_ref` to an i1-vector Value matching `idx_shape`. If it
-# resolves to `nothing` (cuTile passed `nothing` for "no mask"), construct
-# an all-true splat.
+# resolves to `nothing` ("no mask"), construct an all-true splat.
 function _resolve_or_alltrue_mask(lc::LowerCtx, mask_ref, idx_shape)
     mask_v = resolve_value_or_const(lc, mask_ref)
     if mask_v === nothing
@@ -2235,18 +2193,14 @@ end
 # / atomic_xor / atomic_xchg / atomic_cas)
 # ----------------------------------------------------------------------------
 #
-# cuTile lowers `ct.atomic_add(arr, idx, val; …)` to
-#   %ptr   = Intrinsics.offset(arg.ptr, idx_0)        (Tile{Ptr{T},S})
-#   %rmw   = Intrinsics.atomic_{add,max,min,and,or,xor,xchg}
-#               (%ptr, val, mask, order, scope, token)
+# An atomic RMW takes a pointer/index, a value, and optional mask/order/scope.
 # We map the RMW directly to `memref.atomic_rmw <kind> %val, %base[%idx]`. The
-# scalar (0-D) form is what `ct.atomic_*(arr, scalar_idx, val)` produces — we
-# emit one atomic op on `%base[%idx]`. For tile (N-D) forms we unroll a small
-# loop over each lane (acceptable for the small atomic tiles cuTile produces;
-# vectorising would require `vector.scatter` with an atomic ordering, which
-# upstream MLIR doesn't expose yet).
+# scalar (0-D) form emits one atomic op on `%base[%idx]`. For tile (N-D) forms
+# we unroll a small loop over each lane (acceptable for the small atomic tiles
+# involved; vectorising would require `vector.scatter` with an atomic ordering,
+# which upstream MLIR doesn't expose yet).
 #
-# `ct.atomic_cas(arr, idx, expected, desired; …)` has no `assign`-style
+# `atomic_cas(arr, idx, expected, desired; …)` has no `assign`-style
 # single-keyword form on `memref.atomic_rmw`; we lower it via
 # `memref.generic_atomic_rmw` with a region body that compares the loaded
 # value against `expected` and yields either `desired` (on match) or the
@@ -2255,12 +2209,11 @@ end
 # `atomic_xchg` reuses `memref.atomic_rmw` with kind `assign` — the verifier
 # accepts an unconditional store-and-return-old at any element type.
 #
-# Memory order/scope arguments from cuTile (Acquire / Release / AcqRel /
-# Relaxed; Block / Device / System) are dropped on the CPU MVP path —
-# `memref.atomic_rmw` lowers to `llvm.atomicrmw <op> … acq_rel`, which is the
-# strongest ordering the verifier emits for this op and matches cuTile's
-# default. Cross-thread synchronisation beyond what libomp + acq_rel give
-# isn't part of this target.
+# Memory order/scope arguments (Acquire / Release / AcqRel / Relaxed; Block /
+# Device / System) are dropped on the CPU MVP path — `memref.atomic_rmw`
+# lowers to `llvm.atomicrmw <op> … acq_rel`, which is the strongest ordering
+# the verifier emits for this op. Cross-thread synchronisation beyond what
+# libomp + acq_rel give isn't part of this target.
 
 # `memref.atomic_rmw`'s `kind` attribute is an integer-encoded enum, BUT
 # the enum was reordered between MLIR 18 and MLIR 20 (and `xori` removed in
@@ -2286,9 +2239,9 @@ function _atomic_rmw_kind_codes()
                                          _ATOMIC_RMW_KIND_CODES_V20
 end
 
-# Pick the `memref.atomic_rmw` kind keyword for a given cuTile op symbol
+# Pick the `memref.atomic_rmw` kind keyword for a reduction op symbol
 # (`:add` / `:max` / `:min` / `:and` / `:or` / `:xor` / `:xchg`) at a given
-# Julia element type. cuTile's `atomic_add(addf-mode)` on AbstractFloat →
+# Julia element type. `atomic_add` on AbstractFloat →
 # `addf`; on integer → `addi`. `atomic_max` / `atomic_min` are signed-int /
 # float (`maxnumf` / `minnumf`). Bitwise ops are integer-only.
 # `atomic_xchg` (unconditional store-and-return-old) maps to the `assign`
@@ -2382,7 +2335,7 @@ end
 # Emit one `memref.generic_atomic_rmw` performing compare-and-swap:
 #   if loaded == expected: yield desired
 #   else:                  yield loaded
-# Returns the prior (loaded) value, matching cuTile semantics.
+# Returns the prior (loaded) value.
 
 # Top-level dispatch for `Intrinsics.atomic_cas`.
 # Args: (ptr_tile_ssa, expected, desired, mask, memory_order, memory_scope)
@@ -2410,8 +2363,8 @@ end
 # ----------------------------------------------------------------------------
 #
 # These handle the SCI ops that arise from Julia's `Vector{T}[i]` /
-# `Vector{T}[i] = v` lowering when the kernel is written without cuTile
-# types. The IRStructurizer / cuTile pipeline accepts plain Julia
+# `Vector{T}[i] = v` lowering when the kernel is written with plain Julia
+# arrays. The IRStructurizer pipeline accepts plain Julia
 # `Vector{T}` args and decomposes indexing into:
 #
 #   %ref = Base.getfield(_arr, :ref)                   # MemoryRef{T}
@@ -2422,9 +2375,8 @@ end
 # When `%i` is the (varying) lane vector, the resulting memoryrefnew is an
 # OffsetInfo with that vector as the per-lane index; `memoryrefget`/`set!`
 # then lower to `vector.gather`/`vector.scatter` on the array's memref.
-# Indices arriving here are 1-based (Julia semantics); cuTile lowers them
-# to 0-based in `memoryrefnew` itself, but on plain Julia code we get the
-# raw 1-based index — we subtract 1 below.
+# Indices arriving here are 1-based (Julia semantics); on plain Julia code
+# we get the raw 1-based index — we subtract 1 below.
 
 # Detect contiguous lane indices. The SPMD lane vector is constructed as
 # `splat(bid * W) + step(0..W-1)` — an affine, contiguous pattern. The
@@ -2602,8 +2554,8 @@ function _emit_nd_index!(lc::LowerCtx, kind::Symbol, N::Int)
     return out
 end
 
-# RMWs — one per lane into arr[bucket_lane] — mirroring the cuTile N-D
-# `emit_atomic_rmw!` lane loop. (A uniform/scalar index does a single atomic.)
+# RMWs — one per lane into arr[bucket_lane] — one atomic per lane.
+# (A uniform/scalar index does a single atomic.)
 # We recover the base memref from the array arg (Argument or getfield(arr,:ref),
 # tracked in lc.field_refs); the order/scope and the old-value return are
 # dropped (the RMW effect is all that's modelled).

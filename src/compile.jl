@@ -18,16 +18,16 @@
 
 # libomp from LLVMOpenMP_jll. `libomp_path` is the JLL's lazy accessor; we
 # resolve to a directory + `-lomp` link line for clang. Override via
-# `ENV["CUTILECPU_LIBOMP_DIR"]` if you need a custom build.
-_libomp_dir() = get(ENV, "CUTILECPU_LIBOMP_DIR", dirname(libomp_path))
+# `ENV["MLIRKERNELS_LIBOMP_DIR"]` if you need a custom build.
+_libomp_dir() = get(ENV, "MLIRKERNELS_LIBOMP_DIR", dirname(libomp_path))
 
 # clang from LLVM_full_jll. Used only for the LLVM-IR → .so step. Override
-# via `CUTILECPU_CLANG` if you want a different toolchain.
-_clang() = get(ENV, "CUTILECPU_CLANG",
+# via `MLIRKERNELS_CLANG` if you want a different toolchain.
+_clang() = get(ENV, "MLIRKERNELS_CLANG",
                joinpath(LLVM_full_jll.artifact_dir, "tools", "clang"))
 
-# Default lowering pipeline: cuTile-style `scf.parallel` + vector dialect →
-# OpenMP → LLVM dialect. Joined into a single textual pipeline string for
+# Default lowering pipeline: `scf.parallel` + vector dialect → OpenMP → LLVM
+# dialect. Joined into a single textual pipeline string for
 # `IR.PassManager.parse`.
 const DEFAULT_PASSES = String[
     # Math lowering, two passes in strict order:
@@ -222,7 +222,7 @@ which is the easiest way to dodge printer/parser asymmetries on MLIR 18
 read back).
 
 The .so is rpath-linked against libomp from `LLVMOpenMP_jll` (or
-`CUTILECPU_LIBOMP_DIR`) when the pipeline mentions `openmp`.
+`MLIRKERNELS_LIBOMP_DIR`) when the pipeline mentions `openmp`.
 """
 function compile_module_to_so(mod::IR.Module, mlir_ctx::IR.Context;
                               kernel_name::String, opt_level::Int=2,

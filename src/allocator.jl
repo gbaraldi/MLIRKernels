@@ -1,8 +1,8 @@
 # Aligned heap allocations as plain `Array{T,N}`.
 #
 # Julia's `Array{T}` is only 16-byte aligned (the GC heap doesn't promise
-# more). cuTile's `ArraySpec.alignment` commonly demands 64 or 128 bytes so
-# the vectorizer can emit aligned vector load/stores; when we lower with
+# more). An `alignment` hint of 64 or 128 bytes lets the vectorizer emit
+# aligned vector load/stores; when we lower with
 # `memref.assume_alignment %ptr, N` and the host hands us a less-aligned
 # buffer, the program is UB.
 #
@@ -20,8 +20,8 @@ Backed by `posix_memalign`; freed via libc `free` when the array becomes
 unreachable.
 
 `alignment` must be a power of two ≥ `sizeof(Ptr{Cvoid})` (per POSIX). Typical
-values: 32, 64, 128 — match the alignment your cuTile `TileArray` carries via
-its `ArraySpec`.
+values: 32, 64, 128 — match the `alignment` you pass to
+`spmd_function`/`ka_function`.
 
 # Examples
 ```julia

@@ -4,8 +4,8 @@
 # KernelAbstractions CPU backend (MLIRBackend <: KA.GPU). Guarded on KA
 # being loadable: the package's own test env (--project=.) has KA only as
 # a weakdep, so this skips there and runs whenever KA is present (e.g. an
-# env that adds it). Validates the fully cuTile-decoupled KA path: KA
-# @kernel → Frontend.structured (own interpreter/intrinsics) → MLIR → clang.
+# env that adds it). Validates the KA CPU path: KA @kernel →
+# Frontend.structured (own interpreter/intrinsics) → MLIR → clang.
 @testset "KA: vadd via MLIRBackend (CPU, decoupled)" begin
     ka_loaded = try
         @eval using KernelAbstractions

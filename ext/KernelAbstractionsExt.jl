@@ -6,21 +6,18 @@ module KernelAbstractionsExt
 #      `gpu_*` (SIMT) function body, not the `cpu_*` (loop-splitting) one.
 #
 #   2. `@overlay MLIRKernels.Frontend.METHOD_TABLE` redefinitions of the KA
-#      intrinsics. Inference runs under MLIRKernels's *own* Frontend
-#      interpreter (src/frontend.jl) — NOT cuTile's — so the overlays map KA
-#      intrinsics onto MLIRKernels's own `Frontend.Intrinsics` markers, which
-#      the walker recognises by name. No cuTile dependency.
+#      intrinsics. Inference runs under MLIRKernels's Frontend interpreter
+#      (src/frontend.jl), so the overlays map KA intrinsics onto the
+#      `Frontend.Intrinsics` markers the walker recognises by name.
 #
 #   3. `(::Kernel{MLIRBackend})(args...; ndrange, workgroupsize)` builds the
 #      KA `CompilerMetadata` type and calls `ka_function` → `lower_to_mlir_ka`
 #      → in-process MLIR pipeline → clang → dlopen, then dispatches the grid
 #      via the standard SPMD-style launch path.
 #
-# This extension no longer depends on cuTile in any way: the Frontend owns
-# its interpreter, its Intrinsics module, and its overlay method table, so
-# the intrinsic markers are defined at the package's own precompile and the
-# overlays are ordinary precompile-safe method additions — no `__init__`
-# cross-module eval.
+# The Frontend owns its interpreter, Intrinsics module, and overlay method
+# table, so the markers are defined at the package's own precompile and the
+# overlays are ordinary precompile-safe method additions (no `__init__` eval).
 
 using KernelAbstractions
 const KA = KernelAbstractions
@@ -107,11 +104,10 @@ struct MLIRBackend <: KA.GPU end
 # `for i in start:step:stop` builds a StepRange whose last element comes from
 # `Base.steprange_last`. The default pulls in `ArgumentError`, a `@noinline
 # overflow_case`, and `checked_srem_int` — none of which lower. This GPU-safe
-# version (mirroring cuTile's) uses plain unsigned `rem`. Needed e.g. by KA's
-# histogram (`for min_element in 1:gs:N`). Must be `@consistent_overlay` +
-# `:foldable` (like cuTile) — plain `@overlay` isn't honoured inside the range
-# machinery's :consistent context, so the default (un-lowerable) version leaks
-# through.
+# version uses plain unsigned `rem`. Needed e.g. by KA's histogram
+# (`for min_element in 1:gs:N`). Must be `@consistent_overlay` + `:foldable` —
+# a plain `@overlay` isn't honoured inside the range machinery's :consistent
+# context, so the default (un-lowerable) version would leak through.
 Base.Experimental.@consistent_overlay FE.METHOD_TABLE function Base.steprange_last(start::T, step::T, stop::T) where {T <: Base.BitInteger}
     stop == start && return stop
     if step > zero(step)

@@ -1,30 +1,13 @@
-# Standalone Julia → StructuredIRCode frontend, independent of cuTile.
+# Standalone Julia → StructuredIRCode frontend for the SPMD / KA / GPU paths.
 #
-# The cuTile *tile* path (`cpu_function`, TileArray kernels with ct.load/
-# ct.store/ct.bid) genuinely needs cuTile's interpreter + Tile-IR intrinsics,
-# so it keeps using `_structured_with_analyses`. But the plain-Julia paths —
-# SPMD (`spmd_function`), KernelAbstractions, and the GPU SIMT path — don't
-# use any cuTile tile intrinsic. They were piggybacking on cuTile's
-# interpreter purely for the inference→structurize plumbing, which dragged
-# in two awkward couplings:
-#
-#   1. cuTile's interpreter sets `OptimizationParams(inline_cost_threshold =
-#      typemax(Int))` — inline EVERYTHING. That bulldozes `@noinline`, so any
-#      marker intrinsic we define gets inlined away and its body leaks into
-#      the IR (the walker never sees a call to intercept).
-#   2. cuTile's `isintrinsic` is hardwired to `parentmodule(f) ===
-#      cuTile.Intrinsics`, so the ONLY way to make a marker survive was to
-#      inject it into cuTile.Intrinsics (illegal at precompile → a runtime
-#      `__init__` eval hack).
-#
-# This module replaces that plumbing with a minimal `AbstractInterpreter`
-# using DEFAULT optimization params (so `@noinline` is respected) plus our
-# OWN `Intrinsics` module and overlay `MethodTable`. Inference runs via the
-# stock `Base.code_ircode(f, argtypes; interp=…)` — no `CacheView`/`typeinf!`
-# — and `IRStructurizer.StructuredIRCode` turns the result into an SCI.
-#
-# Net: the SPMD/KA/GPU lowering depends only on Core.Compiler + IRStructurizer,
-# never on cuTile.
+# A minimal `AbstractInterpreter` with DEFAULT optimization params — crucially
+# NOT inline-everything — so the `@noinline` marker intrinsics below survive
+# inference for the walker to intercept (an inline-everything policy bulldozes
+# `@noinline` and leaks the marker bodies into the IR). It carries its own
+# `Intrinsics` module and an overlay `MethodTable` that frontends register
+# intrinsic mappings into. Inference runs via `Base.code_ircode(f, argtypes;
+# interp=…)`, and `IRStructurizer.StructuredIRCode` turns the result into an SCI.
+# Depends only on Core.Compiler + IRStructurizer.
 module Frontend
 
 const CC = Core.Compiler
@@ -36,10 +19,7 @@ using IRStructurizer: StructuredIRCode
 #
 # Each is `@noinline` with a `compilerbarrier(:type, …)` body so that, under
 # default optimization, the call SURVIVES inference (no inline, no
-# const-fold) with a concrete return type for the walker to replace. This is
-# the same recipe cuTile uses for its Tile-IR intrinsics — but here the
-# functions live in OUR module, so we own them and there is no cross-package
-# eval.
+# const-fold) with a concrete return type for the walker to replace.
 module Intrinsics
     using Base: compilerbarrier
 
@@ -130,9 +110,9 @@ module Intrinsics
     end
 end
 
-# Predicate mirroring cuTile's `isintrinsic`: a function defined in our
-# Intrinsics module. (We don't currently need NoCallInfo because default opt
-# params already respect `@noinline`; kept for parity / future use.)
+# An intrinsic is a function defined in our Intrinsics module. (We don't
+# currently need NoCallInfo because default opt params already respect
+# `@noinline`; kept for future use.)
 isintrinsic(@nospecialize(f)) = isa(f, Function) && parentmodule(f) === Intrinsics
 
 # ----------------------------------------------------------------------------
@@ -170,7 +150,7 @@ CC.method_table(i::FrontendInterpreter)        = i.method_table
 # (precompiled) CodeInstances — e.g. Base's range machinery already resolved
 # `steprange_last` to the un-lowerable default, so our `@overlay` was bypassed.
 # A private owner forces re-inference of reachable methods through our overlay
-# method table. (cuTile does the same via its `CacheView` owner.)
+# method table.
 CC.cache_owner(::FrontendInterpreter)          = :MLIRKernelsFrontend
 @static if isdefined(CC, :get_inference_world)
     CC.get_inference_world(i::FrontendInterpreter) = i.world
@@ -187,7 +167,7 @@ end
 
 Infer `f(argtypes...)` under the Frontend interpreter (our overlays + own
 intrinsics, default opt params) and structurize the resulting IRCode into a
-`StructuredIRCode`. No cuTile involvement.
+`StructuredIRCode`.
 """
 function structured(@nospecialize(f), @nospecialize(argtypes::Type))
     tt = Tuple(argtypes.parameters)

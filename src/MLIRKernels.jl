@@ -3,7 +3,7 @@
 
 An MLIR-based, multi-target kernel compiler for Julia. It infers a plain-Julia
 kernel through a standalone `Frontend` (its own `AbstractInterpreter` +
-`IRStructurizer`, no cuTile), lowers the resulting StructuredIRCode to
+`IRStructurizer`), lowers the resulting StructuredIRCode to
 high-level MLIR (`scf`/`arith`/`memref`/`vector`/`math`/`func`/`gpu`), and
 targets two backends:
 
@@ -43,9 +43,8 @@ module MLIRKernels
 
 using BFloat16s: BFloat16
 
-# Local mirrors of the comparison/signedness enums the scalar (SPMD/KA/GPU)
-# lowering uses — formerly taken from cuTile. Member values match cuTile's so
-# the predicate-code lookups are unchanged.
+# Comparison/signedness enums the scalar (SPMD/KA/GPU) lowering uses. Member
+# values are the standard signless encodings the predicate-code lookups expect.
 using EnumX
 @enumx Signedness Unsigned=0 Signed=1
 @enumx ComparisonPredicate Equal=0 NotEqual=1 LessThan=2 LessThanOrEqual=3 GreaterThan=4 GreaterThanOrEqual=5
@@ -56,12 +55,10 @@ using MLIR.IR
 const IR = MLIR.IR
 const Dialects = MLIR.Dialects
 
-# Reactant exposed a `@with_context` / `@with_module` / `@with_block` macro
-# trio that pushed an IR handle onto a TLS stack while executing a block.
-# MLIR.jl exposes the primitive `IR.activate(x)` / `IR.deactivate(x)`
-# (per-task TLS stack); each of the three macros below is just a try/finally
-# around activate/deactivate, kept as separate names purely for call-site
-# readability.
+# `@with_context` / `@with_module` / `@with_block` push an IR handle onto
+# MLIR.jl's per-task TLS stack while executing a block. They wrap the primitive
+# `IR.activate(x)` / `IR.deactivate(x)` in a try/finally; the three names are
+# kept separate purely for call-site readability.
 for macro_name in (:with_context, :with_module, :with_block)
     @eval macro $macro_name(x, body)
         quote
@@ -86,9 +83,8 @@ using Libdl
 import LLVM_full_jll
 using LLVMOpenMP_jll: libomp_path
 
-# Vanilla libMLIR (from MLIR_jll) registers ALL upstream conversion passes
-# via `mlirRegisterAllPasses` and exposes `mlirTranslateModuleToLLVMIR` —
-# both things Reactant's libReactantExtra deliberately omitted. We call
+# libMLIR (from MLIR_jll) registers all upstream conversion passes via
+# `mlirRegisterAllPasses` and exposes `mlirTranslateModuleToLLVMIR`. We call
 # `mlirRegisterAllPasses` lazily (once per session) and
 # `mlirRegisterAllLLVMTranslations` per context.
 const _passes_registered = Ref(false)

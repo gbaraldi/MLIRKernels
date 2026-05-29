@@ -1,6 +1,6 @@
 # Reflection for the CPU SPMD path — the MLIR/LLVM IR emitted from a plain-Julia
-# kernel via the standalone Frontend (no cuTile). For the GPU SIMT path see
-# `code_gpu` (MLIRCUDAExt). These stop at intermediate IRs, useful for debugging
+# kernel via the standalone Frontend. For the GPU SIMT path see `code_gpu`
+# (MLIRCUDAExt). These stop at intermediate IRs, useful for debugging
 # codegen without the dlopen/launch round-trip.
 
 """
