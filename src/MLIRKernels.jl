@@ -113,6 +113,7 @@ end
 
 include("allocator.jl")
 include("frontend.jl")
+include("transform/optimize.jl")   # SCIOpt: SCI optimization passes (DCE/CSE/LICM)
 include("lower.jl")
 include("compile.jl")
 include("launch.jl")

@@ -316,3 +316,29 @@ end
         @test all(Array(uo2) .== Int32(7))                     # union branch: Int64(7)%Int32
     end
 end
+
+@testset "SCI optimization (DCE/CSE/LICM) affects KA codegen" begin
+    if !CUDA.functional()
+        @info "CUDA not functional — skipping SCI-optimization codegen test"
+        @test true
+    else
+        N = 256
+        a = MLIRArray(CUDA.rand(Float32, N)); b = MLIRArray(CUDA.rand(Float32, N))
+        c = MLIRArray(CUDA.zeros(Float32, N))
+        bk = get_backend(a)
+        k = _g_vadd!(bk, 256)
+        # `optimize_sci!` (on by default) runs in the KA compile path; the
+        # `optimize` toggle lets us compare against the un-optimized lowering.
+        nlines(s) = count('\n', s)
+        nops(s)   = count(r"= [a-z_]+\.[a-z_]+", s)   # MLIR op-result lines
+        raw_sci = code_gpu(k, c, a, b; ndrange=N, level=:sci,  optimize=false)
+        opt_sci = code_gpu(k, c, a, b; ndrange=N, level=:sci,  optimize=true)
+        raw_ir  = code_gpu(k, c, a, b; ndrange=N, level=:mlir, optimize=false)
+        opt_ir  = code_gpu(k, c, a, b; ndrange=N, level=:mlir, optimize=true)
+        @test nlines(opt_sci) < nlines(raw_sci)   # passes transform the structured IR
+        @test nops(opt_ir)   <  nops(raw_ir)      # ...and that reaches the emitted MLIR
+        # The optimized kernel (the default path) still computes the right result.
+        k(c, a, b; ndrange=N); CUDA.synchronize()
+        @test Array(c) == Array(a) .+ Array(b)
+    end
+end

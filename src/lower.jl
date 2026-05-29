@@ -744,7 +744,9 @@ end
 function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                            kernel_name::String, module_name::String="kernels",
                            lane_idx_type::Type=Int32, nd_dims::Vector{Int}=Int[],
-                           ctx_arg::Union{Nothing,Int}=nothing)
+                           ctx_arg::Union{Nothing,Int}=nothing, optimize::Bool=true)
+    # Optimize the StructuredIRCode (DCE/CSE/LICM) before walking it to MLIR.
+    optimize && SCIOpt.optimize_sci!(sci)
     ctx = fresh_context()
     mod_ref = Ref{IR.Module}()
     param_julia_types = Type[]

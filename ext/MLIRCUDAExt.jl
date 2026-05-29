@@ -141,7 +141,7 @@ end
 # to stderr, so it works even when a kernel is launched deep inside a library.
 const _DUMP_ORDER = (:sci, :mlir, :lowered, :llvm, :ptx)
 
-function _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims)
+function _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims, optimize=true)
     spec = get(ENV, "MLIRKERNELS_DUMP", "")
     isempty(spec) && return
     filt = get(ENV, "MLIRKERNELS_DUMP_FILTER", "")
@@ -152,7 +152,7 @@ function _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims)
     isempty(idxs) && return
     upto = _DUMP_ORDER[maximum(idxs)]
     stages = try
-        _codegen_stages(f, full_argtypes; sm, feat, upto, nd_dims)
+        _codegen_stages(f, full_argtypes; sm, feat, upto, nd_dims, optimize)
     catch e
         printstyled(stderr, "===== [MLIRKernels dump] $kname: staging failed at :$upto =====\n";
                     color=:red, bold=true)
@@ -167,11 +167,11 @@ function _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims)
     return
 end
 
-function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80", nd_dims=Int[])
-    key = (f, full_argtypes, sm, feat, nd_dims)
+function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80", nd_dims=Int[], optimize::Bool=true)
+    key = (f, full_argtypes, sm, feat, nd_dims, optimize)
     haskey(_gpu_cache, key) && return _gpu_cache[key]
     kname = _sym(f)
-    _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims)
+    _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims, optimize)
 
     sci, rettype = FE.structured(f, full_argtypes)
     (rettype === Nothing || rettype === Union{}) ||
@@ -179,7 +179,7 @@ function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80", nd_dims=Int[])
 
     # ctx (`__ctx__`) is arg slot 2 (slot 1 is the function itself).
     mod, _pjt, mlir_ctx, kinds =
-        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims)
+        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims, optimize)
 
     _run_passes!(mod, mlir_ctx, GPU_PASSES)
     bc = _extract_gpu_binary(mod)
@@ -201,7 +201,7 @@ end
 const _GPU_PASSES_NOBIN = GPU_PASSES[1:end-1]
 
 function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
-                         upto::Symbol=:ptx, nd_dims=Int[])
+                         upto::Symbol=:ptx, nd_dims=Int[], optimize::Bool=true)
     kname = _sym(f)
     order = (:sci, :mlir, :lowered, :llvm, :ptx)
     want = findfirst(==(upto), order)
@@ -209,11 +209,14 @@ function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
     out = Dict{Symbol,String}()
 
     sci, _ = FE.structured(f, full_argtypes)
+    # Optimize the SCI here (so the :sci level reflects the toggle); then lower
+    # with optimize=false to avoid running the passes twice.
+    optimize && MK.SCIOpt.optimize_sci!(sci)
     out[:sci] = sprint(show, sci)
     want == 1 && return out
 
     mod, _pjt, mlir_ctx, _kinds =
-        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims)
+        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims, optimize=false)
     MK.@with_context mlir_ctx begin
         out[:mlir] = sprint(show, mod)
         want == 2 && return out
@@ -400,18 +403,20 @@ end
 # code_gpu — reflection entry points (see MLIRKernels.code_gpu docstring).
 # ----------------------------------------------------------------------------
 
-# Low-level form: explicit (gpu_body, full_argtypes::Type).
+# Low-level form: explicit (gpu_body, full_argtypes::Type). `optimize` toggles the
+# SCI optimization passes (DCE/CSE/LICM) — handy for opt-vs-raw codegen diffs.
 function MK.code_gpu(@nospecialize(f), full_argtypes::Type; level::Symbol=:ptx,
-                     sm="sm_90", feat="+ptx80", nd_dims=Int[])
-    stages = _codegen_stages(f, full_argtypes; sm, feat, upto=level, nd_dims)
+                     sm="sm_90", feat="+ptx80", nd_dims=Int[], optimize::Bool=true)
+    stages = _codegen_stages(f, full_argtypes; sm, feat, upto=level, nd_dims, optimize)
     return stages[level]
 end
 
 # Ergonomic form: a KA kernel + launch args (mirrors a `(obj)(args…; ndrange)`).
 function MK.code_gpu(obj::KA.Kernel{MLIRCUDABackend}, args...; level::Symbol=:ptx,
-                     ndrange=nothing, workgroupsize=nothing, sm="sm_90", feat="+ptx80")
+                     ndrange=nothing, workgroupsize=nothing, sm="sm_90", feat="+ptx80",
+                     optimize::Bool=true)
     full_argtypes, nd, _wg = _launch_setup(obj, args, ndrange, workgroupsize)
-    return MK.code_gpu(obj.f, full_argtypes; level, sm, feat, nd_dims=Int[nd...])
+    return MK.code_gpu(obj.f, full_argtypes; level, sm, feat, nd_dims=Int[nd...], optimize)
 end
 
 end # module MLIRCUDAExt
