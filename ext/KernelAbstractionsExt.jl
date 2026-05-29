@@ -83,6 +83,20 @@ struct MLIRBackend <: KA.GPU end
         ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
     FE.Intrinsics.group_ntuple(Val(N))
 
+# `@index(…, Cartesian)` → a `CartesianIndex{N}` wrapping the same per-dim coords
+# as the NTuple form (CartesianIndex's `.I` field IS the NTuple). `A[I]` then
+# inlines through `I.I` to the per-dim coords + column-major linearisation.
+# GPUArrays uses this form heavily (broadcast/copy/clamp/transpose/…).
+@overlay FE.METHOD_TABLE KA.__index_Global_Cartesian(
+        ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
+    CartesianIndex(FE.Intrinsics.global_ntuple(Val(N)))
+@overlay FE.METHOD_TABLE KA.__index_Local_Cartesian(
+        ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
+    CartesianIndex(FE.Intrinsics.local_ntuple(Val(N)))
+@overlay FE.METHOD_TABLE KA.__index_Group_Cartesian(
+        ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
+    CartesianIndex(FE.Intrinsics.group_ntuple(Val(N)))
+
 # `__validindex(ctx)` — for launches where ndrange is a multiple of the
 # workgroup size, every lane is valid. Tighter (lane < ndrange) masking is a
 # TODO (thread `ndrange` through and emit a per-lane mask compare).

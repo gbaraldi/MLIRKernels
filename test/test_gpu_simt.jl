@@ -154,6 +154,16 @@ end
         f(i)
     end
 end
+# @index(Global, Cartesian): a CartesianIndex{N}. Full-index `A[I]` + component
+# `I[k]` access (the GPUArrays broadcast/copy/transpose pattern).
+@kernel function _g_cartdbl!(A)
+    I = @index(Global, Cartesian)
+    @inbounds A[I] = A[I] * 2f0
+end
+@kernel function _g_carttr!(B, @Const(A))
+    I = @index(Global, Cartesian)
+    @inbounds B[I[2], I[1]] = A[I[1], I[2]]
+end
 
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
@@ -266,5 +276,16 @@ end
         ch = let d = cdst, s = csrc2; i -> (@inbounds d[i] = 3f0 * s[i]); end
         _g_mapclos!(GPUB(), 256)(1024, ch; ndrange=1024); CUDA.synchronize()
         @test Array(cdst) ≈ 3f0 .* (1:1024)                    # 2-capture closure + write
+
+        # @index(Global, Cartesian): full-index A[I] (2-D + 1-D) + component I[k].
+        cda = CUDA.CuArray(rand(Float32, 16, 16)); cda0 = Array(cda)
+        _g_cartdbl!(GPUB(), (4, 4))(cda; ndrange=size(cda)); CUDA.synchronize()
+        @test Array(cda) ≈ 2f0 .* cda0                         # 2-D Cartesian A[I]
+        cv = CUDA.CuArray(rand(Float32, 1024)); cv0 = Array(cv)
+        _g_cartdbl!(GPUB(), 256)(cv; ndrange=length(cv)); CUDA.synchronize()
+        @test Array(cv) ≈ 2f0 .* cv0                           # 1-D Cartesian
+        cta = CUDA.CuArray(rand(Float32, 8, 12)); ctb = CUDA.zeros(Float32, 12, 8)
+        _g_carttr!(GPUB(), (4, 4))(ctb, cta; ndrange=size(cta)); CUDA.synchronize()
+        @test Array(ctb) == permutedims(Array(cta))            # Cartesian I[k] transpose
     end
 end
