@@ -118,6 +118,16 @@ module Intrinsics
         return compilerbarrier(:type,
             Array{T, length(Dims)}(undef, Dims))::Array{T, length(Dims)}
     end
+
+    # Per-thread private memory (`@private T dims`). KA overlays
+    # `Scratchpad(ctx, T, Val(dims))` onto this. Same shape as `shared_alloc`,
+    # but the walker emits a DEFAULT-address-space `memref.alloca` — per-thread
+    # storage (each lane its own copy), no sharing, no barrier.
+    @noinline function private_alloc(::Type{T}, ::Val{Dims}) where {T, Dims}
+        Base.donotdelete(T, Dims)
+        return compilerbarrier(:type,
+            Array{T, length(Dims)}(undef, Dims))::Array{T, length(Dims)}
+    end
 end
 
 # Predicate mirroring cuTile's `isintrinsic`: a function defined in our

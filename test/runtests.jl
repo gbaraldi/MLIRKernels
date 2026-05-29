@@ -2444,6 +2444,35 @@ end
             (@eval _g_histogram!)(GPUB(), (256,))(dhout, dhin; ndrange=Lh); CUDA.synchronize()
             hist_ref = zeros(Int, NBINS); for v in hin; hist_ref[v] += 1; end
             @test Array(dhout) == hist_ref                   # full KA histogram
+
+            # @private: per-thread storage (default-space alloca). Scalar and
+            # array forms; the array kernel also takes a `::Val{M}` dispatch arg
+            # (a compile-time constant, not a runtime param).
+            @eval begin
+                using KernelAbstractions: @private
+                @kernel function _g_privrev!(A)
+                    @uniform Np = prod(@groupsize())
+                    I = @index(Global, Linear); il = @index(Local, Linear)
+                    pp = @private Int (1,)
+                    @inbounds pp[1] = Np - il + 1
+                    @inbounds A[I] = pp[1]
+                end
+                @kernel function _g_privarr!(out, @Const(A), ::Val{M}) where {M}
+                    I = @index(Global, Linear)
+                    pp = @private Int (M,)
+                    s = 0
+                    @inbounds for j in 1:M; pp[j] = A[I] * j; end
+                    @inbounds for j in 1:M; s += pp[j]; end
+                    @inbounds out[I] = s
+                end
+            end
+            Np = 64; Wp = 16
+            ap = CUDA.zeros(Int, Np)
+            (@eval _g_privrev!)(GPUB(), Wp)(ap; ndrange=Np); CUDA.synchronize()
+            @test Array(ap) == repeat(collect(Wp:-1:1), Np ÷ Wp)   # per-thread scalar
+            Mp = 4; inpp = CUDA.CuArray(collect(1:Np)); op = CUDA.zeros(Int, Np)
+            (@eval _g_privarr!)(GPUB(), Wp)(op, inpp, Val(Mp); ndrange=Np); CUDA.synchronize()
+            @test Array(op) == [i * sum(1:Mp) for i in 1:Np]       # per-thread array + Val arg
         end
     end
 

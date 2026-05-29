@@ -129,8 +129,11 @@ function _push_memref!(flat, sig, arr::CuArray)
 end
 
 function _marshal(args, kinds)
-    # `kinds` is one symbol per *param* (memref/scalar) — the array/scalar args
-    # in order (the ctx is not a param). It lines up 1:1 with `args`.
+    # `kinds` is one symbol per *param* (memref/scalar). Compile-time-constant
+    # args — singletons like `::Val{M}` / `::Type{T}` used only for dispatch —
+    # are NOT runtime params (lower_to_mlir_gpu folds them in as Core.Const), so
+    # drop them here too; the rest line up 1:1 with `kinds`.
+    args = Tuple(a for a in args if !Base.issingletontype(typeof(a)))
     length(kinds) == length(args) ||
         error("MLIRCUDABackend: $(length(kinds)) params vs $(length(args)) args")
     flat = Any[]; sig = DataType[]

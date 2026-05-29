@@ -125,9 +125,12 @@ Base.Experimental.@consistent_overlay FE.METHOD_TABLE function Base.steprange_la
     end
 end
 
-# `@private` / Scratchpad — not yet wired up.
-@overlay FE.METHOD_TABLE KA.Scratchpad(ctx, ::Type, ::Val) =
-    error("MLIRBackend: @private / Scratchpad not yet implemented")
+# `@private T dims` → `Scratchpad(__ctx__, T, Val(dims))`. Per-thread private
+# storage: map onto `private_alloc` (the walker emits a default-space alloca —
+# per-thread `.local` on GPU). Unlike KA's CPU Scratchpad we don't add the
+# implicit workitem dimension (SIMT gives each thread its own copy directly).
+@overlay FE.METHOD_TABLE KA.Scratchpad(ctx, ::Type{T}, ::Val{Dims}) where {T, Dims} =
+    FE.Intrinsics.private_alloc(T, Val(Dims))
 
 # `KA.@atomic` / `Atomix.@atomic arr[i] op= x` — KA's *portable* atomic, the
 # form KA docs recommend (CUDA/AMDGPU/oneAPI all override `Atomix.modify!` for

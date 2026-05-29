@@ -1914,10 +1914,13 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         return nothing
     end
 
-    # `@localmem T dims` (Frontend.Intrinsics.shared_alloc) → a workgroup-space
-    # `memref.alloca`, tracked so `shared[…]` accesses route to it.
+    # `@localmem` (shared_alloc) / `@private` (private_alloc) → a workgroup or
+    # per-thread buffer, tracked so `buf[…]` accesses route to it.
     if fname === :shared_alloc && lc.spmd
-        return emit_shared_alloc!(lc, idx, args)
+        return emit_local_buffer!(lc, idx, args, true)
+    end
+    if fname === :private_alloc && lc.spmd
+        return emit_local_buffer!(lc, idx, args, false)
     end
 
     # Workgroup barrier marker (`Frontend.Intrinsics.barrier`, from KA
@@ -3993,23 +3996,28 @@ end
 # of `:size`/`memref.dim`) means the static shape is `reverse(dims)`. We register
 # the alloca in `lc.local_memrefs` so the marker result (and `getfield(_,:ref)`
 # on it) route memoryrefnew/get/set to this buffer instead of an arg memref.
-function emit_shared_alloc!(lc::LowerCtx, idx::Int, args)
-    length(args) >= 2 || error("shared_alloc: expected (T, Val{Dims}), got $args")
+# `@localmem`/`@private` buffer. `shared=true` (@localmem) → per-BLOCK workgroup
+# memory (GPU: a `.shared` memref.global; CPU: a per-block alloca).
+# `shared=false` (@private) → per-THREAD storage (a default-space alloca, i.e.
+# `.local` on GPU — each lane its own copy).
+function emit_local_buffer!(lc::LowerCtx, idx::Int, args, shared::Bool)
+    what = shared ? "shared_alloc" : "private_alloc"
+    length(args) >= 2 || error("$what: expected (T, Val{Dims}), got $args")
     T = args[1] isa Type ? args[1] : something(resolve_const(lc, args[1]), nothing)
-    T isa Type || error("shared_alloc: element type must be a Type, got $(args[1])")
+    T isa Type || error("$what: element type must be a Type, got $(args[1])")
     vd = args[2]
     Dims = vd isa Val ? typeof(vd).parameters[1] :
            (vd isa Type && vd <: Val) ? vd.parameters[1] :
-           error("shared_alloc: dims must be Val{Dims}, got $vd")
+           error("$what: dims must be Val{Dims}, got $vd")
     dims = Tuple(Dims)
     elem = mlir_elem_type(T)
     shape = Int[reverse(dims)...]
-    if lc.lane_width == 1
-        # GPU: a workgroup-space `memref.global` sibling of the gpu.func +
-        # `memref.get_global`. gpu-to-nvvm lowers this to real `.shared`.
-        # (`memref.alloca(workgroup)` mis-lowers to a per-thread local depot.)
+    if shared && lc.lane_width == 1
+        # GPU @localmem: a workgroup-space `memref.global` sibling of the
+        # gpu.func + `memref.get_global`. gpu-to-nvvm lowers this to real
+        # `.shared`. (`memref.alloca(workgroup)` mis-lowers to a local depot.)
         lc.gpu_module_block !== nothing ||
-            error("shared_alloc: gpu.module block unavailable for @localmem")
+            error("$what: gpu.module block unavailable")
         ws = parse(IR.Attribute, "#gpu.address_space<workgroup>")
         memref_t = IR.MemRefType(elem, shape, IR.Attribute(), ws)
         sym = "__shmem_$(idx)"   # unique per @localmem site (marker SSA id)
@@ -4022,7 +4030,8 @@ function emit_shared_alloc!(lc::LowerCtx, idx::Int, args)
                         name=parse(IR.Attribute, "@" * sym)))
         lc.local_memrefs[idx] = (buf, T)
     else
-        # CPU SPMD: a plain per-block (default-space) alloca.
+        # Default-space alloca: per-block @localmem on CPU, OR per-thread
+        # @private on either path (each lane its own copy; `.local` on GPU).
         memref_t = IR.MemRefType(elem, shape, IR.Attribute(), IR.Attribute())
         alloca = IR.result(_memref.alloca(IR.Value[], IR.Value[]; memref=memref_t))
         lc.local_memrefs[idx] = (alloca, T)
