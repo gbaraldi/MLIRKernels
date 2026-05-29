@@ -25,5 +25,20 @@ const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
         # the block-reduction helper.
         rsrc = MLIRArray(CUDA.CuArray(collect(Float32, 1:n)))
         @test AK.reduce(+, rsrc; init=0.0f0) ≈ sum(1:n)   # AK.reduce end-to-end
+
+        # mapreduce / sum / count / any / all — reductions over a map or
+        # predicate, all on the @localmem block-reduction path.
+        @test AK.sum(rsrc) ≈ sum(1:n)
+        @test AK.mapreduce(x -> x, +, rsrc; init=0f0) ≈ sum(1:n)
+        @test AK.count(x -> x > 0f0, rsrc) == n           # predicate count (bit-shift ops)
+        @test AK.any(x -> x > Float32(n - 1), rsrc)
+        @test AK.all(x -> x > 0f0, rsrc)
+
+        # accumulate! / cumsum — prefix scan (scf.while loop + bit-shift block
+        # arithmetic in the decoupled-lookback kernel).
+        adst = MLIRArray(CUDA.zeros(Float32, n))
+        AK.accumulate!(+, adst, rsrc; init=0f0); CUDA.synchronize()
+        @test Array(adst) ≈ cumsum(1:n)                   # AK.accumulate! end-to-end
+        @test Array(AK.cumsum(rsrc)) ≈ cumsum(1:n)        # AK.cumsum end-to-end
     end
 end

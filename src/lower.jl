@@ -964,6 +964,35 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry)
         else
             error("walk_block!(:for): unexpected terminator $(typeof(term))")
         end
+    elseif kind === :while_before
+        # `scf.while` "before" region: compute the condition, then forward the
+        # carried values to the "after" region (and out as results) via
+        # `scf.condition`.
+        term isa ConditionOp ||
+            error("walk_block!(:while_before): expected ConditionOp, got $(typeof(term))")
+        cond = resolve_value_or_const(lc, term.condition)
+        cond === nothing && error("scf.condition: cannot resolve condition $(term.condition)")
+        fwd = IR.Value[]
+        for v in term.args
+            r = resolve_value_or_const(lc, v)
+            r === nothing && error("scf.condition: cannot resolve forwarded operand $v")
+            push!(fwd, r)
+        end
+        _scf.condition(cond, fwd)
+        return
+    elseif kind === :while_after
+        # `scf.while` "after" region (the loop body): yield the next iteration's
+        # carried values back to the "before" region.
+        term isa YieldOp ||
+            error("walk_block!(:while_after): expected YieldOp, got $(typeof(term))")
+        vals = IR.Value[]
+        for v in term.values
+            r = resolve_value_or_const(lc, v)
+            r === nothing && error("scf.yield: cannot resolve operand $v")
+            push!(vals, r)
+        end
+        _scf.yield(vals)
+        return
     end
 end
 
@@ -977,6 +1006,9 @@ function walk_stmt!(lc::LowerCtx, idx::Int, @nospecialize(stmt), @nospecialize(t
         return nothing
     elseif stmt isa ForOp
         emit_for!(lc, idx, stmt, typ)
+        return nothing
+    elseif stmt isa WhileOp
+        emit_while!(lc, idx, stmt, typ)
         return nothing
     elseif stmt === :boundscheck || stmt === Symbol("boundscheck")
         # Synthetic bounds-check sentinel. We assume in-bounds; tag the SSA
@@ -1389,6 +1421,7 @@ const _RAW_CORE_INTRINSICS = Set{Symbol}([
     :add_float, :sub_float, :mul_float, :div_float, :neg_float,
     :add_int, :sub_int, :mul_int, :neg_int,
     :and_int, :or_int, :xor_int, :not_int,
+    :shl_int, :lshr_int, :ashr_int,
     :slt_int, :sle_int, :ult_int, :ule_int, :eq_int, :ne_int,
     :lt_float, :le_float, :eq_float, :ne_float,
     :sext_int, :zext_int, :trunc_int, :bitcast,
@@ -1435,6 +1468,38 @@ function _allones_of_elem(t)
     return Int64(-1)
 end
 
+# Bit width of the (signless) integer element behind MLIR type `t`. All int
+# values flow through `mlir_elem_type` (signless `iN`), so matching against
+# `IR.Type(IntN)` is exact. Returns 0 for non-integer types.
+function _int_width(t)
+    et = IR.isvector(t) ? eltype(t) : t
+    et == IR.Type(Bool)  && return 1
+    et == IR.Type(Int8)  && return 8
+    et == IR.Type(Int16) && return 16
+    et == IR.Type(Int32) && return 32
+    et == IR.Type(Int64) && return 64
+    return 0
+end
+
+# Integer shift: `arith.{shl,shr*}i` require both operands to share a type, but
+# Julia hands the count as an `Int` (so e.g. `lshr_int(::UInt8, ::Int)` arrives
+# as i8/i64). Coerce the count to the shifted value's width.
+function emit_shift!(lc::LowerCtx, args, op_fn)
+    a = resolve_value_or_const(lc, args[1])   # value being shifted
+    b = resolve_value_or_const(lc, args[2])   # shift count
+    (a === nothing || b === nothing) &&
+        error("shift: unresolved operands ($(args[1]), $(args[2]))")
+    a, b = _spmd_harmonise(lc, a, b)
+    ta, tb = IR.type(a), IR.type(b)
+    if ta != tb
+        wa, wb = _int_width(ta), _int_width(tb)
+        (wa == 0 || wb == 0) && error("shift: cannot match operand widths $ta / $tb")
+        b = wb > wa ? IR.result(_arith.trunci(b; out=ta)) :
+            wb < wa ? IR.result(_arith.extui(b; out=ta)) : b
+    end
+    return IR.result(op_fn(a, b))
+end
+
 function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecialize(typ))
     CP = ComparisonPredicate
     SG = Signedness
@@ -1449,6 +1514,9 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :and_int   && return emit_binop_value!(lc, args, _arith.andi)
     name === :or_int    && return emit_binop_value!(lc, args, _arith.ori)
     name === :xor_int   && return emit_binop_value!(lc, args, _arith.xori)
+    name === :shl_int   && return emit_shift!(lc, args, _arith.shli)    # shift left
+    name === :lshr_int  && return emit_shift!(lc, args, _arith.shrui)   # logical >>
+    name === :ashr_int  && return emit_shift!(lc, args, _arith.shrsi)   # arithmetic >>
     (name === :udiv_int || name === :checked_udiv_int) && return emit_binop_value!(lc, args, _arith.divui)
     (name === :sdiv_int || name === :checked_sdiv_int) && return emit_binop_value!(lc, args, _arith.divsi)
     (name === :urem_int || name === :checked_urem_int) && return emit_binop_value!(lc, args, _arith.remui)
@@ -2122,6 +2190,50 @@ function emit_for!(lc::LowerCtx, idx::Int, op::ForOp, @nospecialize(typ))
                       results=iter_types, region=body_region)
     if !isempty(iter_types)
         vals = [IR.result(forop, k) for k in 1:length(iter_types)]
+        lc.ssa_multi[idx] = vals
+    end
+    return nothing
+end
+
+# `scf.while`: the structurizer's WhileOp has uniform carried types across
+# init / before-args / after-args / results. The `before` region computes the
+# condition and forwards the carried values via `scf.condition`; the `after`
+# region (the loop body) yields the next iteration's carried values. Both
+# regions take the carried values as block arguments.
+function emit_while!(lc::LowerCtx, idx::Int, op::WhileOp, @nospecialize(typ))
+    init_vals = IR.Value[]
+    iter_types = IR.Type[]
+    for iv in op.init_values
+        v = resolve_value_or_const(lc, iv)
+        v === nothing && error("scf.while: cannot resolve init $iv")
+        push!(init_vals, v)
+        push!(iter_types, IR.type(v))
+    end
+
+    before_region = IR.Region()
+    before_block = IR.Block(iter_types, [IR.Location() for _ in iter_types])
+    push!(before_region, before_block)
+    @with_block before_block begin
+        for (k, ba) in enumerate(op.before.args)
+            lc.block_args[ba.id] = IR.argument(before_block, k)
+        end
+        walk_block!(lc, op.before; kind=:while_before)
+    end
+
+    after_region = IR.Region()
+    after_block = IR.Block(iter_types, [IR.Location() for _ in iter_types])
+    push!(after_region, after_block)
+    @with_block after_block begin
+        for (k, ba) in enumerate(op.after.args)
+            lc.block_args[ba.id] = IR.argument(after_block, k)
+        end
+        walk_block!(lc, op.after; kind=:while_after)
+    end
+
+    whileop = _scf.while_(init_vals; results=iter_types,
+                          before=before_region, after=after_region)
+    if !isempty(iter_types)
+        vals = [IR.result(whileop, k) for k in 1:length(iter_types)]
         lc.ssa_multi[idx] = vals
     end
     return nothing
