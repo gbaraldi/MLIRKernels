@@ -36,6 +36,8 @@ KA.ones(::MLIRCUDABackend, ::Type{T}, dims::Tuple) where {T} = CUDA.ones(T, dims
 KA.synchronize(::MLIRCUDABackend) = CUDA.synchronize()
 KA.functional(::MLIRCUDABackend) = CUDA.functional()
 KA.supports_atomics(::MLIRCUDABackend) = true
+# Data movement (host↔device, device↔device) defers to CUDA's copyto!.
+KA.copyto!(::MLIRCUDABackend, dst, src) = (Base.copyto!(dst, src); dst)
 # NOTE: no `KA.get_backend(::CuArray)` override — that belongs to CUDA.jl's own
 # CUDABackend. Users opt in explicitly: `k(MLIRCUDABackend(), W)(...; ndrange)`.
 
@@ -243,10 +245,21 @@ end
 # eltype/ndims (→ `memref<?×…×T>`), and inferring a kernel body's `A[i]` on a
 # `CuArray` trips `GPUArrays.assertscalar`. (Marshalling still uses the real
 # device arrays.)
+# ndrange: explicit kwarg wins; otherwise fall back to the kernel's STATIC
+# ndrange (baked in via `kernel(backend, wg, ndrange)`), as KA's testsuite does.
+function _resolve_ndrange(obj::KA.Kernel{MLIRCUDABackend}, ndrange)
+    if ndrange !== nothing
+        return ndrange isa Integer ? (ndrange,) : Tuple(ndrange)
+    end
+    nd_T = KA.ndrange(obj)
+    nd_T <: NDI.StaticSize ||
+        error("MLIRCUDABackend: ndrange must be specified (kernel has no static ndrange)")
+    return NDI.get(nd_T)
+end
+
 function _launch_setup(obj::KA.Kernel{MLIRCUDABackend}, args, ndrange, workgroupsize)
-    ndrange === nothing && error("MLIRCUDABackend: ndrange must be specified")
     wg = _resolve_wgsize(obj, workgroupsize)
-    nd = ndrange isa Integer ? (ndrange,) : Tuple(ndrange)
+    nd = _resolve_ndrange(obj, ndrange)
     length(wg) == length(nd) || error(
         "MLIRCUDABackend: ndrange $nd ($(length(nd))-D) and workgroupsize $wg " *
         "($(length(wg))-D) must have the same number of dimensions.")
