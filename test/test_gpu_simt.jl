@@ -172,6 +172,14 @@ end
     @inbounds out[i] = v % Int32
 end
 
+# Runtime dimension extent: `size(a, d)` with a runtime `d` reads
+# `getfield(a.size::Tuple, d)` with a non-const index → a select-chain over the
+# per-dim `memref.dim`s.
+@kernel function _g_dimsz!(out, @Const(a), d)
+    i = @index(Global, Linear)
+    @inbounds out[i] = size(a, d)
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -314,6 +322,14 @@ end
         uo2 = MLIRArray(CUDA.zeros(Int32, 64))
         _g_unionsel!(backend, 16)(uo2, ua, false; ndrange=64); CUDA.synchronize()
         @test all(Array(uo2) .== Int32(7))                     # union branch: Int64(7)%Int32
+
+        # `size(a, d)` with a RUNTIME `d` — getfield(a.size, d) at a non-const
+        # index → select-chain over memref.dims.
+        dm = MLIRArray(CUDA.CuArray(rand(Float32, 8, 5))); dz = MLIRArray(CUDA.zeros(Int64, 4))
+        _g_dimsz!(backend, 4)(dz, dm, 1; ndrange=4); CUDA.synchronize()
+        @test all(Array(dz) .== 8)
+        _g_dimsz!(backend, 4)(dz, dm, 2; ndrange=4); CUDA.synchronize()
+        @test all(Array(dz) .== 5)
     end
 end
 

@@ -2213,6 +2213,29 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
             end
             return nothing
         end
+        # Runtime index into a plain `getfield(arr, :size)` (e.g. AK's dims
+        # reduction reads `size(arr)[dim]` with a runtime `dim`) → select-chain
+        # over the per-dim `memref.dim`s. (Julia dim k ↔ MLIR dim N-k.)
+        if resolve_const(lc, args[2]) === nothing && haskey(lc.field_refs, obj.id) &&
+           lc.field_refs[obj.id][2] in (:size, :sizes)
+            arg_id = lc.field_refs[obj.id][1]
+            idxv = resolve_value_or_const(lc, args[2])
+            idxv === nothing && error("getfield: cannot resolve runtime dim $(args[2])")
+            memref_v = lc.arg_vals[arg_id]
+            N = ndims(IR.type(memref_v)); idx_t = IR.IndexType()
+            extents = IR.Value[IR.result(_memref.dim(memref_v,
+                IR.result(_arith.constant(; value=IR.Attribute(N - k, idx_t))); result=idx_t))
+                               for k in 1:N]
+            eqp = IR.Attribute(0, IR.Type(Int64))          # arith.cmpi eq
+            sel = extents[end]
+            for k in (N - 1):-1:1
+                kc = IR.result(_arith.constant(; value=IR.Attribute(k, IR.type(idxv))))
+                cond = IR.result(_arith.cmpi(idxv, kc; predicate=eqp))
+                sel = IR.result(_arith.select(cond, extents[k], sel))
+            end
+            rt = (typ isa Type && typ <: Integer) ? mlir_elem_type(typ) : mlir_elem_type(Int64)
+            return IR.result(_arith.index_cast(sel; out=rt))
+        end
         k = something(resolve_const(lc, args[2]), args[2])
         k isa Integer || error("getfield: SSA-rooted index must be const int, got $(args[2])")
         ki = Int(k)
