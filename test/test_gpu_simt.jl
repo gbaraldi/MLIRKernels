@@ -180,6 +180,25 @@ end
     @inbounds out[i] = size(a, d)
 end
 
+# An infinite loop with `break` (a structurized LoopOp that doesn't promote to
+# for/while) → scf.while carrying a `done` sentinel.
+@kernel function _g_breakloop!(out, @Const(ns))
+    i = @index(Global, Linear)
+    n = @inbounds ns[i]; s = 0; k = 1
+    while true
+        s += k; k += 1
+        k > n && break
+    end
+    @inbounds out[i] = s
+end
+
+# A runtime tuple index `t[d]` (non-const `d`) → select-chain over components.
+@kernel function _g_tupidx!(out, @Const(a), @Const(ds))
+    i = @index(Global, Linear)
+    x = @inbounds a[i]; t = (x, 2x, 3x)
+    @inbounds out[i] = t[@inbounds ds[i]]
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -330,6 +349,17 @@ end
         @test all(Array(dz) .== 8)
         _g_dimsz!(backend, 4)(dz, dm, 2; ndrange=4); CUDA.synchronize()
         @test all(Array(dz) .== 5)
+
+        # LoopOp: `while true … break` → scf.while + done sentinel.
+        bn = MLIRArray(CUDA.CuArray(Int64[3, 5, 10, 1])); bo = MLIRArray(CUDA.zeros(Int64, 4))
+        _g_breakloop!(backend, 4)(bo, bn; ndrange=4); CUDA.synchronize()
+        @test Array(bo) == [sum(1:n) for n in (3, 5, 10, 1)]
+
+        # Runtime tuple index → select-chain.
+        ta = MLIRArray(CUDA.CuArray(Int64[5, 5, 5])); td = MLIRArray(CUDA.CuArray(Int64[1, 2, 3]))
+        to = MLIRArray(CUDA.zeros(Int64, 3))
+        _g_tupidx!(backend, 4)(to, ta, td; ndrange=3); CUDA.synchronize()
+        @test Array(to) == [5, 10, 15]
     end
 end
 

@@ -1052,6 +1052,9 @@ function walk_stmt!(lc::LowerCtx, idx::Int, @nospecialize(stmt), @nospecialize(t
     elseif stmt isa WhileOp
         emit_while!(lc, idx, stmt, typ)
         return nothing
+    elseif stmt isa LoopOp
+        emit_loop!(lc, idx, stmt, typ)
+        return nothing
     elseif stmt === :boundscheck || stmt === Symbol("boundscheck")
         # Synthetic bounds-check sentinel. We assume in-bounds; tag the SSA
         # so a subsequent Base.getfield(_, _, %14) call can recognise it.
@@ -2129,6 +2132,20 @@ function _resolve_captured!(lc::LowerCtx, idx::Int, slot::Int, path::Tuple)
     return nothing
 end
 
+# `vals[idx]` for a runtime 1-based `idx` over homogeneous Values → a select-chain
+# `idx==1 ? vals[1] : … : vals[end]`. In range for valid indices. The constant
+# index literals match `idx`'s type.
+function _select_chain!(idxv::IR.Value, vals::Vector{IR.Value})
+    eqp = IR.Attribute(0, IR.Type(Int64))     # arith.cmpi eq
+    sel = vals[end]
+    for k in (length(vals) - 1):-1:1
+        kc = IR.result(_arith.constant(; value=IR.Attribute(k, IR.type(idxv))))
+        cond = IR.result(_arith.cmpi(idxv, kc; predicate=eqp))
+        sel = IR.result(_arith.select(cond, vals[k], sel))
+    end
+    return sel
+end
+
 function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     obj = args[1]
     # Resolve through transparent aliases (e.g. the array that `getfield(Const,
@@ -2213,28 +2230,34 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
             end
             return nothing
         end
-        # Runtime index into a plain `getfield(arr, :size)` (e.g. AK's dims
-        # reduction reads `size(arr)[dim]` with a runtime `dim`) → select-chain
-        # over the per-dim `memref.dim`s. (Julia dim k ↔ MLIR dim N-k.)
-        if resolve_const(lc, args[2]) === nothing && haskey(lc.field_refs, obj.id) &&
-           lc.field_refs[obj.id][2] in (:size, :sizes)
-            arg_id = lc.field_refs[obj.id][1]
+        # Runtime tuple index (e.g. AK's dims kernel indexes a `size`/`stride`
+        # tuple, or `size(arr)[dim]`, by a loop variable) → select-chain.
+        if resolve_const(lc, args[2]) === nothing
             idxv = resolve_value_or_const(lc, args[2])
-            idxv === nothing && error("getfield: cannot resolve runtime dim $(args[2])")
-            memref_v = lc.arg_vals[arg_id]
-            N = ndims(IR.type(memref_v)); idx_t = IR.IndexType()
-            extents = IR.Value[IR.result(_memref.dim(memref_v,
-                IR.result(_arith.constant(; value=IR.Attribute(N - k, idx_t))); result=idx_t))
-                               for k in 1:N]
-            eqp = IR.Attribute(0, IR.Type(Int64))          # arith.cmpi eq
-            sel = extents[end]
-            for k in (N - 1):-1:1
-                kc = IR.result(_arith.constant(; value=IR.Attribute(k, IR.type(idxv))))
-                cond = IR.result(_arith.cmpi(idxv, kc; predicate=eqp))
-                sel = IR.result(_arith.select(cond, extents[k], sel))
+            idxv === nothing && error("getfield: cannot resolve runtime index $(args[2])")
+            # A tracked tuple: select over its (homogeneous) components.
+            if haskey(lc.tuples, obj.id)
+                comps = IR.Value[]
+                for c in lc.tuples[obj.id]
+                    v = resolve_value_or_const(lc, c)
+                    v === nothing && error("getfield: tuple component not a Value: $c")
+                    push!(comps, v)
+                end
+                return _select_chain!(idxv, comps)
             end
-            rt = (typ isa Type && typ <: Integer) ? mlir_elem_type(typ) : mlir_elem_type(Int64)
-            return IR.result(_arith.index_cast(sel; out=rt))
+            # `getfield(arr, :size)[dim]`: select over the per-dim `memref.dim`s
+            # (Julia dim k ↔ MLIR dim N-k), index-cast to the result type.
+            if haskey(lc.field_refs, obj.id) && lc.field_refs[obj.id][2] in (:size, :sizes)
+                memref_v = lc.arg_vals[lc.field_refs[obj.id][1]]
+                N = ndims(IR.type(memref_v)); idx_t = IR.IndexType()
+                extents = IR.Value[IR.result(_memref.dim(memref_v,
+                    IR.result(_arith.constant(; value=IR.Attribute(N - k, idx_t))); result=idx_t))
+                                   for k in 1:N]
+                sel = _select_chain!(idxv, extents)
+                rt = (typ isa Type && typ <: Integer) ? mlir_elem_type(typ) : mlir_elem_type(Int64)
+                return IR.result(_arith.index_cast(sel; out=rt))
+            end
+            error("getfield: runtime index into unsupported object %$(obj.id)")
         end
         k = something(resolve_const(lc, args[2]), args[2])
         k isa Integer || error("getfield: SSA-rooted index must be const int, got $(args[2])")
@@ -2294,10 +2317,22 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
     # opt params) doesn't fold through `ref.indices[1]`, so it reaches the walker
     # as a getfield on the literal tuple. Extract and materialise the element.
     if obj isa Tuple
-        k = something(resolve_const(lc, args[2]), args[2])
-        k isa Integer || error("getfield(tuple): index must be const int, got $(args[2])")
-        v = resolve_value_or_const(lc, obj[Int(k)])
-        v === nothing && error("getfield(tuple): element $(obj[Int(k)]) not resolvable")
+        kc = resolve_const(lc, args[2])
+        if kc === nothing
+            # Runtime index into a constant tuple → select-chain over its elements.
+            idxv = resolve_value_or_const(lc, args[2])
+            idxv === nothing && error("getfield(tuple): cannot resolve runtime index $(args[2])")
+            comps = IR.Value[]
+            for el in obj
+                v = resolve_value_or_const(lc, el)
+                v === nothing && error("getfield(tuple): element $el not resolvable")
+                push!(comps, v)
+            end
+            return _select_chain!(idxv, comps)
+        end
+        kc isa Integer || error("getfield(tuple): index must be const int, got $(args[2])")
+        v = resolve_value_or_const(lc, obj[Int(kc)])
+        v === nothing && error("getfield(tuple): element $(obj[Int(kc)]) not resolvable")
         return v
     end
     error("getfield: unsupported obj $obj")
@@ -2551,6 +2586,108 @@ function emit_while!(lc::LowerCtx, idx::Int, op::WhileOp, @nospecialize(typ))
         vals = [IR.result(whileop, k) for k in 1:length(iter_types)]
         lc.ssa_multi[idx] = vals
     end
+    return nothing
+end
+
+# A region that transfers loop control: it ends in `break`/`continue`, or in a
+# control-`if` whose branches do (recursively). (A normal value-`if` ends in
+# `yield`.) Used to find the control-transfer statement in a LoopOp body.
+function _is_loop_control_region(b::Block)
+    b.terminator isa Union{ContinueOp, BreakOp} && return true
+    b.terminator === nothing || return false
+    last_stmt = nothing
+    for (_, e) in b.body; last_stmt = e.stmt; end
+    last_stmt isa IfOp &&
+        _is_loop_control_region(last_stmt.then_region) &&
+        _is_loop_control_region(last_stmt.else_region)
+end
+
+# Lower a LoopOp body region (or a control-`if` branch) to the `(carried…, done)`
+# values an scf.while after-region must yield: `continue`→(vals…, false),
+# `break`→(vals…, true), a control-`if`→an `scf.if` producing the same tuple from
+# each branch. Statements before the transfer lower normally.
+function _emit_loop_region!(lc::LowerCtx, block::Block, carried::Vector{IR.Type})
+    i1 = IR.Type(Bool)
+    _walk(idx, e) = (v = walk_stmt!(lc, idx, e.stmt, e.type);
+        v === nothing || (lc.ssa_vals[idx] = v;
+            e.type isa Type && _struct_vec_info(e.type) !== nothing && (lc.struct_vals[idx] = e.type)))
+    term = block.terminator
+    if term isa ContinueOp || term isa BreakOp
+        for (idx, e) in block.body; _walk(idx, e); end
+        out = IR.Value[]
+        for (k, rv) in enumerate(term.values)
+            v = resolve_value_or_const(lc, rv)
+            v === nothing && error("scf.while(loop): cannot resolve carried value $rv")
+            push!(out, _coerce_to_type!(v, carried[k]))
+        end
+        push!(out, IR.result(_arith.constant(;
+            value=IR.Attribute(term isa BreakOp, i1), result=i1)))
+        return out
+    end
+    # terminator === nothing: the last statement is the control-`if`. Lower the
+    # preceding statements normally, then funnel the control-`if`.
+    stmts = collect(block.body)
+    pos = findlast(p -> p[2].stmt isa IfOp &&
+                        _is_loop_control_region(p[2].stmt.then_region) &&
+                        _is_loop_control_region(p[2].stmt.else_region), stmts)
+    pos === nothing && error("scf.while(loop): region has neither a break/continue " *
+                             "terminator nor a control-if")
+    for (idx, e) in stmts[1:pos-1]; _walk(idx, e); end
+    ifop = stmts[pos][2].stmt::IfOp
+    cond = resolve_value_or_const(lc, ifop.condition)
+    cond === nothing && error("scf.while(loop): cannot resolve control-if condition")
+    rtypes = IR.Type[carried..., i1]
+    then_region = IR.Region(); then_block = IR.Block(IR.Type[], IR.Location[])
+    else_region = IR.Region(); else_block = IR.Block(IR.Type[], IR.Location[])
+    push!(then_region, then_block); push!(else_region, else_block)
+    @with_block then_block _scf.yield(_emit_loop_region!(lc, ifop.then_region, carried))
+    @with_block else_block _scf.yield(_emit_loop_region!(lc, ifop.else_region, carried))
+    ifr = _scf.if_(cond; results=rtypes, thenRegion=then_region, elseRegion=else_region)
+    return IR.Value[IR.result(ifr, k) for k in 1:length(rtypes)]
+end
+
+# `LoopOp` (an infinite loop with `break`/`continue` that didn't promote to
+# for/while) → `scf.while` carrying the loop vars PLUS a `done` sentinel: the
+# `before` region loops while `!done`; the `after` region runs the body and
+# yields `(continue-vals…, false)` or `(break-vals…, true)` (funneled through the
+# control-`if`). The loop's results are the carried values at exit (the break
+# values), dropping the sentinel.
+function emit_loop!(lc::LowerCtx, idx::Int, op::LoopOp, @nospecialize(typ))
+    carried, _ = if_result_types(typ)          # promotes numeric-union carries
+    i1 = IR.Type(Bool)
+    init_vals = IR.Value[]
+    for (k, iv) in enumerate(op.init_values)
+        v = resolve_value_or_const(lc, iv)
+        v === nothing && error("scf.while(loop): cannot resolve init $iv")
+        push!(init_vals, _coerce_to_type!(v, carried[k]))
+    end
+    false_c = IR.result(_arith.constant(; value=IR.Attribute(false, i1), result=i1))
+    push!(init_vals, false_c)
+    types = IR.Type[carried..., i1]
+
+    before_region = IR.Region()
+    before_block = IR.Block(types, [IR.Location() for _ in types])
+    push!(before_region, before_block)
+    @with_block before_block begin
+        bargs = IR.Value[IR.argument(before_block, k) for k in 1:length(types)]
+        true_c = IR.result(_arith.constant(; value=IR.Attribute(true, i1), result=i1))
+        not_done = IR.result(_arith.xori(bargs[end], true_c))   # loop while !done
+        _scf.condition(not_done, bargs)
+    end
+
+    after_region = IR.Region()
+    after_block = IR.Block(types, [IR.Location() for _ in types])
+    push!(after_region, after_block)
+    @with_block after_block begin
+        for (k, ba) in enumerate(op.body.args)
+            lc.block_args[ba.id] = IR.argument(after_block, k)
+        end
+        _scf.yield(_emit_loop_region!(lc, op.body, carried))
+    end
+
+    whileop = _scf.while_(init_vals; results=types,
+                          before=before_region, after=after_region)
+    lc.ssa_multi[idx] = IR.Value[IR.result(whileop, k) for k in 1:length(carried)]
     return nothing
 end
 
