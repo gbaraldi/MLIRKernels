@@ -105,6 +105,17 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         for d in 1:3
             @test A(sum(m3; dims=d)) ≈ sum(M3; dims=d)
         end
+
+        # `extrema` reduces over a `Tuple{T,T}` (min,max) accumulator — the init
+        # is a struct-typed kernel ARG and the per-step result a `Core.tuple`,
+        # both reconstructed into `vector<2×T>`; the carried accumulator is a
+        # struct-typed loop block arg (getfield→extractelement).
+        ev = mk(rand(Float32, 3000)); EV = A(ev)
+        @test extrema(ev) == extrema(EV)
+        @test A(extrema(m2; dims=1)) == extrema(M2; dims=1)
+        @test A(extrema(m2; dims=2)) == extrema(M2; dims=2)
+        ei = mk(rand(Int32(1):Int32(99), 1500))
+        @test extrema(ei) == extrema(A(ei))
     end
 end
 

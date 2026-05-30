@@ -131,6 +131,12 @@ mutable struct LowerCtx
     # `getfield(v, field)` on these extracts the lane; tagged by SCI type in the
     # walk. (Heterogeneous structs are a future, separate representation.)
     struct_vals::Dict{Int, Type}
+    # Kernel arg slot → homogeneous-struct Julia type, for a `vector<N×T>`-able
+    # struct ARG (e.g. an `(typemax,typemin)` reduction init `Tuple{T,T}`).
+    # The arg is flattened to scalar params (so `getfield(arg, k)` resolves via
+    # `captured`); using the WHOLE arg as a value reconstructs the vector from
+    # those scalar slots (see `resolve_value_or_const`).
+    struct_arg_types::Dict{Int, Type}
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -148,7 +154,7 @@ LowerCtx(ctx, mod) = LowerCtx(
     Dict{Tuple{Int, Tuple}, Tuple{Int, Symbol}}(), Set{Int}(),
     Dict{Int, Tuple{Int, Tuple}}(), Dict{Int, Int}(),
     Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}(),
-    Dict{Int, Type}())
+    Dict{Int, Type}(), Dict{Int, Type}())
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -764,6 +770,26 @@ function _flatten_struct_arg!(lc::LowerCtx, @nospecialize(T), arg_slot::Int,
     return syn
 end
 
+# Rebuild a homogeneous-struct arg (flattened to scalar params at synthetic
+# slots) into a `vector<N×T>` value via `vector.from_elements`. Each field
+# `fn` of `T` was registered in `captured[(slot, (fn,))]` as a scalar param;
+# gather them in field order. Returns `nothing` if any field isn't a resolved
+# scalar param (caller falls through).
+function _reconstruct_struct_arg!(lc::LowerCtx, slot::Int, @nospecialize(T))
+    _struct_vec_info(T) === nothing && return nothing
+    elems = IR.Value[]
+    for fn in fieldnames(T)
+        ck = get(lc.captured, (slot, (fn,)), nothing)
+        ck === nothing && return nothing
+        (syn, knd) = ck
+        knd === :scalar || return nothing
+        v = get(lc.arg_vals, syn, nothing)
+        v === nothing && return nothing
+        push!(elems, v)
+    end
+    return IR.result(_vector.from_elements(elems; result=mlir_elem_type(T)))
+end
+
 function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                            kernel_name::String, module_name::String="kernels",
                            lane_idx_type::Type=Int32, nd_dims::Vector{Int}=Int[],
@@ -856,6 +882,11 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
                     # recursively flatten captured fields into their own params.
                     (isstructtype(AT_wide) && !isempty(fieldnames(AT_wide))) ||
                         error("MLIRKernels GPU: unsupported arg type $AT_wide at slot $i")
+                    # A homogeneous-struct arg (e.g. a `Tuple{T,T}` reduction
+                    # init) is `vector<N×T>`-able — record its type so a
+                    # whole-value use reconstructs the vector from the flattened
+                    # scalar slots.
+                    _struct_vec_info(AT_wide) !== nothing && (lc.struct_arg_types[i] = AT_wide)
                     syn_counter = _flatten_struct_arg!(lc, AT_wide, i, (),
                         syn_counter, param_mlir_types, param_arg_slots,
                         param_julia_types, param_kinds, global_attr)
@@ -1196,6 +1227,35 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
                 push!(elems, fv)
             end
             return IR.result(_vector.from_elements(elems; result=mlir_elem_type(T)))
+        end
+    end
+    # A homogeneous-struct ARG used as a whole value: reconstruct the
+    # `vector<N×T>` from the scalar field params it was flattened into.
+    if op isa Argument && haskey(lc.struct_arg_types, op.n)
+        v = _reconstruct_struct_arg!(lc, op.n, lc.struct_arg_types[op.n])
+        v === nothing || return v
+    end
+    # A tracked tuple (`Core.tuple`) used as a whole value — e.g. a
+    # `Tuple{T,T}` reduction result stored into a struct array. If its
+    # components resolve to one common scalar type, it's `vector<N×T>`-able
+    # (same representation as a homogeneous struct); materialise via
+    # `vector.from_elements`. (Heterogeneous tuples remain a future gap.)
+    if op isa SSAValue && haskey(lc.tuples, op.id)
+        comps = lc.tuples[op.id]
+        if !isempty(comps)
+            elems = IR.Value[]
+            for c in comps
+                cv = resolve_value_or_const(lc, c)
+                cv === nothing && break
+                push!(elems, cv)
+            end
+            if length(elems) == length(comps)
+                t0 = IR.type(elems[1])
+                if all(e -> IR.type(e) == t0, elems)
+                    return IR.result(_vector.from_elements(elems;
+                        result=IR.VectorType(1, Int[length(elems)], t0)))
+                end
+            end
         end
     end
     if op isa Bool
@@ -2170,13 +2230,17 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
         return resolve_value_or_const(lc, operand)
     end
     # `getfield(struct_value, :field)` where the value is a `vector<N×T>` (loaded
-    # from a struct array / scf.if result): extract the field's lane.
-    if obj isa SSAValue && haskey(lc.struct_vals, obj.id)
-        T = lc.struct_vals[obj.id]
+    # from a struct array / scf.if result / loop-carried block arg): extract the
+    # field's lane. SSAs are tagged in `struct_vals`; a block arg (a carried
+    # struct accumulator, e.g. a `Tuple{T,T}` extrema state) carries its type.
+    svT = obj isa SSAValue && haskey(lc.struct_vals, obj.id) ? lc.struct_vals[obj.id] :
+          obj isa BlockArgument && obj.type isa Type &&
+              _struct_vec_info(obj.type) !== nothing ? obj.type : nothing
+    if svT !== nothing
         vec = resolve_value_or_const(lc, obj)
         vec === nothing && error("getfield: unresolved struct value $obj")
         fld = args[2] isa QuoteNode ? args[2].value : args[2]
-        fi = fld isa Symbol ? Base.fieldindex(T, fld) : Int(fld)
+        fi = fld isa Symbol ? Base.fieldindex(svT, fld) : Int(fld)
         pos = IR.result(_arith.constant(;
                   value=IR.Attribute(fi - 1, IR.IndexType()), result=IR.IndexType()))
         return IR.result(_vector.extractelement(vec, pos; result=eltype(IR.type(vec))))
