@@ -175,33 +175,54 @@ function _struct_vec_info(@nospecialize(T))
     return (length(fts), ft)
 end
 
-# A heterogeneous bits-struct (mixed scalar field types, e.g. `Tuple{Float32,Int64}`
-# from `findmax`'s (value,index) pair) can't be a `vector<N×T>`. Its VALUE is an
-# `!llvm.struct<(...)>` (built/read with llvm.insert/extractvalue); in memory it
-# rides in a `memref<?xiN>` byte-carrier (N = 8·sizeof) — memref can't hold an
-# aggregate — accessed via an `!llvm.ptr` + `llvm.getelementptr`/load/store. Scalar
-# fields only (no nested aggregates yet). Returns `fieldcount` or `nothing`.
-# Design: see the `reference_hetero_struct_design` memory note (llvm-dialect plan).
+# Flat scalar-leaf list of a bits-struct, recursing through nested bits-struct /
+# tuple fields. Returns `[leaf_scalar_type…]` in field order, or `nothing` if any
+# leaf isn't a bits scalar. A flattened `!llvm.struct<(leaf…)>` matches Julia's
+# layout exactly: both LLVM and Julia lay out isbits fields at natural-alignment
+# offsets, and flattening preserves those offsets (e.g. `Tuple{Float32,Int64}` →
+# [f32,i64] = {f32@0,i64@8}; `CartesianIndex{2}` = `struct{I::Tuple{Int,Int}}` →
+# [i64,i64]; `Tuple{Float32,CartesianIndex{2}}` → [f32,i64,i64]).
+function _struct_leaf_types(@nospecialize(T))
+    out = Type[]
+    for i in 1:fieldcount(T)
+        FT = fieldtype(T, i)
+        if FT isa Type && (FT <: Number || FT === Bool) && isbitstype(FT)
+            push!(out, FT)
+        elseif FT isa DataType && isconcretetype(FT) && isstructtype(FT) &&
+               isbitstype(FT) && fieldcount(FT) >= 1
+            sub = _struct_leaf_types(FT)
+            sub === nothing && return nothing
+            append!(out, sub)
+        else
+            return nothing
+        end
+    end
+    return out
+end
+
+# A heterogeneous bits-struct (not all-one-scalar, e.g. `Tuple{Float32,Int64}` from
+# findmax's (value,index) pair, or `CartesianIndex{2}` = a struct wrapping a
+# tuple) can't be a `vector<N×T>`. Its VALUE is a FLAT `!llvm.struct<(leaf…)>`
+# (built/read with llvm.insert/extractvalue); in memory it rides in a
+# `memref<?xiN>` byte-carrier (N=8·sizeof) — memref can't hold an aggregate —
+# accessed via an `!llvm.ptr` + `llvm.getelementptr`/load/store. Returns the flat
+# leaf-type list or `nothing`. Design: [[reference_hetero_struct_design]].
 function _hetero_struct_info(@nospecialize(T))
     (T isa DataType && isconcretetype(T) && isstructtype(T) && isbitstype(T)) || return nothing
     _struct_vec_info(T) === nothing || return nothing   # homogeneous → vector path
-    fc = fieldcount(T)
-    fc >= 1 || return nothing
-    for i in 1:fc
-        FT = fieldtype(T, i)
-        (FT isa Type && (FT <: Number || FT === Bool) && isbitstype(FT)) || return nothing
-    end
-    return fc
+    leaves = _struct_leaf_types(T)
+    (leaves === nothing || isempty(leaves)) && return nothing
+    return leaves
 end
 
 # Signless MLIR integer of an arbitrary bit width (the `iN` struct byte-carrier).
 _int_type(width::Int) = IR.Type(MLIR.API.mlirIntegerTypeGet(IR.current_context(), width))
 
-# `!llvm.struct<(field types…)>` for a heterogeneous bits-struct. Unpacked literal
-# struct — its field offsets/padding match Julia's layout (verified for the
-# scalar-field case, e.g. `Tuple{Float32,Int64}` = {f32@0, i64@8}).
+# Flat `!llvm.struct<(scalar leaf types…)>` for a heterogeneous (possibly nested)
+# bits-struct — unpacked literal struct; offsets/padding match Julia's layout.
 function _llvm_struct_type(@nospecialize(T))
-    refs = MLIR.API.MlirType[mlir_elem_type(fieldtype(T, i)).ref for i in 1:fieldcount(T)]
+    leaves = _struct_leaf_types(T)
+    refs = MLIR.API.MlirType[mlir_elem_type(L).ref for L in leaves]
     return IR.Type(MLIR.API.mlirLLVMStructTypeLiteralGet(
         IR.current_context(), length(refs), refs, false))
 end
@@ -799,6 +820,47 @@ function _llvm_struct_assemble!(field_vals::Vector{IR.Value})
     return acc
 end
 
+# Split a materialised aggregate Value into its scalar leaves: a `vector<N×T>` →
+# its N lanes (extractelement); an `!llvm.struct` → its fields (extractvalue); a
+# scalar → itself. Used to flatten a sub-aggregate into the flat leaf list.
+function _decompose_leaves(v::IR.Value)
+    t = IR.type(v)
+    if IR.isvector(t)
+        n = Int(size(t, 1)); et = eltype(t)
+        return IR.Value[IR.result(_vector.extractelement(v,
+            IR.result(_arith.constant(; value=IR.Attribute(k, IR.IndexType()), result=IR.IndexType()));
+            result=et)) for k in 0:(n - 1)]
+    elseif MLIR.API.mlirTypeIsALLVMStructType(t)
+        n = Int(MLIR.API.mlirLLVMStructTypeGetNumElementTypes(t))
+        return IR.Value[IR.result(_llvm.extractvalue(v;
+            res=IR.Type(MLIR.API.mlirLLVMStructTypeGetElementType(t, k - 1)),
+            position=IR.Attribute(Int64[k - 1]))) for k in 1:n]
+    end
+    return IR.Value[v]
+end
+
+# Gather the FLAT scalar-leaf Values of a struct/tuple-valued operand, recursing
+# through tracked `Core.tuple`s and `:new` structs so we read the ORIGINAL leaf
+# SSAs (a `CartesianIndex{2}` = `:new(CartesianIndex, Core.tuple(i,j))` yields
+# [i,j]). A leaf that resolves to a materialised vector / `!llvm.struct` is split
+# via `_decompose_leaves`. Matches the flat `_llvm_struct_type` field order.
+function _gather_struct_leaves!(lc::LowerCtx, @nospecialize(op))
+    if op isa SSAValue && haskey(lc.tuples, op.id)
+        leaves = IR.Value[]
+        for c in lc.tuples[op.id]; append!(leaves, _gather_struct_leaves!(lc, c)); end
+        return leaves
+    end
+    if op isa SSAValue && haskey(lc.new_structs, op.id)
+        (_, fops) = lc.new_structs[op.id]
+        leaves = IR.Value[]
+        for o in fops; append!(leaves, _gather_struct_leaves!(lc, o)); end
+        return leaves
+    end
+    v = resolve_value_or_const(lc, op)
+    v === nothing && error("struct leaf unresolved: $op")
+    return _decompose_leaves(v)
+end
+
 # NVVM address space of a memref's memory-space attribute (global=1,
 # workgroup/shared=3, none/default=0) — to type the derived `!llvm.ptr`.
 function _memref_addrspace(base::IR.Value)
@@ -1319,16 +1381,18 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
     # passed on): homogeneous → `vector<N×T>`; heterogeneous → `!llvm.struct`.
     if op isa SSAValue && haskey(lc.new_structs, op.id)
         (T, ops) = lc.new_structs[op.id]
-        if _struct_vec_info(T) !== nothing || _hetero_struct_info(T) !== nothing
+        if _struct_vec_info(T) !== nothing
             elems = IR.Value[]
             for o in ops
                 fv = resolve_value_or_const(lc, o)
                 fv === nothing && error("struct field unresolved: $o")
                 push!(elems, fv)
             end
-            return _struct_vec_info(T) !== nothing ?
-                IR.result(_vector.from_elements(elems; result=mlir_elem_type(T))) :
-                _llvm_struct_assemble!(elems)
+            return IR.result(_vector.from_elements(elems; result=mlir_elem_type(T)))
+        elseif _hetero_struct_info(T) !== nothing
+            # Heterogeneous / nested (e.g. `CartesianIndex{2}` wrapping a tuple):
+            # gather the flat scalar leaves and assemble a flat `!llvm.struct`.
+            return _llvm_struct_assemble!(_gather_struct_leaves!(lc, op))
         end
     end
     # A homogeneous-struct ARG used as a whole value: reconstruct the
@@ -1352,10 +1416,15 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
             end
             if length(elems) == length(comps)
                 t0 = IR.type(elems[1])
-                return all(e -> IR.type(e) == t0, elems) ?
-                    IR.result(_vector.from_elements(elems;
-                        result=IR.VectorType(1, Int[length(elems)], t0))) :
-                    _llvm_struct_assemble!(elems)
+                # All-same SCALAR components → `vector<N×T>` (homogeneous, e.g.
+                # extrema's `Tuple{T,T}`). Otherwise (mixed types, or aggregate
+                # components) → flat `!llvm.struct` from the scalar leaves.
+                if all(e -> IR.type(e) == t0, elems) &&
+                   !IR.isvector(t0) && !MLIR.API.mlirTypeIsALLVMStructType(t0)
+                    return IR.result(_vector.from_elements(elems;
+                        result=IR.VectorType(1, Int[length(elems)], t0)))
+                end
+                return _llvm_struct_assemble!(_gather_struct_leaves!(lc, op))
             end
         end
     end
@@ -2378,8 +2447,16 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
                       value=IR.Attribute(fi - 1, IR.IndexType()), result=IR.IndexType()))
             return IR.result(_vector.extractelement(vec, pos; result=eltype(IR.type(vec))))
         else
-            # heterogeneous → `llvm.extractvalue` at the field's struct position
+            # heterogeneous → `llvm.extractvalue` at the field's struct position.
+            # Only flat structs (one scalar leaf per field) are readable this way;
+            # a nested struct's field index ≠ its leaf position (the flat
+            # `!llvm.struct` has no sub-struct to extract). Construction/store of
+            # nested structs works (leaf-flattened); reading a nested field doesn't.
             FT = fieldtype(svT, fi)
+            (length(_hetero_struct_info(svT)) == fieldcount(svT) &&
+             (FT <: Number || FT === Bool)) ||
+                error("getfield: reading a field of a NESTED heterogeneous struct " *
+                      "($svT.$fld) is unsupported (only flat structs are readable)")
             return IR.result(_llvm.extractvalue(vec;
                 res=mlir_elem_type(FT), position=IR.Attribute(Int64[fi - 1])))
         end

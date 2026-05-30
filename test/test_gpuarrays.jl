@@ -132,6 +132,20 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         @test argmax(fi) == argmax(A(fi))            # heterogeneous Tuple{Int32,Int64}
         fd = mk(rand(Float64, 777))
         @test findmin(fd) == findmin(A(fd))          # Tuple{Float64,Int64}
+
+        # findmax(;dims) builds a `CartesianIndex{2}` (a struct wrapping a
+        # `Tuple{Int,Int}`) and stores it — exercises the NESTED-struct path:
+        # leaf-flattened to a flat `!llvm.struct<(i64,i64)>` via `_struct_leaf_types`
+        # + recursive `_gather_struct_leaves!`. (The `similar(bc, T, dims::Dims)`
+        # fix also lands here — multi-array reduce allocates the reduced shape.)
+        fm = mk(rand(Float32, 8, 4)); FM = A(fm)
+        for d in (1, 2)
+            rv, ri = findmax(fm; dims=d); CUDA.synchronize()
+            ev, ei = findmax(FM; dims=d)
+            @test A(rv) == ev
+            @test A(ri) == ei            # CartesianIndex{2} array, nested struct
+            @test A(argmin(fm; dims=d)) == argmin(FM; dims=d)
+        end
     end
 end
 

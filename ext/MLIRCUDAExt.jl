@@ -76,8 +76,12 @@ struct MLIRArrayStyle{N} <: AbstractGPUArrayStyle{N} end
 MLIRArrayStyle(::Val{N}) where {N} = MLIRArrayStyle{N}()
 MLIRArrayStyle{M}(::Val{N}) where {N,M} = MLIRArrayStyle{N}()
 Base.Broadcast.BroadcastStyle(::Type{<:MLIRArray{T,N}}) where {T,N} = MLIRArrayStyle{N}()
+# `dims` may be axis-ranges (normal broadcast → `axes(bc)`) or an integer `Dims`
+# (e.g. GPUArrays' `_mapreduce` passing the reduced output shape). Normalise each
+# to its length — `length.(dims)` alone would collapse integer dims to 1
+# (`length(4)==1`), giving a wrong-shaped result for dims-reductions.
 Base.similar(bc::Base.Broadcast.Broadcasted{MLIRArrayStyle{N}}, ::Type{T}, dims) where {T,N} =
-    MLIRArray(CuArray{T}(undef, length.(dims)))
+    MLIRArray(CuArray{T}(undef, map(d -> d isa Integer ? Int(d) : length(d), dims)))
 # GPUArrays materialises contiguous views / reshape / reinterpret via `derive`
 # (a new array sharing storage). Delegate to the wrapped CuArray and rewrap, so a
 # `view(::MLIRArray, …)` stays an MLIRArray (get_backend → our backend) instead of
