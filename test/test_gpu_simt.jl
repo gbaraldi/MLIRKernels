@@ -233,6 +233,19 @@ end
     @inbounds out[i] = _g_thrhelper(a[i])
 end
 
+# `@inbounds` honoring: inference folds `@inbounds` into `Expr(:boundscheck, false)`,
+# so a NON-`@inbounds` access compiles a real bounds check (OOB → KernelException)
+# while the `@inbounds` form elides it. `_g_chk!` is in-bounds; `_g_chkoob!` reads
+# deliberately out of range.
+@kernel function _g_chk!(c, @Const(a))
+    i = @index(Global, Linear)
+    c[i] = a[i]                  # non-@inbounds → checked
+end
+@kernel function _g_chkoob!(c, @Const(a))
+    i = @index(Global, Linear)
+    c[i] = a[i + 1000000]        # non-@inbounds OOB read
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -422,6 +435,25 @@ end
         let oa = MLIRArray(CUDA.zeros(Float32, 64))
             @test_throws "conditional branch" code_gpu(devnull, _g_outthrow!(backend, 64),
                 MLIRArray(CUDA.zeros(Float32, 64)), oa; ndrange=64, level=:mlir)
+        end
+
+        # `@inbounds` is honored: a NON-`@inbounds` access compiles a real bounds
+        # check (its OOB throw → the `@__mlirkernels_exc` exception global), while an
+        # `@inbounds` kernel elides it entirely.
+        let N = 256
+            ca = MLIRArray(CUDA.rand(Float32, N)); cc = MLIRArray(CUDA.zeros(Float32, N))
+            chk_mlir = _ir(code_gpu, _g_chk!(backend, 64), cc, ca; ndrange=N, level=:mlir)
+            inb_mlir = _ir(code_gpu, _g_vadd!(backend, 256), cc, ca, ca; ndrange=N, level=:mlir)
+            @test occursin("__mlirkernels_exc", chk_mlir)    # checked → bounds check
+            @test !occursin("__mlirkernels_exc", inb_mlir)   # @inbounds → elided
+            # checked, in-bounds: correct result, no false exception
+            _g_chk!(backend, 64)(cc, ca; ndrange=N); CUDA.synchronize()
+            @test Array(cc) == Array(ca)
+            # checked, OOB: a real KernelException
+            coob = MLIRArray(CUDA.zeros(Float32, N))
+            @test_throws CUDA.CUDACore.KernelException begin
+                _g_chkoob!(backend, 64)(coob, ca; ndrange=N); CUDA.synchronize()
+            end
         end
     end
 end

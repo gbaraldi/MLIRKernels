@@ -1379,9 +1379,14 @@ function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
         # un-dispatchable invoke can be emitted as an outlined `func.call`.
         return walk_call!(lc, idx, e.args[2], e.args[3:end], typ; mi=e.args[1])
     elseif e.head === :boundscheck
-        # Synthetic bool used as the 3rd `getfield` arg (`@inbounds` hint).
-        # Tag the SSA as a sentinel; subsequent getfield call recognises it.
-        lc.sentinels[idx] = :boundscheck
+        # `Expr(:boundscheck, folded)`: inference folds `@inbounds` into `args[1]` —
+        # `false` ⇒ `@inbounds` (don't check), `true` ⇒ a checked access. (This is
+        # exactly what Julia's own codegen reads; the value isn't a statement flag.)
+        # Tag the SSA so the gating `if boundscheck …` IfOp (emit_if!) either drops
+        # the check (`:boundscheck`) or runs it (`:boundscheck_on`). A bare/no-arg
+        # boundscheck defaults to `@inbounds`/off (the conservative prior behavior).
+        checked = !isempty(e.args) && e.args[1] === true
+        lc.sentinels[idx] = checked ? :boundscheck_on : :boundscheck
         return nothing
     elseif e.head === :aliasscope || e.head === :popaliasscope
         # `@Const`/`@inbounds` (KA's `constify`) wrap loads in alias-scope
@@ -3021,26 +3026,32 @@ function _is_dead_throw_branch(block::Block)
 end
 
 function emit_if!(lc::LowerCtx, idx::Int, op::IfOp, @nospecialize(typ))
-    # SPMD mode: `if boundscheck …` IfOps gate dead bounds-check code.
-    # Their condition resolves to the `:boundscheck` sentinel (no Value).
-    # We assume `@inbounds` and skip the entire IfOp — its then-branch is
-    # the actual bounds check (compare + throw), its else-branch is empty.
-    # (Enabling these checks — driving the condition `true` so OOB → a real
-    # `KernelException` — is a worthwhile follow-up, but: (1) `@inbounds` is not
-    # honored here so checks would be always-on; (2) a throw inside a loop makes
-    # the check's throw-branch terminate in a `BreakOp`, which `walk_block!(:if)`
-    # can't yet lower (needs loop-control integration — matmul-style kernels fail,
-    # though 1-D/2-D non-loop ones work); (3) the exception buffer is per-context
-    # and shared across modules, and `check_exceptions()` clears it on detection —
-    # so a false throw's `status=1` is observed by ANY intervening `synchronize()`
-    # on that context, surfacing a spurious `KernelException` (possibly attributed
-    # to an unrelated kernel). So it stays off; EXPLICIT throws still signal via
-    # `emit_exception!`.)
-    if lc.spmd && op.condition isa SSAValue &&
-       get(lc.sentinels, op.condition.id, nothing) === :boundscheck
-        return nothing
+    # `if boundscheck …` IfOps gate a bounds check (then-branch = compare + a
+    # `throw_boundserror`). The condition resolves to a `:boundscheck`/
+    # `:boundscheck_on` sentinel (no Value) recorded from `Expr(:boundscheck, …)`,
+    # which honors `@inbounds`:
+    #   • `:boundscheck`    — `@inbounds` access → DROP the whole IfOp (no check).
+    #   • `:boundscheck_on` — a checked access → drive the condition `true` so the
+    #     check RUNS; an OOB index then `throw_boundserror`s → `emit_exception!` →
+    #     a host `KernelException` (matching `@inbounds`-respecting CUDA.jl).
+    # CAVEAT: a checked access inside a LOOP makes the throw-branch terminate in a
+    # `BreakOp` that `walk_block!(:if)` can't yet lower — such kernels error rather
+    # than miscompile. `@inbounds` accesses (the common case for KA/AK/GPUArrays)
+    # fold to `:boundscheck` and are unaffected.
+    bc = (lc.spmd && op.condition isa SSAValue) ?
+         get(lc.sentinels, op.condition.id, nothing) : nothing
+    bc === :boundscheck && return nothing          # @inbounds → drop the check
+    # A checked access whose check body transfers loop control (a `break` for the
+    # OOB-throws-after-the-loop shape) can't be threaded yet → drop it too (sound:
+    # no check, never a crash). Otherwise enable: drive the condition `true`.
+    bc === :boundscheck_on &&
+        (_region_has_loop_control(op.then_region) ||
+         _region_has_loop_control(op.else_region)) && return nothing
+    cond_v = if bc === :boundscheck_on             # checked, non-loop → enable
+        IR.result(_arith.constant(; value=IR.Attribute(true, IR.Type(Bool)), result=IR.Type(Bool)))
+    else
+        resolve_value_or_const(lc, op.condition)
     end
-    cond_v = resolve_value_or_const(lc, op.condition)
     cond_v === nothing && error("scf.if: cannot resolve condition $(op.condition)")
     # SPMD mode: a varying (lane-vector) condition can't drive an `scf.if`
     # (which requires a scalar i1). The varying guards we produce are the
@@ -3252,6 +3263,30 @@ function _is_loop_control_region(b::Block)
     last_stmt isa IfOp &&
         _is_loop_control_region(last_stmt.then_region) &&
         _is_loop_control_region(last_stmt.else_region)
+end
+
+# True if `b` (or any region nested within it) transfers loop control
+# (`break`/`continue`). A bounds check INSIDE a loop represents its OOB throw as a
+# `break` out of the loop (+ a post-loop `throw_boundserror`); the generic
+# `walk_block!(:if)` can't thread that break, so `emit_if!` uses this to fall back
+# to dropping such a (would-be-enabled) check rather than crashing. Conservative:
+# recurses into every nested region, so it may also fire on an unrelated nested
+# loop — which only means a check is dropped (sound), never enabled-then-crashed.
+function _region_has_loop_control(b::Block)
+    b.terminator isa Union{ContinueOp, BreakOp} && return true
+    for (_, e) in b.body
+        st = e.stmt
+        if st isa IfOp
+            (_region_has_loop_control(st.then_region) ||
+             _region_has_loop_control(st.else_region)) && return true
+        elseif st isa ForOp || st isa LoopOp
+            _region_has_loop_control(st.body) && return true
+        elseif st isa WhileOp
+            (_region_has_loop_control(st.before) ||
+             _region_has_loop_control(st.after)) && return true
+        end
+    end
+    return false
 end
 
 # Lower a LoopOp body region (or a control-`if` branch) to the `(carried…, done)`
