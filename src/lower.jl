@@ -1230,9 +1230,11 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
 end
 
 function undef_value(lc::LowerCtx, @nospecialize(T))
-    if T isa Type && T <: Number
-        return materialise_zero_scalar(T)
-    end
+    # Collapse a numeric Union (e.g. a loop-carried `Union{Int32,Int64}`) to its
+    # promoted scalar — matching how `if_result_types` promotes carried types, so
+    # the materialised undef's type lines up with the carried block-arg type.
+    pt = _promote_numeric_type(T)
+    pt !== nothing && return materialise_zero_scalar(pt)
     error("undef_value: unsupported type $T")
 end
 

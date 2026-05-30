@@ -89,6 +89,22 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
         @test any(>(0.5f0), a) == any(>(0.5f0), A(a))
         @test all(>(0.0f0), p)
         @test mapreduce(abs2, +, a) ≈ mapreduce(abs2, +, A(a))
+
+        # Dimensional reductions → GPUArrays.mapreducedim! (dims) → AK's
+        # `mapreduce_nd_by_block` kernel. That kernel has two sequential loops
+        # where the second references a `Union{Int32,Int64}` accumulator carried
+        # out of the first via a `PiNode`; exercises the structurizer's PiNode
+        # exit-value threading + the numeric-union undef coercion.
+        m2 = mk(rand(Float32, 32, 17)); M2 = A(m2)
+        @test A(sum(m2; dims=1)) ≈ sum(M2; dims=1)
+        @test A(sum(m2; dims=2)) ≈ sum(M2; dims=2)
+        @test A(sum(abs2, m2; dims=1)) ≈ sum(abs2, M2; dims=1)
+        @test A(maximum(m2; dims=2)) == maximum(M2; dims=2)
+        @test A(minimum(m2; dims=1)) == minimum(M2; dims=1)
+        m3 = mk(rand(Float32, 8, 4, 3)); M3 = A(m3)
+        for d in 1:3
+            @test A(sum(m3; dims=d)) ≈ sum(M3; dims=d)
+        end
     end
 end
 
