@@ -53,7 +53,12 @@ contributes nothing.
 function get_stmt_operands(@nospecialize(s))
     result = Any[]
     if s isa Expr
-        start = s.head === :invoke ? 3 : 2
+        # `:invoke` args are [CodeInstance/MI, callee, args…]; the callee (args[2])
+        # can be an SSA value (an outlined-call closure) — a real use that must be
+        # tracked or DCE drops the statement defining it. The CodeInstance at
+        # args[1] isn't a trackable value, so scanning from 2 is safe for both
+        # `:invoke` and `:call` (whose func at args[1] is likewise skipped).
+        start = 2
         for i in start:length(s.args)
             is_trackable_value(s.args[i]) && push!(result, s.args[i])
         end

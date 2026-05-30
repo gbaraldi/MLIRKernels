@@ -1774,6 +1774,49 @@ function _outline_mi(@nospecialize(ci))
     return mi, mi.specTypes
 end
 
+# Flatten a struct/closure call operand into leaf operand Values, in the SAME
+# order `_flatten_struct_arg!` produces the func.func's params (DFS over
+# `fieldnames`, singletons skipped, arrays→memref / numbers→scalar / structs
+# recurse). Two operand shapes:
+#  - flattened-arg-tracked (a closure `getfield(broadcasted,:f)` or a flattened
+#    arg): leaves come from the OUTER kernel's `captured` map at the extended path.
+#  - a materialised value (a `Core.tuple`/loaded struct): its `!llvm.struct`/vector
+#    is leaf-flattened (built that way), so `_decompose_leaves` yields the leaves.
+function _outline_operand_leaves!(lc::LowerCtx, @nospecialize(op), @nospecialize(T),
+                                   ops::Vector{IR.Value})
+    if op isa SSAValue && haskey(lc.field_paths, op.id)
+        (slot, base) = lc.field_paths[op.id]
+        _outline_path_leaves!(lc, slot, base, T, ops)
+    elseif op isa Argument && op.n in lc.flattened_slots
+        _outline_path_leaves!(lc, op.n, (), T, ops)
+    else
+        v = resolve_value_or_const(lc, op)
+        v === nothing && error("outlined call: cannot resolve operand $op::$T")
+        (T <: Number || T === Bool) ? push!(ops, v) : append!(ops, _decompose_leaves(v))
+    end
+end
+
+# Leaves of a flattened-arg operand rooted at `(slot, base)`, mirroring
+# `_flatten_struct_arg!`: a scalar/array leaf reads its captured synthetic slot;
+# a struct field recurses with an extended path.
+function _outline_path_leaves!(lc::LowerCtx, slot::Int, base::Tuple,
+                                @nospecialize(T), ops::Vector{IR.Value})
+    if T <: Number || T === Bool || T <: DenseArray
+        ck = get(lc.captured, (slot, base), nothing)
+        ck === nothing && error("outlined call: capture leaf ($slot, $base)::$T not found")
+        v = get(lc.arg_vals, ck[1], nothing)
+        v === nothing && error("outlined call: capture leaf ($slot, $base) unbound")
+        push!(ops, v); return
+    end
+    (isstructtype(T) && !isempty(fieldnames(T))) ||
+        error("outlined call: unsupported capture leaf $T at ($slot, $base)")
+    for fn in fieldnames(T)
+        FT = fieldtype(T, fn)
+        Base.issingletontype(FT) && continue
+        _outline_path_leaves!(lc, slot, (base..., fn), FT, ops)
+    end
+end
+
 # Emit `func.call @outlined(operands…)` for an un-dispatchable `:invoke`, queueing
 # the callee for `func.func` emission (deduped per signature).
 function emit_outlined_call!(lc::LowerCtx, idx::Int, @nospecialize(ci),
@@ -1786,18 +1829,24 @@ function emit_outlined_call!(lc::LowerCtx, idx::Int, @nospecialize(ci),
         s
     end
     # Operands: the call's args in MI-signature order (callee = arg 1 = the
-    # function/closure, args[k] = arg k+1), keeping only the value (non-ghost)
-    # ones — matching the func.func's param list.
+    # function/closure, args[k] = arg k+1), value (non-ghost) ones only, each
+    # FLATTENED to leaves matching the func.func's param list (see
+    # `_outline_operand_leaves!`).
     sigparams = collect(sig.parameters)
     call_ops = Any[callee, args...]
     operands = IR.Value[]
     for (k, AT) in enumerate(sigparams)
         _outline_is_value_arg(AT) || continue
-        v = resolve_value_or_const(lc, call_ops[k])
-        v === nothing && error("outlined call $sym: cannot resolve operand $(call_ops[k])::$AT")
-        push!(operands, v)
+        ATw = Core.Compiler.widenconst(AT)
+        if ATw <: Number
+            v = resolve_value_or_const(lc, call_ops[k])
+            v === nothing && error("outlined call $sym: cannot resolve operand $(call_ops[k])::$AT")
+            push!(operands, v)
+        else
+            _outline_operand_leaves!(lc, call_ops[k], ATw, operands)
+        end
     end
-    ret = (typ === Nothing || typ === Nothing) ? IR.Type[] : IR.Type[mlir_elem_type(typ)]
+    ret = (typ === Nothing) ? IR.Type[] : IR.Type[mlir_elem_type(typ)]
     res = _func.call(operands; result_0=ret, callee=parse(IR.Attribute, "@" * sym))
     return isempty(ret) ? nothing : IR.result(res)
 end
@@ -1822,18 +1871,35 @@ function _emit_outlined_func!(lc::LowerCtx, @nospecialize(mi), sym::String)
     cl.spmd = true; cl.lane_width = 1
 
     # Classify args → params (value) / consts (ghost). SCI arg slots are 1-based.
+    # A struct/closure value arg is FLATTENED via `_flatten_struct_arg!` (the same
+    # machinery as kernel args): captured fields → scalar/memref params at synthetic
+    # (negative) slots, recorded in `cl.captured` so the body's `getfield(arg, …)`
+    # chains resolve. The call site produces matching operands in the same order.
     param_types = IR.Type[]
     param_slots = Int[]
+    pj = Type[]; pk = Symbol[]; syn = 0          # _flatten_struct_arg! bookkeeping
+    global_attr = parse(IR.Attribute, "#gpu.address_space<global>")
     for (i, AT) in enumerate(sci.argtypes)
         ATw = Core.Compiler.widenconst(AT)
         if AT isa Core.Const
             cl.arg_const[i] = AT.val
-        elseif _outline_is_value_arg(AT) && ATw <: Number
+        elseif !_outline_is_value_arg(AT)
+            # singleton/Type ghost arg: nothing to bind (never used at runtime).
+        elseif ATw <: Number
             push!(param_types, mlir_elem_type(ATw)); push!(param_slots, i)
-        elseif _outline_is_value_arg(AT)
-            error("outlined func $sym: non-scalar arg #$i::$ATw unsupported yet (captures)")
+        elseif ATw <: DenseArray
+            eT = eltype(ATw); N = ndims(ATw)
+            push!(param_types, IR.MemRefType(mlir_memref_elem_type(eT),
+                fill(Int(IR.dynsize()), N), IR.Attribute(), global_attr))
+            push!(param_slots, i); cl.arg_elem_types[i] = eT
+        elseif isstructtype(ATw) && !isempty(fieldnames(ATw))
+            (_struct_vec_info(ATw) !== nothing ||
+             _hetero_struct_info(ATw) !== nothing) && (cl.struct_arg_types[i] = ATw)
+            syn = _flatten_struct_arg!(cl, ATw, i, (), syn,
+                param_types, param_slots, pj, pk, global_attr)
+        else
+            error("outlined func $sym: unsupported arg #$i::$ATw")
         end
-        # singleton/Type ghost args: nothing to bind (never used at runtime).
     end
     ret_ts = (rt === Nothing) ? IR.Type[] : IR.Type[mlir_elem_type(rt)]
     ftype = IR.FunctionType(param_types, ret_ts)

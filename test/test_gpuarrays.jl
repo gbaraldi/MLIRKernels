@@ -146,6 +146,18 @@ mk(v) = MLIRArray(CUDA.CuArray(v))
             @test A(ri) == ei            # CartesianIndex{2} array, nested struct
             @test A(argmin(fm; dims=d)) == argmin(FM; dims=d)
         end
+        # 3-D findmax(;dims): the linear→CartesianIndex{3} conversion is a closure
+        # Julia's inliner declines, so it lowers as an OUTLINED `func.call` whose
+        # `func.func` flattens the closure's captured array dims as params (the
+        # outlined-call worklist). Also a DCE/use-tracking regression: the invoke
+        # callee must be counted as a use or the closure's getfield is dropped.
+        fm3 = mk(rand(Float32, 4, 3, 2)); FM3 = A(fm3)
+        for d in (1, 2, 3)
+            rv, ri = findmax(fm3; dims=d); CUDA.synchronize()
+            ev, ei = findmax(FM3; dims=d)
+            @test A(rv) == ev
+            @test A(ri) == ei            # CartesianIndex{3} array
+        end
     end
 end
 
