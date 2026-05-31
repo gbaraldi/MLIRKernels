@@ -12,6 +12,8 @@ module Frontend
 
 const CC = Core.Compiler
 using IRStructurizer: StructuredIRCode
+using CompilerCaching: CacheView, @setup_caching, match_method_instance,
+                       typeinf!, get_source
 
 # ----------------------------------------------------------------------------
 # Frontend intrinsics — markers the MLIRKernels walker recognises by name.
@@ -141,58 +143,100 @@ Base.Experimental.@MethodTable METHOD_TABLE
 # Interpreter
 # ----------------------------------------------------------------------------
 
+# A custom (non-`nothing`) cache owner is REQUIRED for overlays to apply to
+# Base/stdlib callees. With `nothing`, the interpreter reuses Julia's native
+# (precompiled) CodeInstances — e.g. Base's range machinery already resolved
+# `steprange_last` to the un-lowerable default, so our `@overlay` was bypassed.
+# A private owner forces re-inference of reachable methods through our overlay
+# method table. It also shards our `CompilerCaching` results onto their own
+# `CodeInstance`s. (`@setup_caching` below derives `cache_owner` from this.)
+const FRONTEND_OWNER = :MLIRKernelsFrontend
+
+# The `V` token `@setup_caching` requires: `finish!` stacks a fresh one on each
+# inferred CI's `analysis_results`, which is what wires the CI into CompilerCaching's
+# (cross-session-serialisable) cache keyed by our owner. We don't memoise the SCI in
+# it (the SCI is mutated downstream, so it's rebuilt fresh per call — see
+# `structured`); the inference cached on the CI itself is the win. Mutable so it's
+# egal-matched when deserialised from a package image (mirrors cuTile's CuTileResults).
+mutable struct FrontendResults
+    FrontendResults() = new()
+end
+
 struct FrontendInterpreter <: CC.AbstractInterpreter
-    world::UInt
+    cache::CacheView{Symbol, FrontendResults}
     method_table::CC.CachedMethodTable{CC.OverlayMethodTable}
     inf_cache::Vector{CC.InferenceResult}
     inf_params::CC.InferenceParams
     opt_params::CC.OptimizationParams
 end
 
-function FrontendInterpreter(world::UInt=Base.get_world_counter())
-    mt = CC.CachedMethodTable(CC.OverlayMethodTable(world, METHOD_TABLE))
+function FrontendInterpreter(cache::CacheView{Symbol, FrontendResults})
+    mt = CC.CachedMethodTable(CC.OverlayMethodTable(cache.world, METHOD_TABLE))
     # DEFAULT OptimizationParams — crucially NOT inline_cost_threshold=typemax,
     # so `@noinline` on our intrinsics is honoured and the marker calls survive.
-    return FrontendInterpreter(world, mt, CC.InferenceResult[],
+    return FrontendInterpreter(cache, mt, CC.InferenceResult[],
                                CC.InferenceParams(), CC.OptimizationParams())
 end
+FrontendInterpreter(world::UInt=Base.get_world_counter()) =
+    FrontendInterpreter(CacheView{FrontendResults}(FRONTEND_OWNER, world))
 
 CC.InferenceParams(i::FrontendInterpreter)     = i.inf_params
 CC.OptimizationParams(i::FrontendInterpreter)  = i.opt_params
 CC.get_inference_cache(i::FrontendInterpreter) = i.inf_cache
 CC.method_table(i::FrontendInterpreter)        = i.method_table
-# A custom (non-`nothing`) cache owner is REQUIRED for overlays to apply to
-# Base/stdlib callees. With `nothing`, the interpreter reuses Julia's native
-# (precompiled) CodeInstances — e.g. Base's range machinery already resolved
-# `steprange_last` to the un-lowerable default, so our `@overlay` was bypassed.
-# A private owner forces re-inference of reachable methods through our overlay
-# method table.
-CC.cache_owner(::FrontendInterpreter)          = :MLIRKernelsFrontend
 @static if isdefined(CC, :get_inference_world)
-    CC.get_inference_world(i::FrontendInterpreter) = i.world
+    CC.get_inference_world(i::FrontendInterpreter) = i.cache.world
 else
-    CC.get_world_counter(i::FrontendInterpreter) = i.world
+    CC.get_world_counter(i::FrontendInterpreter) = i.cache.world
 end
+
+# Generates `CC.cache_owner(interp) = FRONTEND_OWNER` and a `CC.finish!` that
+# stacks a fresh `FrontendResults()` onto each inferred CI's analysis results.
+@setup_caching FrontendInterpreter.cache
 
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
 
 """
-    structured(f, argtypes::Tuple) -> (sci::StructuredIRCode, rettype)
+    structured(f, argtypes::Type) -> (sci::StructuredIRCode, rettype)
 
 Infer `f(argtypes...)` under the Frontend interpreter (our overlays + own
 intrinsics, default opt params) and structurize the resulting IRCode into a
 `StructuredIRCode`.
+
+Caching (cuTile-style, via `CompilerCaching`): the INFERENCE is memoised on the
+`CodeInstance` keyed by the resolved `MethodInstance` — a hit skips re-inference
+(the expensive part), and redefining a kernel makes a new method → new MI → miss
+→ re-infer (no staleness). A FRESH `StructuredIRCode` is built on every call,
+because the SCI is mutated downstream (`optimize_sci!` / lowering) and must NOT be
+a shared cached object.
 """
 function structured(@nospecialize(f), @nospecialize(argtypes::Type))
-    tt = Tuple(argtypes.parameters)
-    interp = FrontendInterpreter()
-    results = Base.code_ircode(f, tt; interp)
-    isempty(results) && error("Frontend.structured: inference produced no results for $f$tt")
-    ir, rettype = results[1]
-    sci = StructuredIRCode(ir)
-    return sci, CC.widenconst(rettype)
+    world = Base.get_world_counter()
+    cache = CacheView{FrontendResults}(FRONTEND_OWNER, world)
+    mi = match_method_instance(f, argtypes)
+    mi === nothing && return _structured_uncached(f, argtypes, cache)  # no unique method
+    ci = get(cache, mi, nothing)
+    if ci === nothing
+        typeinf!(cache, FrontendInterpreter(cache), mi)               # infer + cache on the CI
+        ci = get(cache, mi, nothing)
+    end
+    ci === nothing && return _structured_uncached(f, argtypes, cache)
+    src = get_source(ci)
+    src === nothing && return _structured_uncached(f, argtypes, cache)
+    ir = CC.inflate_ir(src, mi)                                       # fresh IRCode from cached inference
+    return StructuredIRCode(ir), CC.widenconst(ci.rettype)
+end
+
+# Uncached fallback: run inference via the convenience entry (still under our
+# interpreter, so overlays apply) and structurize directly. Used when no unique
+# method matches or the CI source isn't retrievable.
+function _structured_uncached(@nospecialize(f), @nospecialize(argtypes::Type), cache::CacheView)
+    r = Base.code_ircode(f, Tuple(argtypes.parameters); interp=FrontendInterpreter(cache))
+    isempty(r) && error("Frontend.structured: inference produced no results for $f$argtypes")
+    ir, rettype = r[1]
+    return StructuredIRCode(ir), CC.widenconst(rettype)
 end
 
 end # module Frontend
