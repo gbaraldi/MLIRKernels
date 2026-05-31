@@ -174,6 +174,11 @@ mutable struct LowerCtx
     # by `resolve_const`/`resolve_value_or_const` so const-consumers (e.g. the
     # `@localmem T dims` element type / dims) and value-consumers both resolve it.
     ssa_consts::Dict{Int, Any}
+    # SSA id → its inferred Julia type. MLIR integers are SIGNLESS, so this is the
+    # only record of a value's signedness — the widening primitives (`_coerce_*!`)
+    # consult it to zero/sign-extend by the SOURCE's signedness (a `UInt8` widened
+    # to a signed `Int32` must zero-extend). Populated for every emitted SSA result.
+    ssa_julia_types::Dict{Int, Type}
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -192,7 +197,7 @@ LowerCtx(ctx, mod) = LowerCtx(
     Dict{Int, Tuple{Int, Tuple}}(), Dict{Int, Int}(),
     Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}(),
     Dict{Int, Type}(), Dict{Int, Type}(), OutlineState(), false,
-    Dict{Int, Any}())
+    Dict{Int, Any}(), Dict{Int, Type}())
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -1212,6 +1217,7 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         v = walk_stmt!(lc, idx, stmt, typ)
         if v !== nothing
             lc.ssa_vals[idx] = v
+            typ isa Type && (lc.ssa_julia_types[idx] = typ)   # source signedness for widening
             # Tag homogeneous-struct values (a `vector<N×T>`) so `getfield`
             # extracts the right lane; propagates through any op via its SCI type.
             typ isa Type && (_struct_vec_info(typ) !== nothing ||
@@ -1255,10 +1261,11 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
                 resolved === nothing &&
                     error("scf.yield: cannot resolve operand $v")
                 # If the if-result type was promoted (numeric union), coerce this
-                # branch's yield to the common type so both branches agree.
+                # branch's yield to the common type so both branches agree — using
+                # the branch value's SOURCE type so an unsigned branch zero-extends.
                 if k <= length(yield_types) && yield_types[k] isa Type &&
                    yield_types[k] <: Number && _struct_vec_info(yield_types[k]) === nothing
-                    resolved = _coerce_numeric!(resolved, yield_types[k])
+                    resolved = _coerce_numeric!(resolved, yield_types[k]; src_T=_operand_jltype(lc, v))
                 end
                 push!(vals, resolved)
             end
@@ -1293,7 +1300,7 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
                 # accumulator transiently widened to `Int64` by `acc + 1`), which
                 # otherwise trips the scf.for verifier ("iter_arg and yielded value
                 # have different type"). No-op when the widths already match.
-                k <= length(carried_types) && (resolved = _coerce_to_type!(resolved, carried_types[k]))
+                k <= length(carried_types) && (resolved = _coerce_to_type!(resolved, carried_types[k]; src_T=_operand_jltype(lc, v)))
                 push!(vals, resolved)
             end
             _scf.yield(vals)
@@ -1316,7 +1323,7 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         for (k, v) in enumerate(term.args)
             r = resolve_value_or_const(lc, v)
             r === nothing && error("scf.condition: cannot resolve forwarded operand $v")
-            k <= length(carried_types) && (r = _coerce_to_type!(r, carried_types[k]))
+            k <= length(carried_types) && (r = _coerce_to_type!(r, carried_types[k]; src_T=_operand_jltype(lc, v)))
             push!(fwd, r)
         end
         _scf.condition(cond, fwd)
@@ -1330,7 +1337,7 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
         for (k, v) in enumerate(term.values)
             r = resolve_value_or_const(lc, v)
             r === nothing && error("scf.yield: cannot resolve operand $v")
-            k <= length(carried_types) && (r = _coerce_to_type!(r, carried_types[k]))
+            k <= length(carried_types) && (r = _coerce_to_type!(r, carried_types[k]; src_T=_operand_jltype(lc, v)))
             push!(vals, r)
         end
         _scf.yield(vals)
@@ -1353,7 +1360,7 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
                     _func.return_(IR.Value[undef_value(lc, func_ret_jtype)])
                 end
             else
-                isempty(func_ret_type) || (rv = _coerce_to_type!(rv, func_ret_type[1]))
+                isempty(func_ret_type) || (rv = _coerce_to_type!(rv, func_ret_type[1]; src_T=_operand_jltype(lc, term.val)))
                 _func.return_(IR.Value[rv])
             end
         elseif isempty(func_ret_type)
@@ -2253,7 +2260,11 @@ function emit_binop_value!(lc::LowerCtx, args, op_fn, @nospecialize(result_T)=no
     (a === nothing || b === nothing) &&
         error("$(op_fn): unresolved operands ($(args[1]), $(args[2]))")
     a, b = _spmd_harmonise(lc, a, b)
-    a, b = _harmonise_binop_widths(a, b, result_T)
+    # Thread each operand's source Julia type (the CGVal-style value↔type pairing)
+    # so any width-harmonising extension zero/sign-extends by the SOURCE signedness.
+    a, b = _harmonise_binop_widths(a, b, result_T;
+                                   a_T=_operand_jltype(lc, args[1]),
+                                   b_T=_operand_jltype(lc, args[2]))
     return IR.result(op_fn(a, b))
 end
 
@@ -2278,17 +2289,25 @@ function _promote_numeric_type(@nospecialize(T))
     return nothing
 end
 
-function _harmonise_binop_widths(a::IR.Value, b::IR.Value, @nospecialize(result_T))
+function _harmonise_binop_widths(a::IR.Value, b::IR.Value, @nospecialize(result_T);
+                                 a_T::Union{Nothing,Type}=nothing,
+                                 b_T::Union{Nothing,Type}=nothing)
     pt = _promote_numeric_type(result_T)
     if pt !== nothing
-        return _coerce_numeric!(a, pt), _coerce_numeric!(b, pt)
+        return _coerce_numeric!(a, pt; src_T=a_T), _coerce_numeric!(b, pt; src_T=b_T)
     end
     ta, tb = IR.type(a), IR.type(b)
     ta == tb && return a, b
     wa, wb = _int_width(ta), _int_width(tb)
     if wa != 0 && wb != 0
-        return wa < wb ? (IR.result(_arith.extsi(a; out=tb)), b) :
-                         (a, IR.result(_arith.extsi(b; out=ta)))
+        # Widen the narrower operand by ITS source signedness (zero-extend unsigned).
+        if wa < wb
+            ext = _ext_unsigned(a_T, nothing) ? _arith.extui : _arith.extsi
+            return IR.result(ext(a; out=tb)), b
+        else
+            ext = _ext_unsigned(b_T, nothing) ? _arith.extui : _arith.extsi
+            return a, IR.result(ext(b; out=ta))
+        end
     end
     fa, fb = _float_width(ta), _float_width(tb)
     if fa != 0 && fb != 0
@@ -2321,7 +2340,7 @@ const _RAW_CORE_INTRINSICS = Set{Symbol}([
     :slt_int, :sle_int, :ult_int, :ule_int, :eq_int, :ne_int,
     :lt_float, :le_float, :eq_float, :ne_float,
     :sext_int, :zext_int, :trunc_int, :bitcast,
-    :sitofp, :fptosi, :fpext, :fptrunc,
+    :sitofp, :uitofp, :fptosi, :fptoui, :fpext, :fptrunc,
     :ifelse, Symbol("==="),
     # Unary float math intrinsics (raw Julia names; the named-intrinsic path
     # uses :absf/:sqrt/etc, but the Frontend path hands them raw). One operand,
@@ -2393,23 +2412,65 @@ end
 # scf.if yields a numeric *union* across branches (e.g. `init=0::Int64` mixed
 # with an `Int32` array): the branches are promoted to a common type, so each
 # branch's yield must be widened/converted to it.
-function _coerce_numeric!(v::IR.Value, target_T::Type)
+# A codegen value paired with its SOURCE Julia type — MLIRKernels' analogue of
+# cuTile's `CGVal` and Julia codegen's `jl_cgval_t`. MLIR integers/floats are
+# SIGNLESS, so `jltype` is the only record of signedness; every sign-dependent
+# emission (extsi/extui, sitofp/uitofp, fptosi/fptoui, width harmonisation) reads
+# it rather than guessing from the target. `jltype === nothing` ⇒ unknown (fall
+# back to the target's signedness — the legacy heuristic, correct for signed).
+struct CGVal
+    value::IR.Value
+    jltype::Union{Type,Nothing}
+end
+
+# Resolve an operand reference to a `CGVal` (value + its source Julia type).
+function resolve_cgval(lc::LowerCtx, @nospecialize(ref))
+    v = resolve_value_or_const(lc, ref)
+    v === nothing ? nothing : CGVal(v, _operand_jltype(lc, ref))
+end
+
+# The inferred Julia type of a walker operand `op` (an `SSAValue`, a literal, …),
+# for source-signedness-correct integer widening. `nothing` when unknown (the
+# coercion then falls back to the target's signedness). The SSA map is the single
+# source of signedness truth, since the emitted MLIR value is signless.
+function _operand_jltype(lc::LowerCtx, @nospecialize(op))
+    if op isa SSAValue
+        haskey(lc.ssa_julia_types, op.id) && return lc.ssa_julia_types[op.id]
+        c = get(lc.ssa_consts, op.id, nothing)
+        (c isa Bool || c isa Number) && return typeof(c)
+        return nothing
+    end
+    op isa QuoteNode && (op = op.value)
+    (op isa Bool || op isa Number) && return typeof(op)
+    return nothing
+end
+
+# Whether widening should ZERO-extend: by the source's signedness when known,
+# else the target's (back-compat fallback for un-threaded sites).
+_ext_unsigned(@nospecialize(src_T), @nospecialize(target_T)) =
+    src_T isa Type ? (src_T <: Unsigned) : (target_T isa Type && target_T <: Unsigned)
+
+function _coerce_numeric!(v::IR.Value, target_T::Type; src_T::Union{Nothing,Type}=nothing)
     out_t = _conv_out_type(v, target_T)
     IR.type(v) == out_t && return v
     src_int = _int_width(IR.type(v)) != 0
     dst_int = target_T <: Integer
     if src_int && dst_int
         wv, wt = _int_width(IR.type(v)), _int_width(out_t)
-        # Widen: ZERO-extend an unsigned target, SIGN-extend a signed one. MLIR
-        # integers are signless, so the Julia `target_T` carries the signedness —
-        # `extsi` for unsigned silently corrupts the high bits of any value ≥ 2^(w-1).
-        wt > wv && return target_T <: Unsigned ?
+        # Widen by the SOURCE's signedness — MLIR ints are signless, so an unsigned
+        # source (e.g. `UInt8`) must ZERO-extend even into a signed target (`Int32`),
+        # else any value ≥ 2^(w-1) is silently corrupted. `src_T` (the operand's Julia
+        # type, threaded from the walker) is authoritative; with it absent we fall
+        # back to the target's signedness (the previous, occasionally-wrong heuristic).
+        wt > wv && return _ext_unsigned(src_T, target_T) ?
             IR.result(_arith.extui(v; out=out_t)) : IR.result(_arith.extsi(v; out=out_t))
         return wt < wv ? IR.result(_arith.trunci(v; out=out_t)) : v
-    elseif src_int          # int → float
-        return IR.result(_arith.sitofp(v; out=out_t))
-    elseif dst_int          # float → int
-        return IR.result(_arith.fptosi(v; out=out_t))
+    elseif src_int          # int → float: UNSIGNED source → uitofp, signed → sitofp
+        return _ext_unsigned(src_T, nothing) ?
+            IR.result(_arith.uitofp(v; out=out_t)) : IR.result(_arith.sitofp(v; out=out_t))
+    elseif dst_int          # float → int: UNSIGNED target → fptoui, signed → fptosi
+        return target_T <: Unsigned ?
+            IR.result(_arith.fptoui(v; out=out_t)) : IR.result(_arith.fptosi(v; out=out_t))
     else                    # float → float
         wv, wt = _float_width(IR.type(v)), _float_width(out_t)
         return wt > wv ? IR.result(_arith.extf(v; out=out_t)) :
@@ -2417,28 +2478,30 @@ function _coerce_numeric!(v::IR.Value, target_T::Type)
     end
 end
 
-# Coerce `v` to a target MLIR type. Used at scf control-flow edges (while carried
-# values) where the target is a signless MLIR type rather than a Julia type — so it
-# can't know signedness and SIGN-extends on widening. Correct for signed ints (the
-# usual carried accumulators); a narrow gap remains for an UNSIGNED value ≥ 2^(w-1)
-# carried across a while loop with width change (rare — the scf.if-yield path uses
-# `_coerce_numeric!`, which has the Julia type and zero-extends unsigned correctly).
-# No-op when already matching; leaves non-numerics be.
-function _coerce_to_type!(v::IR.Value, target_t::IR.Type)
+# Coerce `v` to a target MLIR type at scf control-flow edges (while/loop carried
+# values), where the target is a signless MLIR type. Pass `src_T` (the carried
+# value's Julia type) so int widening / int↔float conversions follow the SOURCE
+# signedness (zero-extend / uitofp for unsigned); with `src_T===nothing` it
+# sign-extends (correct for the usual signed accumulators). No-op when already
+# matching; leaves non-numerics be.
+function _coerce_to_type!(v::IR.Value, target_t::IR.Type; src_T::Union{Nothing,Type}=nothing)
     src = IR.type(v)
     src == target_t && return v
+    unsigned = src_T isa Type && src_T <: Unsigned
     si, di = _int_width(src), _int_width(target_t)
     sf, df = _float_width(src), _float_width(target_t)
     if si != 0 && di != 0
-        return di > si ? IR.result(_arith.extsi(v; out=target_t)) :
-               IR.result(_arith.trunci(v; out=target_t))
+        di > si && return unsigned ? IR.result(_arith.extui(v; out=target_t)) :
+                                     IR.result(_arith.extsi(v; out=target_t))
+        return IR.result(_arith.trunci(v; out=target_t))
     elseif sf != 0 && df != 0
         return df > sf ? IR.result(_arith.extf(v; out=target_t)) :
                IR.result(_arith.truncf(v; out=target_t))
     elseif si != 0 && df != 0
-        return IR.result(_arith.sitofp(v; out=target_t))
+        return unsigned ? IR.result(_arith.uitofp(v; out=target_t)) :
+                          IR.result(_arith.sitofp(v; out=target_t))
     elseif sf != 0 && di != 0
-        return IR.result(_arith.fptosi(v; out=target_t))
+        return IR.result(_arith.fptosi(v; out=target_t))   # target signedness unknown here
     end
     return v
 end
@@ -2530,7 +2593,8 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
     name === :ne_float && return emit_cmpf!(lc, Any[args[1], args[2], CP.NotEqual, ComparisonOrdering.Unordered], typ)
     # Width / type conversions. Raw arg order is (to_type, value).
     if name === :sext_int || name === :zext_int || name === :trunc_int ||
-       name === :sitofp || name === :fptosi || name === :fpext || name === :fptrunc
+       name === :sitofp || name === :uitofp || name === :fptosi || name === :fptoui ||
+       name === :fpext || name === :fptrunc
         target_T = something(resolve_const(lc, args[1]), args[1])
         target_T isa Type || error("$name: target type must be a Type, got $(args[1])")
         v = resolve_value_or_const(lc, args[2])
@@ -2550,7 +2614,9 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
         name === :zext_int  && return IR.result(_arith.extui(v; out=out_t))
         name === :trunc_int && return IR.result(_arith.trunci(v; out=out_t))
         name === :sitofp    && return IR.result(_arith.sitofp(v; out=out_t))
+        name === :uitofp    && return IR.result(_arith.uitofp(v; out=out_t))  # unsigned int→float
         name === :fptosi    && return IR.result(_arith.fptosi(v; out=out_t))
+        name === :fptoui    && return IR.result(_arith.fptoui(v; out=out_t))  # float→unsigned int
         name === :fpext     && return IR.result(_arith.extf(v; out=out_t))    # Float32→Float64
         name === :fptrunc   && return IR.result(_arith.truncf(v; out=out_t))  # Float64→Float32
     elseif name === :bitcast
@@ -3459,6 +3525,7 @@ function _emit_loop_region!(lc::LowerCtx, block::Block, carried::Vector{IR.Type}
     i1 = IR.Type(Bool)
     _walk(idx, e) = (v = walk_stmt!(lc, idx, e.stmt, e.type);
         v === nothing || (lc.ssa_vals[idx] = v;
+            e.type isa Type && (lc.ssa_julia_types[idx] = e.type);
             e.type isa Type && (_struct_vec_info(e.type) !== nothing ||
                 _hetero_struct_info(e.type) !== nothing) && (lc.struct_vals[idx] = e.type)))
     term = block.terminator
@@ -3468,7 +3535,7 @@ function _emit_loop_region!(lc::LowerCtx, block::Block, carried::Vector{IR.Type}
         for (k, rv) in enumerate(term.values)
             v = resolve_value_or_const(lc, rv)
             v === nothing && error("scf.while(loop): cannot resolve carried value $rv")
-            push!(out, _coerce_to_type!(v, carried[k]))
+            push!(out, _coerce_to_type!(v, carried[k]; src_T=_operand_jltype(lc, rv)))
         end
         push!(out, IR.result(_arith.constant(;
             value=IR.Attribute(term isa BreakOp, i1), result=i1)))
@@ -3519,7 +3586,7 @@ function emit_loop!(lc::LowerCtx, idx::Int, op::LoopOp, @nospecialize(typ))
     for (k, iv) in enumerate(op.init_values)
         v = resolve_value_or_const(lc, iv)
         v === nothing && error("scf.while(loop): cannot resolve init $iv")
-        push!(init_vals, _coerce_to_type!(v, carried[k]))
+        push!(init_vals, _coerce_to_type!(v, carried[k]; src_T=_operand_jltype(lc, iv)))
     end
     false_c = IR.result(_arith.constant(; value=IR.Attribute(false, i1), result=i1))
     push!(init_vals, false_c)
@@ -4264,7 +4331,7 @@ function emit_spmd_memoryrefset!(lc::LowerCtx, args, @nospecialize(typ))
     if off.elem_type isa Type && off.elem_type <: Number &&
        _struct_vec_info(off.elem_type) === nothing &&
        IR.type(val_v) != _conv_out_type(val_v, off.elem_type)
-        val_v = _coerce_numeric!(val_v, off.elem_type)
+        val_v = _coerce_numeric!(val_v, off.elem_type; src_T=_operand_jltype(lc, args[2]))
     end
 
     if isempty(off.idx_shape)

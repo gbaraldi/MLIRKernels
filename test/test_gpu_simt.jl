@@ -210,6 +210,22 @@ end
     @inbounds out[i] = UInt64(r)
 end
 
+# UNSIGNED source widened to a SIGNED target via numeric union: `flag ? a[i]::UInt8
+# : Int32(7)` promotes to Int32, and the implicit widening must read the SOURCE
+# signedness (zero-extend the UInt8) — keying on the signed *target* corrupts any
+# value ≥ 128 (200 → -56). This exercises the CGVal value↔type pairing.
+@kernel function _g_uwiden_signed!(out, @Const(a), flag::Bool)
+    i = @index(Global, Linear)
+    x = flag ? (@inbounds a[i]) : Int32(7)
+    @inbounds out[i] = Int32(x)
+end
+
+# Unsigned int → float must emit `uitofp`, not `sitofp` (UInt8(200) → 200.0f0).
+@kernel function _g_uitofp!(out, @Const(a))
+    i = @index(Global, Linear)
+    @inbounds out[i] = Float32(a[i])
+end
+
 # Runtime dimension extent: `size(a, d)` with a runtime `d` reads
 # `getfield(a.size::Tuple, d)` with a non-const index → a select-chain over the
 # per-dim `memref.dim`s.
@@ -541,6 +557,14 @@ end
         uw = MLIRArray(CUDA.CuArray(UInt8[200, 5, 130, 255])); uwo = MLIRArray(CUDA.zeros(UInt64, 4))
         _g_uwiden!(backend, 4)(uwo, uw, true; ndrange=4); CUDA.synchronize()
         @test Array(uwo) == UInt64[200, 5, 130, 255]           # zero-extended, not 0xFF…C8
+        # UNSIGNED source widened to a SIGNED target (the CGVal source-signedness fix)
+        uws = MLIRArray(CUDA.CuArray(UInt8[200, 5, 130, 255])); uwso = MLIRArray(CUDA.zeros(Int32, 4))
+        _g_uwiden_signed!(backend, 4)(uwso, uws, true; ndrange=4); CUDA.synchronize()
+        @test Array(uwso) == Int32[200, 5, 130, 255]           # zero-extended into Int32, not -56…
+        # unsigned int → float must be uitofp (200 → 200.0), not sitofp (→ -56.0)
+        ufa = MLIRArray(CUDA.CuArray(UInt8[200, 5, 130, 255])); ufo = MLIRArray(CUDA.zeros(Float32, 4))
+        _g_uitofp!(backend, 4)(ufo, ufa; ndrange=4); CUDA.synchronize()
+        @test Array(ufo) == Float32[200, 5, 130, 255]
 
         # `size(a, d)` with a RUNTIME `d` — getfield(a.size, d) at a non-const
         # index → select-chain over memref.dims.
