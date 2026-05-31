@@ -183,6 +183,14 @@ struct P2; x::Float32; y::Float32; end
 Base.:+(a::P2, b::P2) = P2(a.x + b.x, a.y + b.y)
 Base.zero(::Type{P2}) = P2(0.0f0, 0.0f0)
 
+# P3 = 3×Float32: a homogeneous struct whose field count is NOT a power of 2, so
+# `vector<3×f32>` would have a padded 16-byte ABI stride ≠ Julia's sizeof = 12.
+# It must take the heterogeneous byte-carrier path (correct stride) — otherwise
+# every element past index 0 reads/writes the wrong address (silent corruption).
+struct P3; x::Float32; y::Float32; z::Float32; end
+Base.:+(a::P3, b::P3) = P3(a.x + b.x, a.y + b.y, a.z + b.z)
+Base.zero(::Type{P3}) = P3(0.0f0, 0.0f0, 0.0f0)
+
 @testset "struct/Complex element types on MLIRCUDABackend" begin
     if !CUDA.functional()
         @test true
@@ -205,5 +213,15 @@ Base.zero(::Type{P2}) = P2(0.0f0, 0.0f0)
         d = mk([P2(0.0f0, 0.0f0) for _ in 1:n])
         map!(p -> P2(2p.x, 2p.y), d, ps); CUDA.synchronize()
         @test A(d)[5] == P2(10.0f0, 20.0f0)
+
+        # non-power-of-2 homogeneous struct (P3 = 3×Float32, sizeof 12): must stride
+        # correctly at EVERY index (not just 0) via the byte-carrier path.
+        p3 = mk([P3(Float32(i), Float32(2i), Float32(3i)) for i in 1:n])
+        q3 = mk([P3(1.0f0, 1.0f0, 1.0f0) for _ in 1:n])
+        r3 = A(p3 .+ q3)
+        @test r3 == [P3(Float32(i)+1, Float32(2i)+1, Float32(3i)+1) for i in 1:n]  # all elems
+        e3 = mk([P3(0.0f0, 0.0f0, 0.0f0) for _ in 1:n])
+        map!(p -> P3(2p.x, 2p.y, 2p.z), e3, p3); CUDA.synchronize()
+        @test A(e3)[7] == P3(14.0f0, 28.0f0, 42.0f0)                                # getfield+new
     end
 end

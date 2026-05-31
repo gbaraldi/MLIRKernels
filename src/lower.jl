@@ -199,16 +199,24 @@ LowerCtx(ctx, mod) = LowerCtx(
 # ----------------------------------------------------------------------------
 
 # A homogeneous bits-struct (all fields the same scalar type, e.g. `ComplexF32` =
-# 2×Float32, `Point{Float32}` = 3×Float32) maps to `vector<Nfields × fieldtype>`,
-# which matches its array-of-structs memory layout. Returns (nfields, fieldtype)
-# or `nothing`. Excludes structs whose field isn't a scalar (e.g. `CartesianIndex`,
-# whose single field is an NTuple — kept on the transient `new_structs` path).
+# 2×Float32) maps to `vector<Nfields × fieldtype>`, which matches its
+# array-of-structs memory layout. Returns (nfields, fieldtype) or `nothing`.
+# Excludes structs whose field isn't a scalar (e.g. `CartesianIndex`, whose single
+# field is an NTuple — kept on the transient `new_structs` path).
+#
+# CRITICAL: only when the `vector<N×ft>` ABI size equals Julia's `sizeof(T)` — i.e.
+# `N·sizeof(ft)` is a power of 2. LLVM rounds a vector's alloc size (which becomes
+# the `memref` element stride) up to a power-of-2 byte count, so e.g. a 3×Float32
+# struct (Julia 12 B) would get a 16 B `vector<3×f32>` stride and silently corrupt
+# array indexing past element 0. Such structs fall through to the heterogeneous
+# byte-carrier path (`memref<?xiN>` + GEP by `sizeof`), which strides correctly.
 function _struct_vec_info(@nospecialize(T))
     (T isa DataType && isconcretetype(T) && isstructtype(T) && isbitstype(T)) || return nothing
     fts = fieldtypes(T)
     (isempty(fts) || any(ft -> ft !== fts[1], fts)) && return nothing
     ft = fts[1]
     (ft isa Type && ft <: Number && isbitstype(ft)) || return nothing
+    ispow2(length(fts) * sizeof(ft)) || return nothing   # else padded vector stride ≠ sizeof
     return (length(fts), ft)
 end
 
