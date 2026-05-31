@@ -428,6 +428,40 @@ end
     @inbounds out[i] = w                          # reconstruct the whole arg struct
 end
 
+# A user method EXTENDING a Base math generic on a custom type. The `:invoke`'s
+# callee resolves to `Base.sin` (root Base), so a function-identity check alone would
+# wave it through to `math.sin` and silently drop the user body. The dispatch must
+# consult the RESOLVED METHOD (defined here, not in Base) and outline it. See
+# `_invoke_method_is_stdlib`.
+struct _GAngle; v::Float32; end
+@noinline Base.sin(a::_GAngle) = _GAngle(a.v + 1.0f0)   # user override: x+1, NOT sin(x)
+@kernel function _g_user_sin!(out, @Const(a))
+    i = @index(Global, Linear)
+    @inbounds out[i] = sin(_GAngle(a[i])).v
+end
+
+# A hetero struct with a SINGLE-LEAF NESTED field (`Tuple{Int64}` = 1 leaf): reading
+# it hits the n==1 getfield branch, which must extract the bare `i64` leaf and re-wrap
+# it as the field's `vector<1×i64>` — NOT declare the aggregate type on a bare-scalar
+# struct member (an invalid `llvm.extractvalue`). See emit_getfield! hetero n==1 path.
+struct _GCI1; t::Tuple{Int64}; y::Int64; end
+@kernel function _g_ci1_read!(out, @Const(a))
+    i = @index(Global, Linear)
+    w = @inbounds a[i]
+    @inbounds out[i] = w.t[1] + w.y               # read the single-leaf nested field
+end
+
+# A hetero struct whose nested aggregate field carries TRAILING padding
+# (`Tuple{Float64,Int16}` = 16 bytes incl. 6 trailing pad) followed by another field:
+# the flat `!llvm.struct` would place the trailing `Float32` at byte 20, but Julia
+# puts it at byte 24 — a silent host/device byte mismatch. Must be REJECTED with a
+# clear error, not miscompiled. See `_flat_layout_matches_julia`.
+struct _GMixedPad; a::Int32; b::Tuple{Float64,Int16}; c::Float32; end
+@kernel function _g_mixedpad!(out, @Const(a))
+    i = @index(Global, Linear)
+    @inbounds out[i] = a[i]
+end
+
 # A type-unstable scf.for carry: `acc` is Int32 but `acc + 1` transiently widens it
 # to Int64, so the yielded value's width differs from the iter-arg. The :for body
 # must coerce the yield to the iter-arg type (like :while) — was an scf.for verifier
@@ -749,7 +783,7 @@ end
             vc = MLIRArray(CUDA.zeros(Float32, n))
             _g_vadd!(backend)(vc, va, vb; ndrange=n); CUDA.synchronize()   # dynamic wg
             @test Array(vc) ≈ Array(va) .+ Array(vb)
-            tuned = [v for (k, v) in MEXT._dyn_wg_cache if k[2] == (n,)]
+            tuned = [v for (k, v) in MEXT._dyn_wg_cache if k[3] == (n,)]   # key: (ctx, f, nd, ats)
             @test !isempty(tuned) && all(t -> prod(t) > 1, tuned)          # occupancy-tuned, not (1,)
         end
 
@@ -798,6 +832,36 @@ end
             wro2 = MLIRArray(CUDA.CuArray(fill(_WSNest(0f0, (Int32(0), Int32(0))), N)))
             _g_ws_recon!(backend, N)(wro2, wv; ndrange=N); CUDA.synchronize()
             @test all(==(wv), Array(wro2))                                # whole-arg reconstruct
+        end
+
+        # A user method extending `Base.sin` on a custom type must be OUTLINED and run
+        # (identity = resolved method, not the Base generic), not lowered to math.sin.
+        let N = 4
+            ua = MLIRArray(CUDA.CuArray(Float32[1, 2, 3, 4]))
+            umlir = _ir(code_gpu, _g_user_sin!(backend, N), MLIRArray(CUDA.zeros(Float32, N)),
+                        ua; ndrange=N, level=:mlir)
+            @test !occursin("math.sin", umlir)                           # user body, not math op
+            uo = MLIRArray(CUDA.zeros(Float32, N))
+            _g_user_sin!(backend, N)(uo, ua; ndrange=N); CUDA.synchronize()
+            @test Array(uo) == Float32[2, 3, 4, 5]                        # x+1 (user sin), not sin(x)
+        end
+
+        # Single-leaf nested field read (n==1 getfield branch): compiles a valid
+        # extractvalue + re-wrap and returns the right value.
+        let N = 4
+            ha = [_GCI1((Int64(7k),), Int64(k)) for k in 1:N]
+            ca = MLIRArray(CUDA.CuArray(ha)); o = MLIRArray(CUDA.zeros(Int64, N))
+            _g_ci1_read!(backend, N)(o, ca; ndrange=N); CUDA.synchronize()
+            @test Array(o) == Int64[7k + k for k in 1:N]
+        end
+
+        # A nested-trailing-pad struct whose flat layout diverges from Julia's is
+        # rejected with a clear error (lowering to :mlir triggers the arg-type build).
+        let N = 4
+            ha = [_GMixedPad(Int32(k), (Float64(k), Int16(k)), Float32(k)) for k in 1:N]
+            src = MLIRArray(CUDA.CuArray(ha)); dst = MLIRArray(CUDA.CuArray(copy(ha)))
+            @test_throws "diverges from Julia" code_gpu(devnull, _g_mixedpad!(backend, N),
+                dst, src; ndrange=N, level=:mlir)
         end
     end
 end

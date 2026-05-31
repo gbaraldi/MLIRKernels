@@ -220,12 +220,23 @@ _parse_ptx(s)  = (m = match(r"^\+ptx(\d+)(\d)$", s);
 # be `nothing`) override the cap/ISA for reflection.
 function _resolve_target(sm, feat)
     (sm === nothing && feat === nothing) && return _device_target()
+    # Both cap AND ISA pinned (explicit cross-arch reflection, and the build-time
+    # precompile workload) ⇒ the target is fully determined; build it WITHOUT
+    # touching the device. `_device_target()` calls `CUDA.device()`, which throws on
+    # a GPU-less / uninitialised build host — so consulting it here would make the
+    # precompile workload silently no-op (its try/catch swallows the throw), warming
+    # nothing and defeating its purpose. Baseline defaults for the non-cap/ptx fields
+    # are correct for reflection (and avoid folding the HOST arch's feature_set
+    # suffix onto a different requested chip).
+    if sm !== nothing && feat !== nothing
+        return GPUCompiler.PTXCompilerTarget(; cap=_parse_cap(sm), ptx=_parse_ptx(feat))
+    end
+    # Exactly one field given — fill the other from the device, carrying its other
+    # fields (feature_set, debuginfo, …) so the reflected target matches what CUDA.jl
+    # configured instead of re-defaulting them.
     t = _device_target()
     cap = sm   === nothing ? t.cap : _parse_cap(sm)
     ptx = feat === nothing ? t.ptx : _parse_ptx(feat)
-    # Override only cap/ptx; carry the device target's other fields (feature_set,
-    # debuginfo, …) so a reflected target matches what CUDA.jl configured, instead
-    # of re-defaulting them (feature_set=:baseline, debuginfo=false).
     return GPUCompiler.PTXCompilerTarget(; cap, ptx,
         feature_set=t.feature_set, debuginfo=t.debuginfo,
         minthreads=t.minthreads, maxthreads=t.maxthreads,
@@ -679,7 +690,14 @@ function (obj::KA.Kernel{MLIRCUDABackend})(args...; ndrange=nothing,
     # "Dynamic" = no static workgroupsize and none passed → we pick the block size,
     # so it's eligible for occupancy tuning (exactly CUDA.jl's gate).
     dynamic = (KA.workgroupsize(obj) <: NDI.DynamicSize) && workgroupsize === nothing
-    cachekey = (obj.f, nd, host_ats)
+    # Key the occupancy-tuned block size by CUDA context, like `_compile`'s key: the
+    # tuned size comes from `launch_configuration`, which is per-(device,kernel) (it
+    # reflects THIS GPU's register file and the kernel's per-arch resource use). Two
+    # devices of different arch in one process share `(obj.f, nd, host_ats)`, so
+    # without the context a block tuned for device A would be reused on device B —
+    # suboptimal at best, a launch-out-of-resources failure for a register-heavy
+    # kernel whose per-kernel thread cap is lower on B.
+    cachekey = (CUDA.context(), obj.f, nd, host_ats)
 
     cached_wg = dynamic ? (@lock _COMPILE_LOCK get(_dyn_wg_cache, cachekey, nothing)) : nothing
     wg = cached_wg !== nothing ? cached_wg : _resolve_wgsize(obj, workgroupsize, nd)

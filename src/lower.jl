@@ -271,6 +271,54 @@ function _field_leaf_span(@nospecialize(T), fi::Int)
     return off, _leaf_count(fieldtype(T, fi))
 end
 
+# Absolute byte offset of each flat scalar leaf within `T`, in `_struct_leaf_types`
+# (DFS) order — the SUM of `fieldoffset`s along each leaf's field path. This is the
+# ground truth (what the host `Array{T}` actually stores).
+function _julia_leaf_offsets(@nospecialize(T), base::Int=0)
+    out = Int[]
+    for i in 1:fieldcount(T)
+        FT = fieldtype(T, i)
+        foff = base + Int(fieldoffset(T, i))
+        if (FT <: Number || FT === Bool) && isbitstype(FT)
+            push!(out, foff)
+        else
+            append!(out, _julia_leaf_offsets(FT, foff))
+        end
+    end
+    return out
+end
+
+# Natural-alignment byte offsets LLVM assigns to the FLAT literal `!llvm.struct` of
+# `leaves` (alignment == size for the pow2-sized primitives we leaf into, on the
+# NVPTX/x86-64 data layout), plus the struct's natural total size.
+function _flat_struct_layout(leaves::Vector{Type})
+    offs = Int[]; pos = 0; maxalign = 1
+    for L in leaves
+        sz = sizeof(L); al = sz                  # i8/i16/i32/i64, f16/f32/f64: align == size
+        pos = cld(pos, al) * al                  # align up to the leaf's alignment
+        push!(offs, pos); pos += sz
+        maxalign = max(maxalign, al)
+    end
+    return offs, cld(pos, maxalign) * maxalign   # round total up to the struct's alignment
+end
+
+# Whether the FLAT `!llvm.struct` of `T`'s leaves has the SAME byte layout as Julia's
+# `T` (every leaf at its `fieldoffset` and equal total size). Flattening drops a
+# nested aggregate's TRAILING padding, so a field positioned after such an aggregate
+# shifts forward in the flat struct vs Julia (e.g. `struct{Int32, Tuple{Float64,Int16},
+# Float32}` puts the trailing Float32 at flat byte 20 but Julia byte 24) — silently
+# reading/writing the wrong bytes at the host/device boundary. This is the hetero
+# analogue of the homogeneous path's `ispow2` representability guard.
+function _flat_layout_matches_julia(@nospecialize(T))
+    leaves = _struct_leaf_types(T)
+    leaves === nothing && return false
+    jl = _julia_leaf_offsets(T)
+    length(jl) == length(leaves) || return false
+    foffs, total = _flat_struct_layout(leaves)
+    total == sizeof(T) || return false
+    return all(foffs[k] == jl[k] for k in eachindex(jl))
+end
+
 # A heterogeneous bits-struct (not all-one-scalar, e.g. `Tuple{Float32,Int64}` from
 # findmax's (value,index) pair, or `CartesianIndex{2}` = a struct wrapping a
 # tuple) can't be a `vector<N×T>`. Its VALUE is a FLAT `!llvm.struct<(leaf…)>`
@@ -278,11 +326,17 @@ end
 # `memref<?xiN>` byte-carrier (N=8·sizeof) — memref can't hold an aggregate —
 # accessed via an `!llvm.ptr` + `llvm.getelementptr`/load/store. Returns the flat
 # leaf-type list or `nothing`. Design: [[reference_hetero_struct_design]].
+#
+# The flat layout is only FAITHFUL when its natural offsets match Julia's; reject
+# (→ `nothing`, surfacing a clear "unsupported element type" error) when a nested
+# aggregate's trailing padding would diverge them, rather than silently corrupting
+# memory. See `_flat_layout_matches_julia`.
 function _hetero_struct_info(@nospecialize(T))
     (T isa DataType && isconcretetype(T) && isstructtype(T) && isbitstype(T)) || return nothing
     _struct_vec_info(T) === nothing || return nothing   # homogeneous → vector path
     leaves = _struct_leaf_types(T)
     (leaves === nothing || isempty(leaves)) && return nothing
+    _flat_layout_matches_julia(T) || return nothing     # flat layout ≠ Julia's → unrepresentable
     return leaves
 end
 
@@ -290,7 +344,9 @@ end
 _int_type(width::Int) = IR.Type(MLIR.API.mlirIntegerTypeGet(IR.current_context(), width))
 
 # Flat `!llvm.struct<(scalar leaf types…)>` for a heterogeneous (possibly nested)
-# bits-struct — unpacked literal struct; offsets/padding match Julia's layout.
+# bits-struct — an unpacked literal struct. Its natural offsets match Julia's layout
+# ONLY for types `_hetero_struct_info` admitted (`_flat_layout_matches_julia`); types
+# whose nested padding would diverge are rejected upstream, never reaching here.
 function _llvm_struct_type(@nospecialize(T))
     leaves = _struct_leaf_types(T)
     refs = MLIR.API.MlirType[mlir_elem_type(L).ref for L in leaves]
@@ -322,6 +378,15 @@ function mlir_elem_type(T::Type)
     T === UInt32   && return IR.Type(Int32)
     T === UInt64   && return IR.Type(Int64)
     T === Bool     && return IR.Type(Bool)
+    # A bits-struct that has leaves but whose flat layout diverges from Julia's is
+    # rejected by `_hetero_struct_info` (see `_flat_layout_matches_julia`); give a
+    # specific reason rather than a bare "unsupported".
+    if T isa DataType && isconcretetype(T) && isstructtype(T) && isbitstype(T) &&
+       _struct_leaf_types(T) !== nothing && !_flat_layout_matches_julia(T)
+        error("MLIRKernels: struct $T is not representable — its flat field layout " *
+              "diverges from Julia's (a nested aggregate field with trailing padding " *
+              "shifts later fields); cannot be a flat !llvm.struct element.")
+    end
     error("MLIRKernels: unsupported element type $T")
 end
 
@@ -1842,6 +1907,26 @@ function _is_julia_stdlib_callee(@nospecialize(c))
     return false
 end
 
+# Whether the RESOLVED method behind an `:invoke` is itself DEFINED in Base/Core,
+# as opposed to a user method extending a name-matched Base generic (e.g.
+# `Base.sin(::MyType)`, `Base.floor(::Money)`). `_is_julia_stdlib_callee` only sees
+# the generic function's identity (`Base.sin`), so it can't tell the two apart; the
+# MethodInstance carried by the `:invoke` can — its `def.module` is where the chosen
+# method lives. The name-dispatch table (math ops, `^`, `fpiseq`, …) may fire only
+# for the genuine Base/Core method; a user override must be outlined and actually
+# run. Mirrors Julia codegen dispatching on the resolved method, not the function.
+# Defaults to `true` (keep name-dispatch) only when the MethodInstance can't be
+# recovered — which doesn't happen for a real `:invoke`.
+function _invoke_method_is_stdlib(@nospecialize(ci))
+    mi = ci isa Core.MethodInstance ? ci :
+         (isdefined(ci, :def) && ci.def isa Core.MethodInstance) ? ci.def : nothing
+    mi === nothing && return true
+    m = mi.def
+    m isa Core.Method || return true
+    r = Base.moduleroot(m.module)
+    return r === Base || r === Core
+end
+
 function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
                     args::Vector{Any}, @nospecialize(typ); mi=nothing)
     fname = callee_name(callee)
@@ -1852,7 +1937,14 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     # `MyMod.sin`/`^`/`add_int`/`memoryrefget` that merely shares a builtin's name is
     # never misrouted to a dialect op. (Builtins/raw intrinsics arrive as `:call`s
     # with `mi === nothing` and fall through to the name matching below as before.)
-    if mi !== nothing && !_is_julia_stdlib_callee(callee) && !_callee_is_intrinsic(callee)
+    #
+    # The identity must be the RESOLVED METHOD, not the generic function: a user
+    # method extending a Base generic (`Base.sin(::MyType)`) shares `Base.sin`'s
+    # identity, so `_is_julia_stdlib_callee` alone would wave it through to the
+    # `math.sin` name-match and silently drop the user body. `_invoke_method_is_stdlib`
+    # consults the MethodInstance's defining module, so a user override outlines.
+    if mi !== nothing && !_callee_is_intrinsic(callee) &&
+       (!_is_julia_stdlib_callee(callee) || !_invoke_method_is_stdlib(mi))
         return emit_outlined_call!(lc, idx, mi, callee, args, typ)
     end
 
@@ -2775,6 +2867,13 @@ end
 function emit_unary_math!(lc::LowerCtx, args, op_fn, @nospecialize(typ))
     a = resolve_value_or_const(lc, args[1])
     a === nothing && error("$(op_fn): unresolved operand $(args[1])")
+    # The math dialect ops are float-only. The walk_call! dispatch gate outlines any
+    # user override of a name-matched generic, so reaching here on a non-float operand
+    # means the name-match misfired — error loudly instead of emitting a nonsense
+    # math op on (e.g.) a struct's vector/int carrier (a silent wrong result).
+    _float_width(IR.type(a)) != 0 ||
+        error("$(op_fn): operand is not a float scalar/vector ($(IR.type(a))); " *
+              "a non-Base method matched a math name")
     return IR.result(op_fn(a; result=IR.type(a)))
 end
 
@@ -2847,6 +2946,10 @@ function emit_fpiseq!(lc::LowerCtx, args, @nospecialize(typ))
     (a === nothing || b === nothing) &&
         error("fpiseq: unresolved operands ($(args[1]), $(args[2]))")
     a, b = _spmd_harmonise(lc, a, b)
+    # Float-only (it bit-compares + checks both-NaN). A user `Base.fpiseq` override
+    # outlines via the dispatch gate; a non-float operand here means a misfire.
+    _float_width(IR.type(a)) != 0 ||
+        error("fpiseq: operands are not floats ($(IR.type(a)))")
     uno = IR.Attribute(14, IR.Type(Int64))                  # arith CmpFPredicate UNO
     nan_a = IR.result(_arith.cmpf(a, a; predicate=uno))
     nan_b = IR.result(_arith.cmpf(b, b; predicate=uno))
@@ -3021,10 +3124,20 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
             FT = fieldtype(svT, fi)
             off, n = _field_leaf_span(svT, fi)
             n >= 1 || error("getfield: $svT.$fld has no representable leaves")
-            if n == 1
+            # A SCALAR field is exactly one bare leaf — extract it directly as its
+            # own type. (Gating on `n == 1` would be wrong: a single-leaf NESTED
+            # aggregate — `CartesianIndex{1}`, `Tuple{Int64}`, an NTuple{1} — also has
+            # n == 1, yet is stored as a bare scalar leaf, not its aggregate type, so
+            # `res=mlir_elem_type(FT)` would declare `!llvm.struct<(i64)>`/`vector<1xi64>`
+            # for a member that is bare `i64` → an invalid extractvalue.)
+            if (FT <: Number || FT === Bool) && isbitstype(FT)
                 return IR.result(_llvm.extractvalue(vec;
                     res=mlir_elem_type(FT), position=IR.Attribute(Int64[off])))
             end
+            # A nested-aggregate field (any leaf count): pull each leaf as its bare
+            # scalar and re-assemble into the field's own representation (vector for a
+            # homogeneous field, flat `!llvm.struct` otherwise) — inverse of how
+            # construction flattens it.
             lts = _struct_leaf_types(FT)
             leaves = IR.Value[IR.result(_llvm.extractvalue(vec;
                         res=mlir_elem_type(lts[k]), position=IR.Attribute(Int64[off + k - 1])))
