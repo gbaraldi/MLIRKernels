@@ -387,8 +387,12 @@ function _compile(f, full_argtypes; sm=nothing, feat=nothing, nd_dims=Int[], opt
     # (the binding is unchanged). The ctx type (carrying nd) is part of the MI, so
     # nd_dims need not be in the key; `sm`/`feat`/`optimize` aren't, so they stay.
     # (CompilerCaching's resolver; `nothing` ⇒ no unique match ⇒ fall back.)
+    # The CuFunction (and its piggy-backed exception buffer) belongs to ONE CUDA
+    # context, so key by the current context too: on multi-GPU, two devices — even
+    # of the same capability (same sm/feat) — must NOT share a CuFunction. Single
+    # GPU: the primary context is stable, so this is transparent.
     mi = match_method_instance(f, full_argtypes)
-    key = (mi === nothing ? (f, full_argtypes, nd_dims) : mi, sm, feat, optimize)
+    key = (CUDA.context(), mi === nothing ? (f, full_argtypes, nd_dims) : mi, sm, feat, optimize)
     @lock _COMPILE_LOCK begin
         haskey(_gpu_cache, key) && return _gpu_cache[key]
         kname = _sym(f)
