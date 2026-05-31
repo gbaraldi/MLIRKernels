@@ -1283,10 +1283,17 @@ function walk_block!(lc::LowerCtx, block::Block; kind::Symbol=:entry,
     elseif kind === :for
         if term isa ContinueOp
             vals = IR.Value[]
-            for v in term.values
+            for (k, v) in enumerate(term.values)
                 resolved = resolve_value_or_const(lc, v)
                 resolved === nothing &&
                     error("scf.for continue: cannot resolve operand $v")
+                # Coerce each yielded value to its iter-arg type (symmetric with
+                # :while_after). A type-unstable carry can make the body produce a
+                # different width than the init-derived iter-arg (e.g. an `Int32`
+                # accumulator transiently widened to `Int64` by `acc + 1`), which
+                # otherwise trips the scf.for verifier ("iter_arg and yielded value
+                # have different type"). No-op when the widths already match.
+                k <= length(carried_types) && (resolved = _coerce_to_type!(resolved, carried_types[k]))
                 push!(vals, resolved)
             end
             _scf.yield(vals)
@@ -3364,7 +3371,7 @@ function emit_for!(lc::LowerCtx, idx::Int, op::ForOp, @nospecialize(typ))
         for (k, ba) in enumerate(op.body.args)
             lc.block_args[ba.id] = IR.argument(body_block, k + 1)
         end
-        walk_block!(lc, op.body; kind=:for)
+        walk_block!(lc, op.body; kind=:for, carried_types=iter_types)
     end
 
     forop = _scf.for_(lower_v, upper_v, step_v, init_vals;

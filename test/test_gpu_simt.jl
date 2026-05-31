@@ -378,6 +378,19 @@ end
     @inbounds out[i] = z
 end
 
+# A type-unstable scf.for carry: `acc` is Int32 but `acc + 1` transiently widens it
+# to Int64, so the yielded value's width differs from the iter-arg. The :for body
+# must coerce the yield to the iter-arg type (like :while) — was an scf.for verifier
+# error ("iter_arg and yielded value have different type: i32 != i64").
+@kernel function _g_widen_for!(out)
+    i = @index(Global, Linear)
+    acc = Int32(0)
+    for j in 1:8
+        acc = (j % 2 == 0) ? acc + Int32(1) : acc + 1
+    end
+    @inbounds out[i] = acc
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -693,6 +706,14 @@ end
             co = MLIRArray(CUDA.CuArray(fill(0f0 + 0f0im, N)))
             _g_cplx_throw!(backend, 64)(co, ca; ndrange=N); CUDA.synchronize()
             @test Array(co) == [ComplexF32(i, 2i) * (2f0 + 0f0im) for i in 1:N]
+        end
+
+        # Width-changing scf.for carry (Int32 acc transiently widened to Int64):
+        # compiles (yield coerced to iter-arg type) and each lane sums to 8.
+        let N = 32
+            wo = MLIRArray(CUDA.zeros(Int, N))
+            _g_widen_for!(backend, 32)(wo; ndrange=N); CUDA.synchronize()
+            @test all(==(8), Array(wo))
         end
     end
 end
