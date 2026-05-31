@@ -2794,7 +2794,11 @@ function emit_egal!(lc::LowerCtx, args, @nospecialize(typ))
     a, b = _spmd_harmonise(lc, a, b)
     a = _bitcast_float_to_int!(a)        # no-op on integers
     b = _bitcast_float_to_int!(b)
-    a, b = _harmonise_binop_widths(a, b, nothing)
+    # Each operand widens by its own source signedness (a union-promoted unsigned
+    # peer must zero-extend, or the bit-equality differs in the high bits).
+    a, b = _harmonise_binop_widths(a, b, nothing;
+                                   a_T=_operand_jltype(lc, args[1]),
+                                   b_T=_operand_jltype(lc, args[2]))
     pred = IR.Attribute(cmpi_predicate_code(ComparisonPredicate.Equal, Signedness.Signed),
                         IR.Type(Int64))
     return IR.result(_arith.cmpi(a, b; predicate=pred))
@@ -2843,7 +2847,11 @@ function emit_cmpi!(lc::LowerCtx, args, @nospecialize(typ))
     a, b = _spmd_harmonise(lc, a, b)
     # cmpi requires both operands to share a type; a numeric-union if-result can
     # arrive wider than its peer, so widen the narrower (no result type → wider).
-    a, b = _harmonise_binop_widths(a, b, nothing)
+    # Thread the operands' SOURCE Julia types so an unsigned operand zero-extends
+    # before an `ult`/`ule` compare (sign-extending it flips the comparison).
+    a, b = _harmonise_binop_widths(a, b, nothing;
+                                   a_T=_operand_jltype(lc, args[1]),
+                                   b_T=_operand_jltype(lc, args[2]))
     # arith.cmpi result is i1; for tile element type Bool yields i1 (or
     # vector<...xi1>). Result type is inferred by the op builder since we
     # don't pass it.

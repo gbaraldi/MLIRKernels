@@ -226,6 +226,14 @@ end
     @inbounds out[i] = Float32(a[i])
 end
 
+# Comparison of a union-promoted UNSIGNED operand: the widening before `ult` must
+# zero-extend (UInt8(200)→UInt32 200 < 1000 == true), not sign-extend (→ false).
+@kernel function _g_ucmp!(out, @Const(a), flag::Bool)
+    i = @index(Global, Linear)
+    x = flag ? (@inbounds a[i]) : UInt32(50)   # ::Union{UInt8,UInt32} → UInt32
+    @inbounds out[i] = x < UInt32(1000)
+end
+
 # Runtime dimension extent: `size(a, d)` with a runtime `d` reads
 # `getfield(a.size::Tuple, d)` with a non-const index → a select-chain over the
 # per-dim `memref.dim`s.
@@ -565,6 +573,10 @@ end
         ufa = MLIRArray(CUDA.CuArray(UInt8[200, 5, 130, 255])); ufo = MLIRArray(CUDA.zeros(Float32, 4))
         _g_uitofp!(backend, 4)(ufo, ufa; ndrange=4); CUDA.synchronize()
         @test Array(ufo) == Float32[200, 5, 130, 255]
+        # unsigned compare with width promotion: zero-extend before ult, not sign-extend
+        uca = MLIRArray(CUDA.CuArray(UInt8[200, 10, 255])); uco = MLIRArray(CUDA.zeros(Bool, 3))
+        _g_ucmp!(backend, 3)(uco, uca, true; ndrange=3); CUDA.synchronize()
+        @test Array(uco) == Bool[1, 1, 1]
 
         # `size(a, d)` with a RUNTIME `d` — getfield(a.size, d) at a non-const
         # index → select-chain over memref.dims.
