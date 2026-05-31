@@ -163,7 +163,12 @@ end
 # discarded by `@atomic … op= …` used as a statement.
 @overlay FE.METHOD_TABLE function Atomix.modify!(
         ref::Atomix.Internal.IndexableRef, op::OP, x, ord) where {OP}
-    FE.Intrinsics.atomic_index!(ref.data, op, x, ref.indices[1])
+    # `ref.indices` is the FULL subscript tuple; linearise it column-major (exactly
+    # Atomix's own `LinearIndices(ref.data)[indices...]`) so an N-D `@atomic A[i,j]`
+    # hits the right element — passing only `indices[1]` updated linear slot i,
+    # ignoring j (wrong, and OOB for i>size(A,1)). For a 1-D ref this is just i.
+    lin = @inbounds Base.LinearIndices(ref.data)[ref.indices...]
+    FE.Intrinsics.atomic_index!(ref.data, op, x, lin)
     return (x, x)
 end
 

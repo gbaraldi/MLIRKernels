@@ -146,6 +146,25 @@ KA.supports_atomics(::MLIRCUDABackend) = true
 # Data movement (host↔device, device↔device) defers to CUDA's copyto!.
 KA.copyto!(::MLIRCUDABackend, dst, src) = (Base.copyto!(unwrap(dst), unwrap(src)); dst)
 
+# Default workgroup for an N-D ndrange when none is given (GPUArrays' broadcast,
+# a bare `kernel(backend)(...)`). Greedily fill up to `maxthreads` lanes starting
+# at dim 1 and spilling into higher dims once a dim is exhausted — so a leading
+# singleton (e.g. ndrange `(1, N)`) still gets a full block instead of the old
+# dim-1-only `(1, 1)` (one thread per block → catastrophic occupancy). Each dim is
+# capped by the ndrange extent and a conservative hardware limit (NVIDIA blocks:
+# x,y ≤ 1024, z ≤ 64); 256 total stays well under the per-block product limit. The
+# result keeps the SAME rank as `nd` (the launcher pads/masks the grid per dim).
+function _default_wgsize(nd::Tuple; maxthreads::Int=256)
+    wg = ones(Int, length(nd))
+    budget = maxthreads
+    for d in 1:length(nd)
+        wg[d] = min(budget, nd[d], d <= 2 ? 1024 : 64)
+        budget ÷= max(wg[d], 1)
+        budget < 1 && break
+    end
+    return Tuple(wg)
+end
+
 # GPUArrays' generic `map!`/`broadcast` call `KA.launch_config(kernel, ndrange,
 # workgroupsize)` and launch with `config[1]`/`config[2]`. Our launcher takes
 # `ndrange`/`workgroupsize` directly and pads+masks the grid, so we just
@@ -155,7 +174,7 @@ KA.copyto!(::MLIRCUDABackend, dst, src) = (Base.copyto!(unwrap(dst), unwrap(src)
     ndrange isa Integer && (ndrange = (ndrange,))
     workgroupsize isa Integer && (workgroupsize = (workgroupsize,))
     if workgroupsize === nothing
-        workgroupsize = ntuple(d -> d == 1 ? min(256, ndrange[d]) : 1, length(ndrange))
+        workgroupsize = _default_wgsize(ndrange)
     end
     return ndrange, workgroupsize, nothing, nothing
 end
@@ -164,19 +183,63 @@ end
 # GPU compilation: SCI → gpu.module → PTX → CuFunction (cached).
 # ----------------------------------------------------------------------------
 
-const GPU_PASSES = String[
-    # Inline outlined device calls (func.call → func.func emitted for un-inlined
-    # `:invoke`s) and drop the now-unused func.funcs. No-op when there are none.
-    "inline", "symbol-dce",
-    "nvvm-attach-target{chip=sm_90 features=+ptx80}",
-    "gpu-kernel-outlining",
-    "gpu.module(convert-gpu-to-nvvm)",
-    "convert-scf-to-cf", "convert-cf-to-llvm", "convert-arith-to-llvm",
-    "convert-vector-to-llvm",   # struct-as-vector<N×T> element: extract/insert/load
-    "expand-strided-metadata", "finalize-memref-to-llvm",
-    "convert-nvvm-to-llvm", "reconcile-unrealized-casts",
-    "gpu-module-to-binary{format=llvm}",
-]
+# Target selection — mirror CUDA.jl. The codegen target is the host GPU's compute
+# capability and the newest PTX ISA that both LLVM and the CUDA runtime support.
+# CUDA derives exactly this in `compiler_config(dev)` (clamping the device cap to
+# LLVM's supported set and picking the highest available PTX ISA), so we reuse that
+# memoised path and pull its `PTXCompilerTarget`. Result: our device code targets
+# the same `(sm_XY, +ptxNN)` CUDA.jl picks for its own kernels — instead of a
+# hardcoded `sm_90/+ptx80` that is wrong on any non-Hopper GPU and stale on the ISA.
+# (`GPUCompiler` is reached through CUDACore, which `using`s it — same coupling as
+# `CUDA.CUDACore.create_exceptions!` for the device-exception path.)
+const GPUCompiler = CUDA.CUDACore.GPUCompiler
+
+_device_target() = CUDA.CUDACore.compiler_config(CUDA.device()).target
+
+# PTXCompilerTarget → the MLIR `nvvm-attach-target` / LLVM TargetMachine strings.
+_target_sm(t)   = "sm_$(t.cap.major)$(t.cap.minor)"
+_target_feat(t) = "+ptx$(t.ptx.major)$(t.ptx.minor)"
+
+# Inverse, for `code_gpu` reflection of a non-host arch: "sm_90"→v"9.0",
+# "sm_120"→v"12.0" (the last digit is the minor); "+ptx87"→v"8.7".
+_parse_cap(s)  = (m = match(r"^sm_(\d+)(\d)$", s);
+                  m === nothing ? error("MLIRCUDABackend: bad sm string $s") :
+                  VersionNumber(parse(Int, m[1]), parse(Int, m[2])))
+_parse_ptx(s)  = (m = match(r"^\+ptx(\d+)(\d)$", s);
+                  m === nothing ? error("MLIRCUDABackend: bad feature string $s") :
+                  VersionNumber(parse(Int, m[1]), parse(Int, m[2])))
+
+# Resolve the codegen target: the host device by default; `sm`/`feat` (either may
+# be `nothing`) override the cap/ISA for reflection.
+function _resolve_target(sm, feat)
+    (sm === nothing && feat === nothing) && return _device_target()
+    t = _device_target()
+    cap = sm   === nothing ? t.cap : _parse_cap(sm)
+    ptx = feat === nothing ? t.ptx : _parse_ptx(feat)
+    return GPUCompiler.PTXCompilerTarget(; cap, ptx)
+end
+
+# The GPU lowering pipeline, parameterised by target. Only `nvvm-attach-target`
+# depends on the target (chip=sm, features=ptx ISA) — the rest are fixed. Building
+# it per-request (rather than a const baking sm_90/+ptx80) keeps the NVVM target
+# attribute consistent with the LLVM `TargetMachine` and the `_gpu_cache` key when
+# `sm`/`feat` are non-default; otherwise a non-sm_90 launch silently lowered its
+# device code for sm_90. The same `feat` string ("+ptxNN") feeds both stages.
+function _gpu_passes(sm::AbstractString, feat::AbstractString)
+    return String[
+        # Inline outlined device calls (func.call → func.func emitted for un-inlined
+        # `:invoke`s) and drop the now-unused func.funcs. No-op when there are none.
+        "inline", "symbol-dce",
+        "nvvm-attach-target{chip=$sm features=$feat}",
+        "gpu-kernel-outlining",
+        "gpu.module(convert-gpu-to-nvvm)",
+        "convert-scf-to-cf", "convert-cf-to-llvm", "convert-arith-to-llvm",
+        "convert-vector-to-llvm",   # struct-as-vector<N×T> element: extract/insert/load
+        "expand-strided-metadata", "finalize-memref-to-llvm",
+        "convert-nvvm-to-llvm", "reconcile-unrealized-casts",
+        "gpu-module-to-binary{format=llvm}",
+    ]
+end
 
 # PTX identifiers can't contain `!` etc.; sanitise the kernel symbol.
 _sym(f) = replace(string(nameof(f)), r"[^A-Za-z0-9_]" => "_")
@@ -195,12 +258,18 @@ function _extract_gpu_binary(mod)
 end
 
 # Run an MLIR pass pipeline (list of pass strings) on `mod` in place.
+# `IR.PassManager()` reads `current_context()`, so the context must be active for
+# the call — `@with_context` activates/deactivates as a BALANCED pair. The old
+# code activated without ever deactivating, so every compile pushed another entry
+# onto the task-local context stack, which both grew unboundedly AND pinned the C
+# context alive (defeating `IR.dispose` in the caller).
 function _run_passes!(mod, mlir_ctx, passes)
-    IR.activate(mlir_ctx)
-    pm = IR.PassManager()
-    parse(IR.OpPassManager(pm), "builtin.module(" * join(passes, ",") * ")")
-    MLIRAPI.mlirPassManagerRunOnOp(pm, IR.Operation(mod)).value == 0 &&
-        error("MLIRCUDABackend: GPU pass pipeline failed")
+    MK.@with_context mlir_ctx begin
+        pm = IR.PassManager()
+        parse(IR.OpPassManager(pm), "builtin.module(" * join(passes, ",") * ")")
+        MLIRAPI.mlirPassManagerRunOnOp(pm, IR.Operation(mod)).value == 0 &&
+            error("MLIRCUDABackend: GPU pass pipeline failed")
+    end
     return mod
 end
 
@@ -223,30 +292,39 @@ function _link_libdevice!(lmod)
     return
 end
 
-# gpu.binary{format=llvm} bitcode → (LLVM.Module, PTX string), with libdevice
-# linked and LLVM's default -O2 run. The driver JITs PTX → SASS at module load.
-# `stages`, when given, captures the LLVM IR before (`:llvm_unopt`) and after
-# (`:llvm`) the -O2 pipeline — for reflection / `code_gpu`.
-function _bitcode_to_ptx(bc; sm="sm_90", feat="+ptx80",
+# gpu.binary{format=llvm} bitcode → PTX string, with libdevice linked and LLVM's
+# default -O2 run. The driver JITs PTX → SASS at module load. `stages`, when given,
+# captures the LLVM IR before (`:llvm_unopt`) and after (`:llvm`) the -O2 pipeline —
+# for reflection / `code_gpu`.
+#
+# Mirrors GPUCompiler's LLVM usage (driver.jl `JuliaContext`, mcgen.jl/optim.jl):
+# the whole emission runs inside an LLVM context do-block (active for the duration,
+# disposed on exit, like `JuliaContext()`), and the `TargetMachine` is built by
+# GPUCompiler's own `llvm_machine(target)` so its triple/datalayout/cpu/features
+# match exactly what CUDA.jl uses — we just dispose it (GPUCompiler leaves it to the
+# GC). The PTX String is context-independent, so nothing is leaked per compile.
+function _bitcode_to_ptx(bc, target;
                          stages::Union{Nothing,Dict{Symbol,String}}=nothing)
-    lctx = LLVM.Context()
-    return LLVM.context!(lctx) do
+    LLVM.Context() do lctx
         lmod = parse(LLVM.Module, bc)
-        triple = "nvptx64-nvidia-cuda"
-        LLVM.triple!(lmod, triple)
+        LLVM.triple!(lmod, GPUCompiler.llvm_triple(target))
         _link_libdevice!(lmod)            # parse libdevice in the SAME context, then link
-        tm = LLVM.TargetMachine(LLVM.Target(; triple), triple, sm, feat)
-        LLVM.asm_verbosity!(tm, true)
-        stages === nothing || (stages[:llvm_unopt] = string(lmod))   # linked, pre-O2
-        # We emit no LLVM-level optimization of our own; run LLVM's default -O2
-        # pipeline (inline/GVN/DCE) — also strips the lazily-linked libdevice down
-        # to the referenced functions. LLVM ≥17 weaves NVPTX's NVVMReflect in at
-        # PipelineStart, resolving libdevice's `__nvvm_reflect`. Job-free (the
-        # GPUCompiler `optimize_module!` is keyed on a CompilerJob we don't have).
-        LLVM.run!("default<O2>", lmod, tm)
-        stages === nothing || (stages[:llvm] = string(lmod))         # post-O2
-        ptx = String(LLVM.emit(tm, lmod, LLVM.API.LLVMAssemblyFile))
-        return lmod, ptx
+        tm = GPUCompiler.llvm_machine(target)
+        tm === nothing && error("MLIRCUDABackend: NVPTX backend unavailable in this LLVM")
+        try
+            stages === nothing || (stages[:llvm_unopt] = string(lmod))   # linked, pre-O2
+            # We emit no LLVM-level optimization of our own; run LLVM's default -O2
+            # pipeline (inline/GVN/DCE) via the new pass manager — also strips the
+            # lazily-linked libdevice down to the referenced functions. LLVM ≥17
+            # weaves NVPTX's NVVMReflect in at PipelineStart, resolving libdevice's
+            # `__nvvm_reflect`. Job-free (GPUCompiler's `optimize!` builds a custom
+            # NewPMPassBuilder pipeline keyed on a CompilerJob we don't have).
+            LLVM.run!("default<O2>", lmod, tm)
+            stages === nothing || (stages[:llvm] = string(lmod))         # post-O2
+            String(LLVM.emit(tm, lmod, LLVM.API.LLVMAssemblyFile))
+        finally
+            LLVM.dispose(tm)
+        end
     end
 end
 
@@ -284,7 +362,9 @@ function _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims, optimize
     return
 end
 
-function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80", nd_dims=Int[], optimize::Bool=true)
+function _compile(f, full_argtypes; sm=nothing, feat=nothing, nd_dims=Int[], optimize::Bool=true)
+    target = _resolve_target(sm, feat)
+    sm, feat = _target_sm(target), _target_feat(target)   # honest, device-derived key
     key = (f, full_argtypes, sm, feat, nd_dims, optimize)
     haskey(_gpu_cache, key) && return _gpu_cache[key]
     kname = _sym(f)
@@ -298,9 +378,16 @@ function _compile(f, full_argtypes; sm="sm_90", feat="+ptx80", nd_dims=Int[], op
     mod, _pjt, mlir_ctx, kinds =
         MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims, optimize)
 
-    _run_passes!(mod, mlir_ctx, GPU_PASSES)
-    bc = _extract_gpu_binary(mod)
-    _lmod, ptx = _bitcode_to_ptx(bc; sm, feat)
+    # The MLIR context owns `mod`; once we've extracted the binary the PTX is a
+    # plain String, so dispose the context (try/finally — free it even on a pass
+    # failure). Without this every cache-miss leaked an MLIR context.
+    ptx = try
+        _run_passes!(mod, mlir_ctx, _gpu_passes(sm, feat))
+        bc = _extract_gpu_binary(mod)
+        _bitcode_to_ptx(bc, target)
+    finally
+        IR.dispose(mlir_ctx)
+    end
 
     cumod = CuModule(ptx)
     _wire_exception_flag!(cumod)
@@ -339,14 +426,15 @@ end
 # `_compile` pipeline but stops at, and returns the text of, each stage.
 # ----------------------------------------------------------------------------
 
-# Which passes to run to reach each level. `:lowered` is the full pipeline minus
-# the final `gpu-module-to-binary` (so the gpu.module is still readable LLVM/NVVM
-# dialect MLIR, not an opaque binary blob).
-const _GPU_PASSES_NOBIN = GPU_PASSES[1:end-1]
-
-function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
+function _codegen_stages(f, full_argtypes; sm=nothing, feat=nothing,
                          upto::Symbol=:ptx, nd_dims=Int[], optimize::Bool=true)
     kname = _sym(f)
+    target = _resolve_target(sm, feat)
+    sm, feat = _target_sm(target), _target_feat(target)
+    # `:lowered` is the full pipeline minus the final `gpu-module-to-binary` (so
+    # the gpu.module is still readable LLVM/NVVM-dialect MLIR, not a binary blob).
+    passes = _gpu_passes(sm, feat)
+    passes_nobin = passes[1:end-1]
     order = (:sci, :mlir, :lowered, :llvm_unopt, :llvm, :ptx)
     want = findfirst(==(upto), order)
     want === nothing && error("code_gpu: unknown level :$upto (one of $order)")
@@ -361,18 +449,23 @@ function _codegen_stages(f, full_argtypes; sm="sm_90", feat="+ptx80",
 
     mod, _pjt, mlir_ctx, _kinds =
         MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims, optimize=false)
-    MK.@with_context mlir_ctx begin
-        out[:mlir] = sprint(show, mod)
-        want == 2 && return out
-        # Lower to LLVM/NVVM dialect (everything but serialise-to-binary).
-        _run_passes!(mod, mlir_ctx, _GPU_PASSES_NOBIN)
-        out[:lowered] = sprint(show, mod)
-        want == 3 && return out
-        # Serialise to gpu.binary, extract bitcode → LLVM IR (pre/post-O2) + PTX.
-        _run_passes!(mod, mlir_ctx, GPU_PASSES[end:end])
-        bc = _extract_gpu_binary(mod)
-        _lmod, ptx = _bitcode_to_ptx(bc; sm, feat, stages=out)  # fills :llvm_unopt + :llvm
-        want >= findfirst(==(:ptx), order) && (out[:ptx] = ptx)
+    # try/finally so the context is disposed even on the early `return out`s below.
+    try
+        MK.@with_context mlir_ctx begin
+            out[:mlir] = sprint(show, mod)
+            want == 2 && return out
+            # Lower to LLVM/NVVM dialect (everything but serialise-to-binary).
+            _run_passes!(mod, mlir_ctx, passes_nobin)
+            out[:lowered] = sprint(show, mod)
+            want == 3 && return out
+            # Serialise to gpu.binary, extract bitcode → LLVM IR (pre/post-O2) + PTX.
+            _run_passes!(mod, mlir_ctx, passes[end:end])
+            bc = _extract_gpu_binary(mod)
+            ptx = _bitcode_to_ptx(bc, target, stages=out)  # fills :llvm_unopt + :llvm
+            want >= findfirst(==(:ptx), order) && (out[:ptx] = ptx)
+        end
+    finally
+        IR.dispose(mlir_ctx)
     end
     return out
 end
@@ -486,11 +579,12 @@ function _resolve_wgsize(obj::KA.Kernel{MLIRCUDABackend}, workgroupsize, nd::Tup
         end
         return static
     end
-    # Default block: up to 256 lanes along dim 1, singletons elsewhere — and the
-    # SAME rank as the ndrange (GPUArrays' broadcast launches an N-D ndrange with
-    # no workgroupsize, so a fixed `(256,)` would mismatch the rank).
+    # Default block: greedily fill up to 256 lanes across the ndrange dims (see
+    # `_default_wgsize`), keeping the SAME rank as the ndrange — GPUArrays' broadcast
+    # launches an N-D ndrange with no workgroupsize, so a fixed `(256,)` would
+    # mismatch the rank, and a leading-singleton ndrange must not collapse to 1 lane.
     if workgroupsize === nothing
-        return ntuple(d -> d == 1 ? min(256, nd[1]) : 1, length(nd))
+        return _default_wgsize(nd)
     end
     workgroupsize isa Integer && return (workgroupsize,)
     return Tuple(workgroupsize)
@@ -559,7 +653,7 @@ end
 # Low-level form: explicit (gpu_body, full_argtypes::Type). `optimize` toggles the
 # SCI optimization passes (DCE/CSE/LICM) — handy for opt-vs-raw codegen diffs.
 function MK.code_gpu(io::IO, @nospecialize(f), full_argtypes::Type; level::Symbol=:ptx,
-                     sm="sm_90", feat="+ptx80", nd_dims=Int[], optimize::Bool=true)
+                     sm=nothing, feat=nothing, nd_dims=Int[], optimize::Bool=true)
     stages = _codegen_stages(f, full_argtypes; sm, feat, upto=level, nd_dims, optimize)
     print(io, stages[level])
     return nothing
@@ -569,7 +663,7 @@ MK.code_gpu(@nospecialize(f), full_argtypes::Type; kwargs...) =
 
 # Ergonomic form: a KA kernel + launch args (mirrors a `(obj)(args…; ndrange)`).
 function MK.code_gpu(io::IO, obj::KA.Kernel{MLIRCUDABackend}, args...; level::Symbol=:ptx,
-                     ndrange=nothing, workgroupsize=nothing, sm="sm_90", feat="+ptx80",
+                     ndrange=nothing, workgroupsize=nothing, sm=nothing, feat=nothing,
                      optimize::Bool=true)
     full_argtypes, nd, _wg = _launch_setup(obj, args, ndrange, workgroupsize)
     return MK.code_gpu(io, obj.f, full_argtypes; level, sm, feat, nd_dims=Int[nd...], optimize)

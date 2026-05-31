@@ -132,6 +132,10 @@ representation at one stage of the codegen pipeline:
   - `:llvm`    — the LLVM IR (textual `.ll`) carried in the `gpu.binary`
   - `:ptx`     — the final PTX assembly (what the driver JITs to SASS)
 
+`sm`/`feat` default to the host GPU's target — the compute capability and PTX ISA
+CUDA.jl itself would select for this device — and may be overridden (e.g.
+`sm="sm_75"`, `feat="+ptx80"`) to reflect code for a different architecture.
+
 Two call forms (the method lives in `MLIRCUDAExt`; CUDA + LLVM + KA must be
 loaded):
 

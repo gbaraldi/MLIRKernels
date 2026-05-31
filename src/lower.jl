@@ -1702,6 +1702,33 @@ function emit_exception!(lc::LowerCtx)
     return nothing
 end
 
+# Column-major linear index (1-based) over `ndims` GPU dimensions, returned as
+# `lane_t`:  1 + c₀ + c₁·e₀ + c₂·e₀·e₁ + …  where `coord(da)` emits the per-dim
+# 0-based coordinate (IndexType) and `extent(da)` the per-dim extent. Used for
+# `@index(Local, Linear)` (coord=thread_id, extent=block_dim) and
+# `@index(Group, Linear)` (coord=block_id, extent=grid_dim) — both linearise over
+# the PHYSICAL block/grid (runtime gpu ops), so a dim>1 thread/block no longer
+# collapses onto its dim-1 sibling. (The unused trailing dims of a lower-rank
+# launch are absent — `ndims` = the ndrange rank.) The GLOBAL index is separate:
+# it linearises over the LOGICAL ndrange (`nd_dims`), since the grid is padded.
+function _emit_gpu_linear_index!(coord, extent, ndims::Int, lane_t::IR.Type)
+    idx_t = IR.IndexType()
+    dimattr = ("#gpu<dim x>", "#gpu<dim y>", "#gpu<dim z>")
+    local lin, stride
+    for d in 1:ndims
+        da = parse(IR.Attribute, dimattr[d])
+        c  = coord(da)
+        contrib = d == 1 ? c : IR.result(_arith.muli(c, stride; result=idx_t))
+        lin = d == 1 ? contrib : IR.result(_arith.addi(lin, contrib; result=idx_t))
+        if d < ndims
+            e = extent(da)
+            stride = d == 1 ? e : IR.result(_arith.muli(stride, e; result=idx_t))
+        end
+    end
+    one = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
+    return IR.result(_arith.index_cast(IR.result(_arith.addi(lin, one; result=idx_t)); out=lane_t))
+end
+
 function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
                     args::Vector{Any}, @nospecialize(typ); mi=nothing)
     fname = callee_name(callee)
@@ -1805,16 +1832,18 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     end
 
     # Local linear index (1-based): CPU SPMD = vector splat(1)+step(0..W-1);
-    # GPU SIMT (lane_width==1) = gpu.thread_id + 1 (scalar).
+    # GPU SIMT (lane_width==1) = COLUMN-MAJOR linearisation of thread_id over the
+    # block (thread_id.x + thread_id.y·block_dim.x + … + 1) — was dim-x-only, which
+    # collapsed every thread in a multi-dim block onto lid 1..block_dim.x.
     if fname === :local_index && lc.spmd
         lane_t = mlir_elem_type(lc.lane_idx_type)
         if lc.lane_width == 1                      # GPU SIMT
             idx_t = IR.IndexType()
-            dimx = parse(IR.Attribute, "#gpu<dim x>")
-            tid  = IR.result(_gpu.thread_id(; result_0=idx_t, dimension=dimx))
-            one  = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
-            l1   = IR.result(_arith.addi(tid, one; result=idx_t))
-            return IR.result(_arith.index_cast(l1; out=lane_t))
+            nd = max(1, length(lc.nd_dims))        # block rank == ndrange rank
+            return _emit_gpu_linear_index!(
+                da -> IR.result(_gpu.thread_id(; result_0=idx_t, dimension=da)),
+                da -> IR.result(_gpu.block_dim(; result_0=idx_t, dimension=da)),
+                nd, lane_t)
         else                                        # CPU SPMD: splat(1) + step
             vt   = IR.VectorType(1, Int[lc.lane_width], lane_t)
             step = _emit_step_vec(vt, lc.lane_idx_type, lc.lane_width)
@@ -1824,17 +1853,23 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         end
     end
 
-    # Group linear index (1-based, uniform scalar): CPU = bid+1; GPU = block_id+1.
-    # Scalar result; `_spmd_harmonise`/`_broadcast_to_match` lift it on use.
+    # Group linear index (1-based, uniform scalar): CPU = bid+1; GPU = COLUMN-MAJOR
+    # linearisation of block_id over the grid (block_id.x + block_id.y·grid_dim.x +
+    # … + 1) — was dim-x-only, which collapsed every block in a multi-dim grid onto
+    # the same group index. `_spmd_harmonise`/`_broadcast_to_match` lift it on use.
     if fname === :group_index && lc.spmd
         idx_t = IR.IndexType(); lane_t = mlir_elem_type(lc.lane_idx_type)
-        bid = lc.lane_width == 1 ?
-            IR.result(_gpu.block_id(; result_0=idx_t,
-                       dimension=parse(IR.Attribute, "#gpu<dim x>"))) :
-            lc.bids[1]
-        one = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
-        g1  = IR.result(_arith.addi(bid, one; result=idx_t))
-        return IR.result(_arith.index_cast(g1; out=lane_t))
+        if lc.lane_width == 1                      # GPU SIMT
+            nd = max(1, length(lc.nd_dims))        # grid rank == ndrange rank
+            return _emit_gpu_linear_index!(
+                da -> IR.result(_gpu.block_id(; result_0=idx_t, dimension=da)),
+                da -> IR.result(_gpu.grid_dim(; result_0=idx_t, dimension=da)),
+                nd, lane_t)
+        else                                        # CPU SPMD: bid+1
+            bid = lc.bids[1]
+            one = IR.result(_arith.constant(; value=IR.Attribute(Int(1), idx_t)))
+            return IR.result(_arith.index_cast(IR.result(_arith.addi(bid, one; result=idx_t)); out=lane_t))
+        end
     end
 
     # Group size (uniform count): CPU = lane_width const; GPU = block_dim.
@@ -3932,7 +3967,11 @@ function emit_spmd_atomic_modifyindex!(lc::LowerCtx, args, @nospecialize(typ))
                 end
             haskey(lc.arg_vals, arg_id) ||
                 error("modifyindex_atomic!: no bound memref for arg $arg_id")
-            (lc.arg_vals[arg_id], lc.arg_elem_types[arg_id])
+            # Flatten a multi-dim arg memref to 1-D (as normal access does, see
+            # emit_spmd_memoryrefnew!) so the COLUMN-MAJOR linear index from the
+            # Atomix overlay drives a single-subscript atomic_rmw (an N-D memref
+            # would otherwise demand N subscripts).
+            (_flatten_memref(lc.arg_vals[arg_id]), lc.arg_elem_types[arg_id])
         end
 
     # Reduction op → memref.atomic_rmw kind keyword.

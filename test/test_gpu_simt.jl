@@ -323,6 +323,23 @@ end
     @inbounds out[i] = x + 1f0
 end
 
+# Multi-dim @index Linear: Local/Group Linear must linearise COLUMN-MAJOR over the
+# block/grid (was dim-x-only → all dim>1 threads/blocks collapsed onto dim-1).
+@kernel function _g_locallin!(out)
+    gi = @index(Global, Linear); li = @index(Local, Linear)
+    @inbounds out[gi] = li
+end
+@kernel function _g_grouplin!(out)
+    gi = @index(Global, Linear); gid = @index(Group, Linear)
+    @inbounds out[gi] = gid
+end
+# N-D @atomic: A[i,j] must hit the column-major linear element (was indices[1]-only).
+@kernel function _g_hist2d!(H, @Const(rs), @Const(cs))
+    i = @index(Global, Linear)
+    @inbounds r = rs[i]; @inbounds c = cs[i]
+    Atomix.@atomic H[r, c] += Int32(1)
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -589,6 +606,25 @@ end
             @test_throws CUDA.CUDACore.KernelException begin
                 _g_voidthrow!(backend, 64)(vbo, vba; ndrange=N); CUDA.synchronize()
             end
+        end
+
+        # Multi-dim @index(Local/Group, Linear): column-major over the block/grid.
+        let lo = MLIRArray(CUDA.zeros(Int, 256))    # 16×16 block, 1 block: global==local
+            _g_locallin!(backend, (16, 16))(lo; ndrange=(16, 16)); CUDA.synchronize()
+            @test Array(lo) == collect(1:256)        # x-only would give 16 distinct values
+            go = MLIRArray(CUDA.zeros(Int, 32 * 32)) # group (16,16), ndrange (32,32) → 2×2 grid
+            _g_grouplin!(backend, (16, 16))(go; ndrange=(32, 32)); CUDA.synchronize()
+            @test sort(unique(Array(go))) == [1, 2, 3, 4]   # x-only would give [1,2]
+        end
+
+        # N-D @atomic A[i,j]: full column-major linear element, not indices[1].
+        let nb = 4, M = 4096
+            rs = rand(1:nb, M); cs = rand(1:nb, M)
+            drs = MLIRArray(CUDA.CuArray(Int.(rs))); dcs = MLIRArray(CUDA.CuArray(Int.(cs)))
+            Hh = MLIRArray(CUDA.zeros(Int32, nb, nb))
+            _g_hist2d!(backend, 256)(Hh, drs, dcs; ndrange=M); CUDA.synchronize()
+            ref = zeros(Int32, nb, nb); for k in 1:M; ref[rs[k], cs[k]] += 1; end
+            @test Array(Hh) == ref
         end
     end
 end

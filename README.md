@@ -132,7 +132,7 @@ harmonization the CPU `vector<W>` path needs.
 ### GPU pass pipeline (in-process, via MLIR.jl + LLVM.jl)
 
 ```
-nvvm-attach-target{chip=sm_90 features=+ptx80}
+nvvm-attach-target{chip=<host sm> features=<host +ptxNN>}   # detected per device
 gpu-kernel-outlining
 gpu.module(convert-gpu-to-nvvm)
 convert-scf-to-cf, convert-cf-to-llvm, convert-arith-to-llvm
