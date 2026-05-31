@@ -88,12 +88,14 @@ total_stmts(sci::StructuredIRCode) = count_calls(sci, nothing)
         sci = build_sci(g, (Int, Int))
         before = total_stmts(sci)
 
-        # Insert `add_int(_2, _3)` before the first instruction; never used.
+        # Insert `add_int(_2, _3)` before the first instruction; never used. A real
+        # dead pure op is fully REMOVABLE (effect-free AND nothrow AND terminates),
+        # so flag it that way — DCE drops only fully-removable dead calls.
         entry = sci.entry
         first_inst = first(instructions(entry))
         dead = insert_before!(entry, first_inst,
                               Expr(:call, Base.add_int, Core.Argument(2), Core.Argument(3)),
-                              Int; flag=CC.IR_FLAG_EFFECT_FREE)
+                              Int; flag=CC.IR_FLAGS_REMOVABLE)
         @test total_stmts(sci) == before + 1
         @test validate_ssa_defs(sci)
 
@@ -101,6 +103,25 @@ total_stmts(sci::StructuredIRCode) = count_calls(sci, nothing)
         @test total_stmts(sci) == before       # dead stmt removed
         @test validate_ssa_defs(sci)
         @test execute(sci, 7, 8) == g(7, 8)
+    end
+
+    @testset "DCE keeps a dead but can-throw (effect-free, not nothrow) call" begin
+        # A conditionally-throwing helper is EFFECT_FREE but NOT NOTHROW; dropping
+        # it would silently erase a `throw`. DCE must drop only fully-removable
+        # ops, so an effect-free-but-can-throw dead op is KEPT.
+        g(x, y) = x + y
+        sci = build_sci(g, (Int, Int))
+        before = total_stmts(sci)
+        entry = sci.entry
+        first_inst = first(instructions(entry))
+        # EFFECT_FREE only (can throw): the same op the old test used — must survive.
+        insert_before!(entry, first_inst,
+                       Expr(:call, Base.add_int, Core.Argument(2), Core.Argument(3)),
+                       Int; flag=CC.IR_FLAG_EFFECT_FREE)
+        @test total_stmts(sci) == before + 1
+        dce_pass!(sci)
+        @test total_stmts(sci) == before + 1   # NOT dropped (effect-free but not nothrow)
+        @test validate_ssa_defs(sci)
     end
 
     @testset "DCE removes a dead loop carry / dead value" begin

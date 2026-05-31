@@ -2060,7 +2060,16 @@ function emit_outlined_call!(lc::LowerCtx, idx::Int, @nospecialize(ci),
     # Widen the result type: a `Core.Const` result (e.g. an un-inlined void kernel
     # body typed `Const(nothing)`, or a `Const(<number>)`) widens to its concrete
     # type — `Nothing` → a void func.call, a numeric/struct const → its MLIR type.
+    # Result type. The CALL-SITE `typ` can be wider than the callee's own return
+    # (e.g. the kernel's inference widens an unused void helper to `Any`); a wider
+    # type also wouldn't match the func.func result _emit_outlined_func! emits. So
+    # when `typ` isn't concrete, use the callee's OWN re-inferred return type (the
+    # same inference _emit_outlined_func! runs) — Nothing -> a void func.call.
     rt = Core.Compiler.widenconst(typ)
+    if !isconcretetype(rt)
+        r = Base.code_ircode_by_type(sig; interp=Frontend.FrontendInterpreter())
+        isempty(r) || (rt = Core.Compiler.widenconst(r[1][2]))
+    end
     ret = (rt === Nothing) ? IR.Type[] : IR.Type[mlir_elem_type(rt)]
     res = _func.call(operands; result_0=ret, callee=parse(IR.Attribute, "@" * sym))
     return isempty(ret) ? nothing : IR.result(res)

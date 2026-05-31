@@ -310,6 +310,19 @@ end
     @inbounds out[i] = acc
 end
 
+# A VOID @noinline validation helper that only conditionally throws (returns
+# nothing on the good path) called purely for effect. Inference flags it
+# effect-free (the throw violates :nothrow, not :effect_free), so DCE must keep
+# it via the full-removable gate — dropping it (the old effect-free-only gate)
+# silently erased the check. Regression for the DCE-throwing-helper fix.
+@noinline _g_check_nonneg(x::Float32) = (x < 0f0 && throw(DomainError(x, "neg")); nothing)
+@kernel function _g_voidthrow!(out, @Const(a))
+    i = @index(Global, Linear)
+    x = @inbounds a[i]
+    _g_check_nonneg(x)
+    @inbounds out[i] = x + 1f0
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -561,6 +574,20 @@ end
             tbad = MLIRArray(CUDA.CuArray(badv)); tbo = MLIRArray(CUDA.zeros(Float32, L))
             @test_throws CUDA.CUDACore.KernelException begin
                 _g_loopthrow!(backend, L)(tbo, tbad, L; ndrange=L); CUDA.synchronize()
+            end
+        end
+
+        # A void conditionally-throwing @noinline helper called for effect: DCE
+        # must KEEP it (effect-free but not nothrow) so the check fires. Good input
+        # runs clean; a negative element raises.
+        let N = 64
+            va = MLIRArray(CUDA.CuArray(fill(2f0, N))); vo = MLIRArray(CUDA.zeros(Float32, N))
+            _g_voidthrow!(backend, 64)(vo, va; ndrange=N); CUDA.synchronize()
+            @test Array(vo) ≈ fill(3f0, N)                     # helper kept, no false throw
+            vbad = fill(2f0, N); vbad[9] = -1f0
+            vba = MLIRArray(CUDA.CuArray(vbad)); vbo = MLIRArray(CUDA.zeros(Float32, N))
+            @test_throws CUDA.CUDACore.KernelException begin
+                _g_voidthrow!(backend, 64)(vbo, vba; ndrange=N); CUDA.synchronize()
             end
         end
     end

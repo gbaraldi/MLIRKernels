@@ -95,3 +95,18 @@ stmt_effect_free(inst::Instruction) =
     CC.has_flag(inst[:flag], CC.IR_FLAG_EFFECT_FREE)
 
 stmt_effect_free(flag::UInt32) = CC.has_flag(flag, CC.IR_FLAG_EFFECT_FREE)
+
+"""
+    stmt_removable(inst) -> Bool
+
+Whether `inst` can be deleted/speculatively executed with NO observable effect —
+Julia inference's full removability mask `IR_FLAGS_REMOVABLE`
+(`EFFECT_FREE & NOTHROW & TERMINATES`). `effect_free` ALONE is not enough to drop
+or hoist a call: a conditionally-throwing helper is `effect_free` but NOT
+`nothrow`, and dropping it (DCE) erases a `throw` that should fire, while hoisting
+it (LICM) executes a fault that a zero-trip loop would have skipped.
+"""
+stmt_removable(inst::Instruction) =
+    CC.has_flag(inst[:flag], CC.IR_FLAGS_REMOVABLE)
+
+stmt_removable(flag::UInt32) = CC.has_flag(flag, CC.IR_FLAGS_REMOVABLE)

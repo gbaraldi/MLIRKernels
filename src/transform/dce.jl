@@ -120,8 +120,13 @@ function inst_must_keep(block::Block, inst::Instruction)
     if s isa Expr
         call = resolve_call(block, s)
         if call !== nothing
-            # A call is droppable only when inference proved it effect-free.
-            return !stmt_effect_free(inst)
+            # A call is droppable only when inference proved it fully REMOVABLE
+            # (effect-free AND nothrow AND terminates). `effect_free` alone is a
+            # bug: a conditionally-throwing helper (returns on some paths, throws
+            # on others) is effect_free but NOT nothrow and is typed `Nothing`
+            # (so the `Union{}` keep-rule above misses it) — dropping it would
+            # silently erase a `throw` that should fire a device exception.
+            return !stmt_removable(inst)
         end
         # Non-call Exprs (:boundscheck, :foreigncall, :new with mutable type…):
         # keep unless effect-free.

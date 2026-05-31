@@ -53,10 +53,14 @@ function collect_loops!(result, block::Block)
     end
 end
 
-# Whether a (resolvable) instruction is safe to hoist: effect-free, and not a
-# memory load whose value depends on loop-mutated state.
+# Whether a (resolvable) instruction is safe to hoist to the loop preheader:
+# fully REMOVABLE (effect-free AND nothrow AND terminates), and not a memory load
+# whose value depends on loop-mutated state. `effect_free` alone is unsound —
+# hoisting moves the op to the UNCONDITIONAL preheader, so a faulting-but-
+# effect-free op (e.g. an invariant `÷`/`checked_*`) would execute and fault even
+# when a zero-trip loop never reached it.
 function is_hoistable(body::Block, inst::Instruction)
-    stmt_effect_free(inst) || return false
+    stmt_removable(inst) || return false
     call = resolve_call(body, inst)
     if call !== nothing
         func, _ = call
