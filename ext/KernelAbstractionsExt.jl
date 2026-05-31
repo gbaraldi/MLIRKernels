@@ -49,14 +49,14 @@ struct MLIRBackend <: KA.GPU end
 # method additions to OUR table — precompile-safe.
 
 # `__index_Global_Linear(ctx)` → global linear thread index (1-based).
-@overlay FE.METHOD_TABLE KA.__index_Global_Linear(ctx) = FE.Intrinsics.global_index()
+@overlay FE.METHOD_TABLE KA.__index_Global_Linear(ctx) = FE.Intrinsics.__mlirkernels_global_index()
 
 # `@index(Local, Linear)` / `@index(Group, Linear)` expand to one-arg `(ctx)`
 # calls (the `:Linear` kind is a macro-stripped literal), so the unary overlay
 # is the matching one. KA's 2-arg `(ctx, ::CartesianIndex)` defs in cpu.jl are
 # CPU-emit-only and never reached on the Frontend path.
-@overlay FE.METHOD_TABLE KA.__index_Local_Linear(ctx) = FE.Intrinsics.local_index()
-@overlay FE.METHOD_TABLE KA.__index_Group_Linear(ctx) = FE.Intrinsics.group_index()
+@overlay FE.METHOD_TABLE KA.__index_Local_Linear(ctx) = FE.Intrinsics.__mlirkernels_local_index()
+@overlay FE.METHOD_TABLE KA.__index_Group_Linear(ctx) = FE.Intrinsics.__mlirkernels_group_index()
 
 # `@groupsize()` → the workgroup size as an `NTuple` (KA semantics). We return
 # the STATIC size straight off the ctx type (the workgroup `StaticSize` is the
@@ -84,13 +84,13 @@ struct MLIRBackend <: KA.GPU end
 # per-dim vectors. (`@index(…, Cartesian)` / N-D `__validindex` masking are TODO.)
 @overlay FE.METHOD_TABLE KA.__index_Global_NTuple(
         ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
-    FE.Intrinsics.global_ntuple(Val(N))
+    FE.Intrinsics.__mlirkernels_global_ntuple(Val(N))
 @overlay FE.METHOD_TABLE KA.__index_Local_NTuple(
         ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
-    FE.Intrinsics.local_ntuple(Val(N))
+    FE.Intrinsics.__mlirkernels_local_ntuple(Val(N))
 @overlay FE.METHOD_TABLE KA.__index_Group_NTuple(
         ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
-    FE.Intrinsics.group_ntuple(Val(N))
+    FE.Intrinsics.__mlirkernels_group_ntuple(Val(N))
 
 # `@index(…, Cartesian)` → a `CartesianIndex{N}` wrapping the same per-dim coords
 # as the NTuple form (CartesianIndex's `.I` field IS the NTuple). `A[I]` then
@@ -98,22 +98,22 @@ struct MLIRBackend <: KA.GPU end
 # GPUArrays uses this form heavily (broadcast/copy/clamp/transpose/…).
 @overlay FE.METHOD_TABLE KA.__index_Global_Cartesian(
         ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
-    CartesianIndex(FE.Intrinsics.global_ntuple(Val(N)))
+    CartesianIndex(FE.Intrinsics.__mlirkernels_global_ntuple(Val(N)))
 @overlay FE.METHOD_TABLE KA.__index_Local_Cartesian(
         ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
-    CartesianIndex(FE.Intrinsics.local_ntuple(Val(N)))
+    CartesianIndex(FE.Intrinsics.__mlirkernels_local_ntuple(Val(N)))
 @overlay FE.METHOD_TABLE KA.__index_Group_Cartesian(
         ctx::KA.CompilerMetadata{A,B,C,D,<:NDI.NDRange{N}}) where {A,B,C,D,N} =
-    CartesianIndex(FE.Intrinsics.group_ntuple(Val(N)))
+    CartesianIndex(FE.Intrinsics.__mlirkernels_group_ntuple(Val(N)))
 
 # `__validindex(ctx)` — tail-block masking; walker lowers the marker (GPU:
 # `∧_d (global_d < ndrange[d])`, CPU: `true`).
-@overlay FE.METHOD_TABLE KA.__validindex(ctx) = FE.Intrinsics.valid_index()
+@overlay FE.METHOD_TABLE KA.__validindex(ctx) = FE.Intrinsics.__mlirkernels_valid_index()
 
 # `__synchronize()` → workgroup barrier marker. CPU SIMD has no warp barrier
 # so the walker lowers `:barrier` to a no-op; on the GPU SIMT path with no
 # cross-lane communication this is correct for the current scope.
-@overlay FE.METHOD_TABLE KA.__synchronize() = FE.Intrinsics.barrier()
+@overlay FE.METHOD_TABLE KA.__synchronize() = FE.Intrinsics.__mlirkernels_barrier()
 
 # `@localmem T dims` → `SharedMemory(T, Val(dims), Val(id))`. Map onto the
 # `shared_alloc` marker (dropping the gensym id — the walker emits a distinct
@@ -121,7 +121,7 @@ struct MLIRBackend <: KA.GPU end
 # The walker lowers it to a workgroup-address-space `memref.alloca` (real GPU
 # shared memory on the SIMT path); `@synchronize` becomes a `gpu.barrier`.
 @overlay FE.METHOD_TABLE KA.SharedMemory(::Type{T}, ::Val{Dims}, ::Val) where {T, Dims} =
-    FE.Intrinsics.shared_alloc(T, Val(Dims))
+    FE.Intrinsics.__mlirkernels_shared_alloc(T, Val(Dims))
 
 # `for i in start:step:stop` builds a StepRange whose last element comes from
 # `Base.steprange_last`. The default pulls in `ArgumentError`, a `@noinline
@@ -148,7 +148,7 @@ end
 # per-thread `.local` on GPU). Unlike KA's CPU Scratchpad we don't add the
 # implicit workitem dimension (SIMT gives each thread its own copy directly).
 @overlay FE.METHOD_TABLE KA.Scratchpad(ctx, ::Type{T}, ::Val{Dims}) where {T, Dims} =
-    FE.Intrinsics.private_alloc(T, Val(Dims))
+    FE.Intrinsics.__mlirkernels_private_alloc(T, Val(Dims))
 
 # `KA.@atomic` / `Atomix.@atomic arr[i] op= x` — KA's *portable* atomic, the
 # form KA docs recommend (CUDA/AMDGPU/oneAPI all override `Atomix.modify!` for
@@ -168,7 +168,7 @@ end
     # hits the right element — passing only `indices[1]` updated linear slot i,
     # ignoring j (wrong, and OOB for i>size(A,1)). For a 1-D ref this is just i.
     lin = @inbounds Base.LinearIndices(ref.data)[ref.indices...]
-    FE.Intrinsics.atomic_index!(ref.data, op, x, lin)
+    FE.Intrinsics.__mlirkernels_atomic_index!(ref.data, op, x, lin)
     return (x, x)
 end
 

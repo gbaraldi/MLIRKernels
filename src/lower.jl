@@ -1742,9 +1742,9 @@ end
 # builtins matched by name on purpose). A user function sharing one of these names
 # would otherwise be silently lowered to the intrinsic.
 const _INTRINSIC_MARKERS = Set{Symbol}((
-    :global_index, :block_index, :block_dim, :local_index, :group_index,
-    :group_size, :barrier, :valid_index, :atomic_index!,
-    :global_ntuple, :local_ntuple, :group_ntuple, :shared_alloc, :private_alloc,
+    :__mlirkernels_global_index, :__mlirkernels_block_index, :__mlirkernels_block_dim, :__mlirkernels_local_index, :__mlirkernels_group_index,
+    :__mlirkernels_group_size, :__mlirkernels_barrier, :__mlirkernels_valid_index, :__mlirkernels_atomic_index!,
+    :__mlirkernels_global_ntuple, :__mlirkernels_local_ntuple, :__mlirkernels_group_ntuple, :__mlirkernels_shared_alloc, :__mlirkernels_private_alloc,
 ))
 
 # Whether a matched marker name is the REAL intrinsic — i.e. the callee actually
@@ -1801,10 +1801,10 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
             return emit_spmd_memoryrefget!(lc, args, typ)
         elseif fname === :memoryrefset!
             return emit_spmd_memoryrefset!(lc, args, typ)
-        elseif fname === :atomic_index!
+        elseif fname === :__mlirkernels_atomic_index!
             # KA.@atomic / Atomix.@atomic — KA's *portable* atomic. The KA
             # extension overlays `Atomix.modify!(IndexableRef, op, x, ord)` onto
-            # `Frontend.Intrinsics.atomic_index!(arr, op, val, idx)`, so by the
+            # `Frontend.Intrinsics.__mlirkernels_atomic_index!(arr, op, val, idx)`, so by the
             # time the walker sees it the call is a clean marker (not the raw
             # pointer-arithmetic + `atomicrmw` llvmcall it would otherwise inline
             # to). Adapt to the modifyindex emitter, which expects
@@ -1814,7 +1814,7 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
                 (args[1], args[1], args[2], args[3], args[4]), typ)
         elseif fname === :modifyindex_atomic!
             # Bare `Base.@atomic arr[i] op= x` (CPU array) → Base.modifyindex_atomic!.
-            # Not the KA-portable form (that's `KA.@atomic`/`:atomic_index!`
+            # Not the KA-portable form (that's `KA.@atomic`/`:__mlirkernels_atomic_index!`
             # above) but Julia-native array atomics work on this path too.
             return emit_spmd_atomic_modifyindex!(lc, args, typ)
         elseif fname === :throw_methoderror && length(args) >= 1 &&
@@ -1856,11 +1856,11 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         return emit_raw_core_intrinsic!(lc, fname, args, typ)
     end
 
-    # Lane-index sentinel. `Frontend.Intrinsics.global_index` marks the global
+    # Lane-index sentinel. `Frontend.Intrinsics.__mlirkernels_global_index` marks the global
     # thread index; the walker binds it to the lane value synthesized per grid
     # step — a `vector<W×iX>` on the CPU/SPMD path, or a scalar `gpu.thread_id +
     # block_id*block_dim` on the GPU SIMT path.
-    if fname === :global_index && lc.spmd && haskey(lc.arg_vals, lc.lane_arg)
+    if fname === :__mlirkernels_global_index && lc.spmd && haskey(lc.arg_vals, lc.lane_arg)
         return lc.arg_vals[lc.lane_arg]
     end
 
@@ -1868,7 +1868,7 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     # GPU SIMT (lane_width==1) = COLUMN-MAJOR linearisation of thread_id over the
     # block (thread_id.x + thread_id.y·block_dim.x + … + 1) — was dim-x-only, which
     # collapsed every thread in a multi-dim block onto lid 1..block_dim.x.
-    if fname === :local_index && lc.spmd
+    if fname === :__mlirkernels_local_index && lc.spmd
         lane_t = mlir_elem_type(lc.lane_idx_type)
         if lc.lane_width == 1                      # GPU SIMT
             idx_t = IR.IndexType()
@@ -1890,7 +1890,7 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     # linearisation of block_id over the grid (block_id.x + block_id.y·grid_dim.x +
     # … + 1) — was dim-x-only, which collapsed every block in a multi-dim grid onto
     # the same group index. `_spmd_harmonise`/`_broadcast_to_match` lift it on use.
-    if fname === :group_index && lc.spmd
+    if fname === :__mlirkernels_group_index && lc.spmd
         idx_t = IR.IndexType(); lane_t = mlir_elem_type(lc.lane_idx_type)
         if lc.lane_width == 1                      # GPU SIMT
             nd = max(1, length(lc.nd_dims))        # grid rank == ndrange rank
@@ -1906,7 +1906,7 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     end
 
     # Group size (uniform count): CPU = lane_width const; GPU = block_dim.
-    if fname === :group_size && lc.spmd
+    if fname === :__mlirkernels_group_size && lc.spmd
         lane_t = mlir_elem_type(lc.lane_idx_type)
         if lc.lane_width == 1                      # GPU
             idx_t = IR.IndexType()
@@ -1923,10 +1923,10 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     # registered as the marker result's tuple components (`ssa_multi`). The
     # kernel's `i, j = @index(…, NTuple)` destructure becomes `getfield(result,
     # d)`, which returns component `d` directly.
-    if (fname === :global_ntuple || fname === :local_ntuple ||
-        fname === :group_ntuple) && lc.spmd
-        kind = fname === :global_ntuple ? :global :
-               fname === :local_ntuple  ? :local : :group
+    if (fname === :__mlirkernels_global_ntuple || fname === :__mlirkernels_local_ntuple ||
+        fname === :__mlirkernels_group_ntuple) && lc.spmd
+        kind = fname === :__mlirkernels_global_ntuple ? :global :
+               fname === :__mlirkernels_local_ntuple  ? :local : :group
         # Grid rank N is carried by the marker's `Val{N}` arg (the only source
         # on the GPU path, where lc.wg_dims is empty).
         a1 = args[1]
@@ -1939,20 +1939,20 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
 
     # `@localmem` (shared_alloc) / `@private` (private_alloc) → a workgroup or
     # per-thread buffer, tracked so `buf[…]` accesses route to it.
-    if fname === :shared_alloc && lc.spmd
+    if fname === :__mlirkernels_shared_alloc && lc.spmd
         return emit_local_buffer!(lc, idx, args, true)
     end
-    if fname === :private_alloc && lc.spmd
+    if fname === :__mlirkernels_private_alloc && lc.spmd
         return emit_local_buffer!(lc, idx, args, false)
     end
 
-    # Workgroup barrier marker (`Frontend.Intrinsics.barrier`, from KA
+    # Workgroup barrier marker (`Frontend.Intrinsics.__mlirkernels_barrier`, from KA
     # `@synchronize`). On the GPU SIMT path it's a real `gpu.barrier` (threads
     # are hardware lanes, so it actually synchronizes shared-memory writes/reads).
     # On the CPU SIMD path the W lanes are SIMD lanes of one thread executing in
     # lockstep, so a barrier is a no-op (the scatter→gather data dependency
     # already orders shared writes before reads — see project_simt_over_cpu_simd).
-    if fname === :barrier && lc.spmd
+    if fname === :__mlirkernels_barrier && lc.spmd
         lc.lane_width == 1 && _gpu.barrier()
         return nothing
     end
@@ -1960,7 +1960,7 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
     # Tail-block masking. GPU SIMT: valid iff in range on every dim,
     # `∧_d (thread_id.d + block_id.d*block_dim.d < ndrange[d])`. CPU SPMD: always
     # true.
-    if fname === :valid_index && lc.spmd
+    if fname === :__mlirkernels_valid_index && lc.spmd
         if lc.gpu_module_block !== nothing && !isempty(lc.nd_dims)
             idx_t = IR.IndexType()
             dimnames = ("x", "y", "z")

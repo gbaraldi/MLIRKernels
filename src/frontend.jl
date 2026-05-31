@@ -23,32 +23,42 @@ using IRStructurizer: StructuredIRCode
 module Intrinsics
     using Base: compilerbarrier
 
+    # These markers are the functions the MLIR walker pattern-matches BY NAME
+    # (`fname === :__mlirkernels_*`) to recognise a KA intrinsic. They therefore
+    # carry the deliberately uncommon `__mlirkernels_` prefix so a user kernel that
+    # defines its own `barrier`/`local_index`/`group_size`/… is NOT mistaken for the
+    # intrinsic (the walker also gates on `isintrinsic`/parentmodule, but the mangled
+    # name makes a collision essentially impossible — and lets users shadow the
+    # natural names freely). cuTile.jl avoids this entirely by dispatching its
+    # intrinsics on function identity (`emit_intrinsic!(::typeof(Intrinsics.f))`);
+    # our walker matches names, so we mangle them instead.
+
     # Global linear thread index (1-based, Julia semantics). The walker binds
     # this to the SPMD lane vector (CPU) or `gpu.thread_id + block_id*block_dim`
     # (GPU SIMT).
-    @noinline global_index() = compilerbarrier(:type, zero(Int32))::Int32
+    @noinline __mlirkernels_global_index() = compilerbarrier(:type, zero(Int32))::Int32
 
     # Block / workgroup index along a dimension (0-based). `dim` ∈ (0,1,2).
-    @noinline block_index(dim::Int32) = compilerbarrier(:type, zero(Int32))::Int32
+    @noinline __mlirkernels_block_index(dim::Int32) = compilerbarrier(:type, zero(Int32))::Int32
 
     # Block (workgroup) dimension along an axis.
-    @noinline block_dim(dim::Int32) = compilerbarrier(:type, zero(Int32))::Int32
+    @noinline __mlirkernels_block_dim(dim::Int32) = compilerbarrier(:type, zero(Int32))::Int32
 
     # Local linear index within the workgroup (1-based). CPU = lane step+1; GPU = thread_id+1.
-    @noinline local_index() = compilerbarrier(:type, zero(Int32))::Int32
+    @noinline __mlirkernels_local_index() = compilerbarrier(:type, zero(Int32))::Int32
 
     # Group (workgroup/block) linear index (1-based). CPU = bid+1 (uniform); GPU = block_id+1.
-    @noinline group_index() = compilerbarrier(:type, zero(Int32))::Int32
+    @noinline __mlirkernels_group_index() = compilerbarrier(:type, zero(Int32))::Int32
 
     # Workgroup size (count). CPU = lane_width const; GPU = block_dim.
-    @noinline group_size() = compilerbarrier(:type, zero(Int32))::Int32
+    @noinline __mlirkernels_group_size() = compilerbarrier(:type, zero(Int32))::Int32
 
     # Workgroup barrier (CPU: no-op; GPU: gpu.barrier). Returns nothing.
     # `Base.donotdelete` is essential: the barrier has no result and is otherwise
     # effect-free, so without it DCE deletes the call before the walker sees it
     # and `@synchronize` silently vanishes — fatal for cross-lane shared memory
     # (the reads race ahead of the writes). Same fix as `atomic_index!`.
-    @noinline function barrier()
+    @noinline function __mlirkernels_barrier()
         Base.donotdelete(0)
         return compilerbarrier(:type, nothing)
     end
@@ -57,7 +67,7 @@ module Intrinsics
     # The walker lowers it to `∧_d (global_d < ndrange[d])` on GPU (padded last
     # block's out-of-range threads do nothing), `true` on CPU. `compilerbarrier`
     # keeps it from folding so the guarding `if` survives inference.
-    @noinline valid_index() = compilerbarrier(:type, true)::Bool
+    @noinline __mlirkernels_valid_index() = compilerbarrier(:type, true)::Bool
 
     # Atomic read-modify-write at a 1-based linear index. The KA extension
     # overlays `Atomix.modify!(IndexableRef, op, x, ord)` — i.e. `KA.@atomic` /
@@ -73,7 +83,7 @@ module Intrinsics
     # marker is inferred effect-free and DCE deletes the whole call before the
     # walker ever sees it — the atomic silently vanishes. `donotdelete` makes the
     # method `!effect_free`, so the call is preserved for the walker to rewrite.
-    @noinline function atomic_index!(arr, op, val, idx)
+    @noinline function __mlirkernels_atomic_index!(arr, op, val, idx)
         Base.donotdelete(arr, val, idx)
         return compilerbarrier(:type, val)
     end
@@ -85,11 +95,11 @@ module Intrinsics
     # registers them as the tuple's components, so `i, j = @index(…, NTuple)`
     # binds `i`/`j` to the right per-lane vectors. Returning a concrete-arity
     # `NTuple{N,Int}` is what lets inference destructure the result.
-    @noinline global_ntuple(::Val{N}) where {N} =
+    @noinline __mlirkernels_global_ntuple(::Val{N}) where {N} =
         compilerbarrier(:type, ntuple(_ -> zero(Int), Val(N)))::NTuple{N,Int}
-    @noinline local_ntuple(::Val{N}) where {N} =
+    @noinline __mlirkernels_local_ntuple(::Val{N}) where {N} =
         compilerbarrier(:type, ntuple(_ -> zero(Int), Val(N)))::NTuple{N,Int}
-    @noinline group_ntuple(::Val{N}) where {N} =
+    @noinline __mlirkernels_group_ntuple(::Val{N}) where {N} =
         compilerbarrier(:type, ntuple(_ -> zero(Int), Val(N)))::NTuple{N,Int}
 
     # Workgroup shared memory (`@localmem T dims`). The KA extension overlays
@@ -99,7 +109,7 @@ module Intrinsics
     # the same memoryref path as a normal array arg. `Base.donotdelete` makes the
     # call `!effect_free` so it survives DCE and isn't CSE-merged across distinct
     # `@localmem` declarations (each must be its own buffer).
-    @noinline function shared_alloc(::Type{T}, ::Val{Dims}) where {T, Dims}
+    @noinline function __mlirkernels_shared_alloc(::Type{T}, ::Val{Dims}) where {T, Dims}
         Base.donotdelete(T, Dims)
         return compilerbarrier(:type,
             Array{T, length(Dims)}(undef, Dims))::Array{T, length(Dims)}
@@ -109,7 +119,7 @@ module Intrinsics
     # `Scratchpad(ctx, T, Val(dims))` onto this. Same shape as `shared_alloc`,
     # but the walker emits a DEFAULT-address-space `memref.alloca` — per-thread
     # storage (each lane its own copy), no sharing, no barrier.
-    @noinline function private_alloc(::Type{T}, ::Val{Dims}) where {T, Dims}
+    @noinline function __mlirkernels_private_alloc(::Type{T}, ::Val{Dims}) where {T, Dims}
         Base.donotdelete(T, Dims)
         return compilerbarrier(:type,
             Array{T, length(Dims)}(undef, Dims))::Array{T, length(Dims)}
