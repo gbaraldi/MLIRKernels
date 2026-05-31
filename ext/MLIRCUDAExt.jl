@@ -199,7 +199,12 @@ const GPUCompiler = CUDA.CUDACore.GPUCompiler
 _device_target() = CUDA.CUDACore.compiler_config(CUDA.device()).target
 
 # PTXCompilerTarget → the MLIR `nvvm-attach-target` / LLVM TargetMachine strings.
-_target_sm(t)   = "sm_$(t.cap.major)$(t.cap.minor)"
+# Use GPUCompiler's own `cpu_name` for the chip so the MLIR `nvvm-attach-target`
+# chip EXACTLY matches the LLVM `TargetMachine` cpu (`_bitcode_to_ptx` builds it via
+# `llvm_machine`) — `cpu_name` folds in the `feature_set` suffix (e.g. sm_90a for
+# :arch), which a hand-built "sm_$maj$min" drops, diverging the two stages and
+# colliding the `_gpu_cache` key for targets differing only in feature_set.
+_target_sm(t)   = GPUCompiler.cpu_name(t)
 _target_feat(t) = "+ptx$(t.ptx.major)$(t.ptx.minor)"
 
 # Inverse, for `code_gpu` reflection of a non-host arch: "sm_90"→v"9.0",
@@ -218,7 +223,14 @@ function _resolve_target(sm, feat)
     t = _device_target()
     cap = sm   === nothing ? t.cap : _parse_cap(sm)
     ptx = feat === nothing ? t.ptx : _parse_ptx(feat)
-    return GPUCompiler.PTXCompilerTarget(; cap, ptx)
+    # Override only cap/ptx; carry the device target's other fields (feature_set,
+    # debuginfo, …) so a reflected target matches what CUDA.jl configured, instead
+    # of re-defaulting them (feature_set=:baseline, debuginfo=false).
+    return GPUCompiler.PTXCompilerTarget(; cap, ptx,
+        feature_set=t.feature_set, debuginfo=t.debuginfo,
+        minthreads=t.minthreads, maxthreads=t.maxthreads,
+        blocks_per_sm=t.blocks_per_sm, maxregs=t.maxregs,
+        fastmath=t.fastmath, exitable=t.exitable, unreachable=t.unreachable)
 end
 
 # The GPU lowering pipeline, parameterised by target. Only `nvvm-attach-target`
