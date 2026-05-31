@@ -97,6 +97,19 @@ end
     @synchronize
     @inbounds o[I, J] = t[ii, jj]
 end
+# KA's shared-memory tiled pattern (examples/performance.jl): `@localmem eltype(o)`
+# + a `@groupsize()`-derived, BANK-PADDED (non-square) tile. Exercises (a) Core.Const
+# `eltype` resolution, (b) an un-inlined `Val{BANK}`-parametric kernel body lowered
+# as an outlined `func.func` (void return), and (c) a tile whose leading dim (N+1)
+# differs from the access extent (so the linearisation must use the tile's own dim).
+@kernel function _g_padtile!(o, @Const(a), ::Val{BANK} = Val(1)) where {BANK}
+    I, J = @index(Global, NTuple); i, j = @index(Local, NTuple)
+    N = @uniform @groupsize()[1]; M = @uniform @groupsize()[2]
+    t = @localmem eltype(o) (N + BANK, M)
+    @inbounds t[i, j] = a[I, J]
+    @synchronize
+    @inbounds o[I, J] = t[i, j]
+end
 @kernel function _g_tiletr!(o, @Const(a))
     I, J = @index(Global, NTuple); ii, jj = @index(Local, NTuple)
     t = @localmem Float32 (16, 16)
@@ -321,6 +334,10 @@ end
         otc = MLIRArray(CUDA.zeros(Float32, Mt, Mt))
         _g_tilecopy!(backend, (16,16))(otc, int; ndrange=(Mt,Mt)); CUDA.synchronize()
         @test Array(otc) == iht                                # 2-D tile copy
+        # KA padded-tile pattern: eltype + @groupsize dims + BANK padding (N+1≠N)
+        opt = MLIRArray(CUDA.zeros(Float32, Mt, Mt))
+        _g_padtile!(backend, (16,16))(opt, int; ndrange=(Mt,Mt)); CUDA.synchronize()
+        @test Array(opt) == iht                                # padded shared-mem tile
         ott = MLIRArray(CUDA.zeros(Float32, Mt, Mt))
         _g_tiletr!(backend, (16,16))(ott, int; ndrange=(Mt,Mt)); CUDA.synchronize()
         reft = copy(iht)

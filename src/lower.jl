@@ -168,6 +168,12 @@ mutable struct LowerCtx
     # `emit_exception!` (a `nvvm.exit` halt) directly — equivalent, and it keeps the
     # enclosing `scf.for`/loop break-free. See emit_if!/walk_block!(:if).
     bc_break_throws::Bool
+    # SSA id → Julia compile-time constant value, for a call whose INFERRED result
+    # is a `Core.Const` (e.g. `eltype(arr)` → `Core.Const(Float32)`, which the
+    # Frontend interpreter leaves as an `:invoke` rather than a literal). Consulted
+    # by `resolve_const`/`resolve_value_or_const` so const-consumers (e.g. the
+    # `@localmem T dims` element type / dims) and value-consumers both resolve it.
+    ssa_consts::Dict{Int, Any}
 end
 
 LowerCtx(ctx, mod) = LowerCtx(
@@ -185,7 +191,8 @@ LowerCtx(ctx, mod) = LowerCtx(
     Dict{Tuple{Int, Tuple}, Tuple{Int, Symbol}}(), Set{Int}(),
     Dict{Int, Tuple{Int, Tuple}}(), Dict{Int, Int}(),
     Dict{Int, Tuple{Any, Vector{Any}}}(), Dict{Int, Any}(),
-    Dict{Int, Type}(), Dict{Int, Type}(), OutlineState(), false)
+    Dict{Int, Type}(), Dict{Int, Type}(), OutlineState(), false,
+    Dict{Int, Any}())
 
 # ----------------------------------------------------------------------------
 # Type translation: Julia → MLIR
@@ -1446,6 +1453,7 @@ end
 # Resolve a compile-time constant if available (Const-seeded arg, literal,
 # or — TODO — a tracked ConstantOp).
 function resolve_const(lc::LowerCtx, @nospecialize(op))
+    op isa SSAValue && haskey(lc.ssa_consts, op.id) && return lc.ssa_consts[op.id]
     op isa Argument && return get(lc.arg_const, op.n, nothing)
     op isa Number   && return op
     op isa Bool     && return op
@@ -1492,6 +1500,12 @@ end
 function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
     v = resolve_value(lc, op)
     v === nothing || return v
+    # An SSA folded to a compile-time constant (Core.Const result, see ssa_consts):
+    # materialise a numeric/bool one; a Type/Symbol const is left for resolve_const.
+    if op isa SSAValue && haskey(lc.ssa_consts, op.id)
+        c = lc.ssa_consts[op.id]
+        (c isa Number || c isa Bool) && return materialise_const(lc, c)
+    end
     # A struct `:new` used as a VALUE (yielded from scf.if, stored to an array,
     # passed on): homogeneous → `vector<N×T>`; heterogeneous → `!llvm.struct`.
     if op isa SSAValue && haskey(lc.new_structs, op.id)
@@ -1909,6 +1923,19 @@ function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
         end
     end
 
+    # A call whose INFERRED result is a TYPE-valued compile-time constant (e.g.
+    # `eltype(arr)` → `Core.Const(Float32)`, which the Frontend interpreter leaves
+    # as an `:invoke` rather than folding to a literal). A type value is a pure
+    # ghost (no runtime computation) — record it so uses resolve via `resolve_const`
+    # (e.g. `@localmem eltype(arr) dims`), and emit nothing. Restricted to `isa Type`
+    # on purpose: a `Core.Const(nothing)` is a VOID call (e.g. an un-inlined kernel
+    # body) that may carry side effects and must NOT be dropped — it falls through
+    # to the outlined-call path, which now widens such a result to a void return.
+    if typ isa Core.Const && typ.val isa Type
+        lc.ssa_consts[idx] = typ.val
+        return nothing
+    end
+
     # Un-dispatchable `:invoke` (a statically-resolved MethodInstance the walker
     # has no special case for — e.g. a closure Julia's inliner declined). Emit an
     # outlined `func.call` and queue the callee for lowering. (Dynamic dispatch —
@@ -2011,7 +2038,11 @@ function emit_outlined_call!(lc::LowerCtx, idx::Int, @nospecialize(ci),
             _outline_operand_leaves!(lc, call_ops[k], ATw, operands)
         end
     end
-    ret = (typ === Nothing) ? IR.Type[] : IR.Type[mlir_elem_type(typ)]
+    # Widen the result type: a `Core.Const` result (e.g. an un-inlined void kernel
+    # body typed `Const(nothing)`, or a `Const(<number>)`) widens to its concrete
+    # type — `Nothing` → a void func.call, a numeric/struct const → its MLIR type.
+    rt = Core.Compiler.widenconst(typ)
+    ret = (rt === Nothing) ? IR.Type[] : IR.Type[mlir_elem_type(rt)]
     res = _func.call(operands; result_0=ret, callee=parse(IR.Attribute, "@" * sym))
     return isempty(ret) ? nothing : IR.result(res)
 end
