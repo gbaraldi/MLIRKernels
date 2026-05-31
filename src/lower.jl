@@ -393,10 +393,13 @@ end
 # Element type for a MEMREF carrier. Identical to `mlir_elem_type` except a
 # heterogeneous struct uses an `iN` byte-carrier (`memref` can't hold an
 # `!llvm.struct`); the struct value itself is loaded/stored via the `llvm` dialect
-# on a pointer derived from this memref. `iN` keeps the descriptor's element
-# stride (= sizeof bytes) consistent with the host `Array{T}` AoS layout.
+# on a pointer derived from this memref. `iN` keeps the descriptor's element stride
+# (= the array element stride, `aligned_sizeof` — the same canonical quantity as the
+# host `Base.elsize`) consistent with the host `Array{T}` AoS layout. (For the
+# structs admitted here `sizeof == aligned_sizeof`, but using the stride quantity
+# keeps the device carrier and the host descriptor stride expressed identically.)
 function mlir_memref_elem_type(T::Type)
-    _hetero_struct_info(T) === nothing || return _int_type(8 * sizeof(T))
+    _hetero_struct_info(T) === nothing || return _int_type(8 * Base.aligned_sizeof(T))
     return mlir_elem_type(T)
 end
 

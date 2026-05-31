@@ -65,7 +65,12 @@ Base.similar(::Type{MLIRArray{T}}, dims::Dims) where {T} = MLIRArray(CuArray{T}(
 Base.Array(a::MLIRArray) = Array(a.data)
 Base.pointer(a::MLIRArray) = pointer(a.data)
 Base.strides(a::MLIRArray) = strides(a.data)
-Base.elsize(::Type{MLIRArray{T,N}}) where {T,N} = sizeof(T)
+# Inter-element byte stride — must match the wrapped CuArray's, whose canonical
+# value (like Base.Array / GenericMemory) is `aligned_sizeof`, NOT `sizeof`: the two
+# diverge for an over-aligned eltype (e.g. a non-pow2-byte `primitive type`, sizeof 3
+# / aligned 4). They coincide for every isbits struct, but elsize takes an arbitrary
+# external eltype, so use the canonical quantity to stay consistent with the backing array.
+Base.elsize(::Type{MLIRArray{T,N}}) where {T,N} = Base.aligned_sizeof(T)
 Base.unsafe_convert(::Type{CUDA.CuPtr{T}}, a::MLIRArray{T}) where {T} =
     Base.unsafe_convert(CUDA.CuPtr{T}, a.data)
 

@@ -462,6 +462,11 @@ struct _GMixedPad; a::Int32; b::Tuple{Float64,Int16}; c::Float32; end
     @inbounds out[i] = a[i]
 end
 
+# An over-aligned primitive eltype: sizeof=3 but the array element STRIDE is 4
+# (aligned_sizeof). `Base.elsize(MLIRArray{T})` must report the stride (matching the
+# wrapped CuArray), not sizeof — else elsize-based pointer arithmetic under-strides.
+primitive type _GP24 24 end
+
 # A type-unstable scf.for carry: `acc` is Int32 but `acc + 1` transiently widens it
 # to Int64, so the yielded value's width differs from the iter-arg. The :for body
 # must coerce the yield to the iter-arg type (like :while) — was an scf.for verifier
@@ -891,6 +896,19 @@ end
         end
         @test Array(c)[1] == 100.0f0
     end
+end
+
+# Base.elsize(MLIRArray{T}) must be the array element STRIDE (aligned_sizeof),
+# matching the wrapped CuArray — not sizeof, which under-strides an over-aligned
+# eltype. Pure type-level (no functional GPU needed).
+@testset "GPU: MLIRArray elsize == aligned_sizeof (matches CuArray)" begin
+    @test sizeof(_GP24) == 3                                    # the divergent case
+    @test Base.aligned_sizeof(_GP24) == 4                       # true array stride
+    @test Base.elsize(MLIRArray{_GP24,1}) == 4                  # was 3 (sizeof) before the fix
+    @test Base.elsize(MLIRArray{_GP24,1}) == Base.elsize(CUDA.CuArray{_GP24,1})
+    # normal eltypes unaffected (sizeof == aligned_sizeof)
+    @test Base.elsize(MLIRArray{Float32,1}) == 4
+    @test Base.elsize(MLIRArray{ComplexF64,1}) == 16
 end
 
 # Concurrent launches must not corrupt the (now lock-guarded) compile + workgroup
