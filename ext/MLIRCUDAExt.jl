@@ -246,6 +246,11 @@ _sym(f) = replace(string(nameof(f)), r"[^A-Za-z0-9_]" => "_")
 
 const _gpu_cache = Dict{Any, Tuple{CUDA.CuFunction, Vector{Symbol}}}()
 
+# Occupancy-tuned default block size (mirror CUDA.jl): per (kernel, ndrange,
+# host-argtypes), the workgroup the driver's occupancy API suggested. Lets repeat
+# launches skip the provisional compile + re-query. (Plain Dict, like _gpu_cache.)
+const _dyn_wg_cache = Dict{Any, Tuple}()
+
 function _extract_gpu_binary(mod)
     for op in IR.body(mod)
         IR.name(op) == "gpu.binary" || continue
@@ -633,8 +638,37 @@ end
 
 function (obj::KA.Kernel{MLIRCUDABackend})(args...; ndrange=nothing,
                                                      workgroupsize=nothing)
-    full_argtypes, nd, wg = _launch_setup(obj, args, ndrange, workgroupsize)
-    cufn, kinds = _compile(obj.f, full_argtypes; nd_dims=Int[nd...])
+    nd = _resolve_ndrange(obj, ndrange)
+    host_ats = map(a -> _host_argtype(typeof(a)), args)
+    # "Dynamic" = no static workgroupsize and none passed → we pick the block size,
+    # so it's eligible for occupancy tuning (exactly CUDA.jl's gate).
+    dynamic = (KA.workgroupsize(obj) <: NDI.DynamicSize) && workgroupsize === nothing
+    cachekey = (obj.f, nd, host_ats)
+
+    wg = dynamic && haskey(_dyn_wg_cache, cachekey) ?
+         _dyn_wg_cache[cachekey] : _resolve_wgsize(obj, workgroupsize, nd)
+    length(wg) == length(nd) || error(
+        "MLIRCUDABackend: ndrange $nd ($(length(nd))-D) and workgroupsize $wg " *
+        "($(length(wg))-D) must have the same number of dimensions.")
+    cufn, kinds = _compile(obj.f, Tuple{_ctx_type(nd, wg), host_ats...}; nd_dims=Int[nd...])
+
+    # Untuned dynamic launch: mirror CUDA.jl's `threads_to_workgroupsize`. The CUDA
+    # occupancy API (cuOccupancyMaxPotentialBlockSize, via `launch_configuration`)
+    # picks the block size that maximises THIS kernel's occupancy given its register/
+    # shared-mem use — instead of a fixed 256 — and `_default_wgsize` distributes that
+    # budget across the ndrange dims (the same greedy fill CUDA uses). `wg` is baked
+    # into the inference signature (via `_ctx_type`), so recompile if it changed; the
+    # result is cached so later launches compile straight to the tuned block.
+    if dynamic && !haskey(_dyn_wg_cache, cachekey)
+        cfg = CUDA.launch_configuration(cufn; max_threads=prod(nd))
+        wg_tuned = _default_wgsize(nd; maxthreads=min(prod(nd), cfg.threads))
+        if wg_tuned != wg
+            wg = wg_tuned
+            cufn, kinds = _compile(obj.f, Tuple{_ctx_type(nd, wg), host_ats...}; nd_dims=Int[nd...])
+        end
+        _dyn_wg_cache[cachekey] = wg
+    end
+
     flat, sig = _marshal(args, kinds)
     grid = map(cld, nd, wg)          # blocks per dim (padded)
     cudacall(cufn, Tuple{sig...}, flat...; threads=wg, blocks=grid)

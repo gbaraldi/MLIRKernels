@@ -7,8 +7,24 @@ using CUDA, LLVM, KernelAbstractions, Atomix
 using KernelAbstractions: @localmem, @synchronize, @uniform, @groupsize, @private, get_backend
 using KernelAbstractions.Extras: @unroll
 
-const GPUB = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRCUDABackend
-const MLIRArray = Base.get_extension(MLIRKernels, :MLIRCUDAExt).MLIRArray
+const MEXT = Base.get_extension(MLIRKernels, :MLIRCUDAExt)
+const GPUB = MEXT.MLIRCUDABackend
+const MLIRArray = MEXT.MLIRArray
+
+# Pure (no GPU): the default-workgroup greedy fill. Mirrors CUDA's
+# `threads_to_workgroupsize` distribution (fill dim 1, spill into higher dims),
+# capped per-dim by extent and the NVIDIA block limits (x,y ≤ 1024, z ≤ 64).
+@testset "default workgroupsize (greedy fill)" begin
+    wg = MEXT._default_wgsize
+    @test wg((1024,)) == (256,)                  # 1-D fills dim 1 up to the budget
+    @test wg((100,)) == (100,)                   # capped by the extent
+    @test wg((1, 1_000_000)) == (1, 256)         # leading singleton must NOT collapse to (1,1)
+    @test wg((16, 16)) == (16, 16)               # square block, 256 lanes
+    @test wg((1, 1, 1000)) == (1, 1, 64)         # z-dim capped at 64 (would be 256 uncapped)
+    @test prod(wg((1, 50_000))) > 1              # never the degenerate one-thread block
+    @test wg((300,); maxthreads=1024) == (300,)  # honours an occupancy-derived budget
+    @test wg((4096,); maxthreads=1024) == (1024,)
+end
 
 @kernel function _g_vadd!(c, @Const(a), @Const(b))
     i = @index(Global, Linear)
@@ -625,6 +641,19 @@ end
             _g_hist2d!(backend, 256)(Hh, drs, dcs; ndrange=M); CUDA.synchronize()
             ref = zeros(Int32, nb, nb); for k in 1:M; ref[rs[k], cs[k]] += 1; end
             @test Array(Hh) == ref
+        end
+
+        # Dynamic workgroupsize (kernel built with NO wg): the launcher occupancy-
+        # tunes the block via CUDA's launch_configuration, then distributes it across
+        # the dims — so it launches correctly and picks a real (prod>1) block, not
+        # the degenerate one-thread-per-block. (50_000 is a unique ndrange here.)
+        let n = 50_000
+            va = MLIRArray(CUDA.rand(Float32, n)); vb = MLIRArray(CUDA.rand(Float32, n))
+            vc = MLIRArray(CUDA.zeros(Float32, n))
+            _g_vadd!(backend)(vc, va, vb; ndrange=n); CUDA.synchronize()   # dynamic wg
+            @test Array(vc) ≈ Array(va) .+ Array(vb)
+            tuned = [v for (k, v) in MEXT._dyn_wg_cache if k[2] == (n,)]
+            @test !isempty(tuned) && all(t -> prod(t) > 1, tuned)          # occupancy-tuned, not (1,)
         end
     end
 end
