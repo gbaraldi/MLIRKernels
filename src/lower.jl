@@ -1780,14 +1780,44 @@ _callee_is_intrinsic(@nospecialize(callee)) =
     (callee isa GlobalRef && callee.mod === Frontend.Intrinsics) ||
     Frontend.isintrinsic(callee)
 
+# True when `callee` is a Julia builtin / intrinsic / Base|Core (sub)module function
+# — the ONLY callees the walker may dispatch by bare name (`add_int`, `sin`, `^`,
+# `memoryrefget`, `tuple`, …). A user function in any other module must NOT be
+# name-matched even if it shares a builtin's name; it goes to the outlined path.
+# Mirrors how Julia's own codegen dispatches intrinsics by identity, not spelling.
+function _is_julia_stdlib_callee(@nospecialize(c))
+    c isa Core.IntrinsicFunction && return true
+    c isa Core.Builtin && return true
+    if c isa GlobalRef
+        # Resolve the BINDING to its value: a GlobalRef points at the USE-site
+        # module (e.g. `Main.sin`), not where the function is defined, so check the
+        # resolved function's own module — the true identity — not `c.mod`.
+        isdefined(c.mod, c.name) || return false
+        return _is_julia_stdlib_callee(getglobal(c.mod, c.name))
+    end
+    if c isa Function
+        r = Base.moduleroot(parentmodule(c)); return r === Base || r === Core
+    end
+    return false
+end
+
 function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
                     args::Vector{Any}, @nospecialize(typ); mi=nothing)
     fname = callee_name(callee)
 
-    # A user function that merely shares an Intrinsics marker's name must not be
-    # lowered to the intrinsic. When the name matches a marker but the callee isn't
-    # actually from Intrinsics, rename it so the marker branches below fall through
-    # to the generic outlined-call path (and it still reads clearly in any error).
+    # Dispatch by IDENTITY, not name: a statically-resolved callee (`mi`) that is
+    # neither a Julia builtin/stdlib function nor one of our Intrinsics markers is a
+    # USER function — route it straight to the outlined func.call path so a
+    # `MyMod.sin`/`^`/`add_int`/`memoryrefget` that merely shares a builtin's name is
+    # never misrouted to a dialect op. (Builtins/raw intrinsics arrive as `:call`s
+    # with `mi === nothing` and fall through to the name matching below as before.)
+    if mi !== nothing && !_is_julia_stdlib_callee(callee) && !_callee_is_intrinsic(callee)
+        return emit_outlined_call!(lc, idx, mi, callee, args, typ)
+    end
+
+    # Belt-and-suspenders for our manglable markers: if the name matches a marker but
+    # the callee isn't actually from Intrinsics, blank it so the marker branches fall
+    # through (also covers a marker-named callee that arrived without an `mi`).
     if fname in _INTRINSIC_MARKERS && !_callee_is_intrinsic(callee)
         fname = Symbol("#nonintrinsic#", fname)
     end
@@ -3244,20 +3274,16 @@ function _is_dead_throw_branch(block::Block)
     saw_throw = false
     for (_, entry) in block.body
         stmt = entry.stmt
-        if stmt isa Expr && stmt.head === :invoke
-            nm = callee_name(stmt.args[2])
-            if nm === :throw || startswith(String(nm), "throw")
+        if stmt isa Expr && (stmt.head === :invoke || stmt.head === :call)
+            # A throw / non-returning call is typed `Union{}` (Bottom) by inference —
+            # the authoritative identity for "this diverges", vs guessing from the
+            # callee NAME (which misclassifies a user helper named `throw_*` that does
+            # real work, and misses a renamed/aliased throw).
+            if entry.type === Union{}
                 saw_throw = true
                 continue
             end
-            return false  # a non-throw invoke = real work
-        elseif stmt isa Expr && stmt.head === :call
-            nm = callee_name(stmt.args[1])
-            if nm === :throw || startswith(String(nm), "throw")
-                saw_throw = true
-                continue
-            end
-            return false
+            return false  # a returning call = real work
         elseif stmt === nothing || stmt isa QuoteNode ||
                stmt isa Core.ReturnNode || stmt isa GlobalRef ||
                stmt isa Core.Const || !(stmt isa Expr)

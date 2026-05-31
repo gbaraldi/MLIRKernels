@@ -392,6 +392,17 @@ end
     @inbounds out[i] = _GShadow.group_size() * 10 + _GShadow.local_index()   # 73
 end
 
+# A user function whose name SHADOWS a Base math builtin (`exp`) must run as the
+# user's own code (outlined func.call), not be misrouted to `math.exp` — the walker
+# dispatches by callee identity (resolved binding), not by bare name.
+module _GMathShadow
+    @noinline exp(x) = x * 3.0f0 + 1.0f0
+end
+@kernel function _g_mathshadow!(out, @Const(a))
+    i = @index(Global, Linear)
+    @inbounds out[i] = _GMathShadow.exp(a[i])      # user exp (3x+1), NOT e^x
+end
+
 # A ComplexF32 (aggregate) flows out of an scf.if whose other branch throws — the
 # throwing branch must yield a POISON aggregate. Was an `undef_value: unsupported
 # type ComplexF32` compile crash (only real scalars had a poison value).
@@ -733,6 +744,15 @@ end
             so = MLIRArray(CUDA.zeros(Int, N))
             _g_shadow!(backend, 32)(so; ndrange=N); CUDA.synchronize()   # block_dim 32 ≠ 7
             @test all(==(73), Array(so))
+        end
+
+        # A user function shadowing the `exp` math builtin runs as the user's code
+        # (identity dispatch), not math.exp.
+        let N = 32
+            ma = MLIRArray(CUDA.CuArray(Float32[1, 2, 3, 4][mod1.(1:N, 4)]))
+            mo = MLIRArray(CUDA.zeros(Float32, N))
+            _g_mathshadow!(backend, 32)(mo, ma; ndrange=N); CUDA.synchronize()
+            @test Array(mo) == Array(ma) .* 3.0f0 .+ 1.0f0
         end
 
         # Aggregate (ComplexF32) carried out of a throwing scf.if branch: compiles
