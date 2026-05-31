@@ -250,8 +250,16 @@ const _gpu_cache = Dict{Any, Tuple{CUDA.CuFunction, Vector{Symbol}}}()
 
 # Occupancy-tuned default block size (mirror CUDA.jl): per (kernel, ndrange,
 # host-argtypes), the workgroup the driver's occupancy API suggested. Lets repeat
-# launches skip the provisional compile + re-query. (Plain Dict, like _gpu_cache.)
+# launches skip the provisional compile + re-query.
 const _dyn_wg_cache = Dict{Any, Tuple}()
+
+# Guards both caches AND the compile pipeline (fresh MLIR/LLVM contexts, the
+# `_passes_registered` global, CuModule loading) so concurrent launches from
+# `Threads.@threads` don't race the Dicts or double-register MLIR passes. Reentrant
+# so the launcher can hold it across its own `_dyn_wg_cache` use + the nested
+# `_compile`. Cache hits are a fast Dict read under the lock; only first-compiles
+# serialise (rare after warmup).
+const _COMPILE_LOCK = ReentrantLock()
 
 function _extract_gpu_binary(mod)
     for op in IR.body(mod)
@@ -381,34 +389,36 @@ function _compile(f, full_argtypes; sm=nothing, feat=nothing, nd_dims=Int[], opt
     # (CompilerCaching's resolver; `nothing` ⇒ no unique match ⇒ fall back.)
     mi = match_method_instance(f, full_argtypes)
     key = (mi === nothing ? (f, full_argtypes, nd_dims) : mi, sm, feat, optimize)
-    haskey(_gpu_cache, key) && return _gpu_cache[key]
-    kname = _sym(f)
-    _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims, optimize)
+    @lock _COMPILE_LOCK begin
+        haskey(_gpu_cache, key) && return _gpu_cache[key]
+        kname = _sym(f)
+        _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims, optimize)
 
-    sci, rettype = FE.structured(f, full_argtypes)
-    (rettype === Nothing || rettype === Union{}) ||
-        @warn "MLIRCUDABackend: kernel inferred rettype = $rettype (expected Nothing)"
+        sci, rettype = FE.structured(f, full_argtypes)
+        (rettype === Nothing || rettype === Union{}) ||
+            @warn "MLIRCUDABackend: kernel inferred rettype = $rettype (expected Nothing)"
 
-    # ctx (`__ctx__`) is arg slot 2 (slot 1 is the function itself).
-    mod, _pjt, mlir_ctx, kinds =
-        MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims, optimize)
+        # ctx (`__ctx__`) is arg slot 2 (slot 1 is the function itself).
+        mod, _pjt, mlir_ctx, kinds =
+            MK.lower_to_mlir_gpu(sci, full_argtypes; kernel_name=kname, ctx_arg=2, nd_dims, optimize)
 
-    # The MLIR context owns `mod`; once we've extracted the binary the PTX is a
-    # plain String, so dispose the context (try/finally — free it even on a pass
-    # failure). Without this every cache-miss leaked an MLIR context.
-    ptx = try
-        _run_passes!(mod, mlir_ctx, _gpu_passes(sm, feat))
-        bc = _extract_gpu_binary(mod)
-        _bitcode_to_ptx(bc, target)
-    finally
-        IR.dispose(mlir_ctx)
+        # The MLIR context owns `mod`; once we've extracted the binary the PTX is a
+        # plain String, so dispose the context (try/finally — free it even on a pass
+        # failure). Without this every cache-miss leaked an MLIR context.
+        ptx = try
+            _run_passes!(mod, mlir_ctx, _gpu_passes(sm, feat))
+            bc = _extract_gpu_binary(mod)
+            _bitcode_to_ptx(bc, target)
+        finally
+            IR.dispose(mlir_ctx)
+        end
+
+        cumod = CuModule(ptx)
+        _wire_exception_flag!(cumod)
+        cufn = CuFunction(cumod, kname)
+        _gpu_cache[key] = (cufn, kinds)
+        return cufn, kinds
     end
-
-    cumod = CuModule(ptx)
-    _wire_exception_flag!(cumod)
-    cufn = CuFunction(cumod, kname)
-    _gpu_cache[key] = (cufn, kinds)
-    return cufn, kinds
 end
 
 # If the kernel has throws, the lowering emits a module global `@__mlirkernels_exc`
@@ -655,8 +665,8 @@ function (obj::KA.Kernel{MLIRCUDABackend})(args...; ndrange=nothing,
     dynamic = (KA.workgroupsize(obj) <: NDI.DynamicSize) && workgroupsize === nothing
     cachekey = (obj.f, nd, host_ats)
 
-    wg = dynamic && haskey(_dyn_wg_cache, cachekey) ?
-         _dyn_wg_cache[cachekey] : _resolve_wgsize(obj, workgroupsize, nd)
+    cached_wg = dynamic ? (@lock _COMPILE_LOCK get(_dyn_wg_cache, cachekey, nothing)) : nothing
+    wg = cached_wg !== nothing ? cached_wg : _resolve_wgsize(obj, workgroupsize, nd)
     length(wg) == length(nd) || error(
         "MLIRCUDABackend: ndrange $nd ($(length(nd))-D) and workgroupsize $wg " *
         "($(length(wg))-D) must have the same number of dimensions.")
@@ -669,14 +679,14 @@ function (obj::KA.Kernel{MLIRCUDABackend})(args...; ndrange=nothing,
     # budget across the ndrange dims (the same greedy fill CUDA uses). `wg` is baked
     # into the inference signature (via `_ctx_type`), so recompile if it changed; the
     # result is cached so later launches compile straight to the tuned block.
-    if dynamic && !haskey(_dyn_wg_cache, cachekey)
+    if dynamic && cached_wg === nothing
         cfg = CUDA.launch_configuration(cufn; max_threads=prod(nd))
         wg_tuned = _default_wgsize(nd; maxthreads=min(prod(nd), cfg.threads))
         if wg_tuned != wg
             wg = wg_tuned
             cufn, kinds = _compile(obj.f, Tuple{_ctx_type(nd, wg), host_ats...}; nd_dims=Int[nd...])
         end
-        _dyn_wg_cache[cachekey] = wg
+        @lock _COMPILE_LOCK (_dyn_wg_cache[cachekey] = wg)
     end
 
     flat, sig = _marshal(args, kinds)

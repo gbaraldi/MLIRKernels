@@ -745,6 +745,27 @@ end
     end
 end
 
+# Concurrent launches must not corrupt the (now lock-guarded) compile + workgroup
+# caches. `@spawn` interleaves the cache access even on one thread, and runs truly
+# parallel under `-t>1`.
+@testset "GPU: concurrent launches are cache-safe" begin
+    if !CUDA.functional()
+        @test true
+    else
+        bk = GPUB(); n = 512; ntasks = 8
+        oks = fill(false, ntasks)
+        b = MLIRArray(CUDA.ones(Float32, n))
+        @sync for i in 1:ntasks
+            Threads.@spawn begin
+                a = MLIRArray(CUDA.fill(Float32(i), n)); c = MLIRArray(CUDA.zeros(Float32, n))
+                _g_vadd!(bk)(c, a, b; ndrange=n); CUDA.synchronize()   # dynamic wg → caches under lock
+                oks[i] = Array(c) ≈ fill(Float32(i) + 1, n)
+            end
+        end
+        @test all(oks)
+    end
+end
+
 @testset "SCI optimization (DCE/CSE/LICM) affects KA codegen" begin
     if !CUDA.functional()
         @info "CUDA not functional — skipping SCI-optimization codegen test"
