@@ -202,6 +202,18 @@ end
     @inbounds out[i] = size(a, d)
 end
 
+# `@ndrange()` → the launch iteration size as a compile-time-constant NTuple
+# (overlaid off the CompilerMetadata's static ndrange type param, like @groupsize).
+@kernel function _g_ndr!(out)
+    i = @index(Global, Linear)
+    @inbounds out[i] = @ndrange()[1]
+end
+@kernel function _g_ndr2!(out)
+    i, j = @index(Global, NTuple)
+    nd = @ndrange()
+    @inbounds out[i, j] = nd[1] * 100 + nd[2]
+end
+
 # An infinite loop with `break` (a structurized LoopOp that doesn't promote to
 # for/while) → scf.while carrying a `done` sentinel.
 @kernel function _g_breakloop!(out, @Const(ns))
@@ -438,6 +450,14 @@ end
         @test all(Array(dz) .== 8)
         _g_dimsz!(backend, 4)(dz, dm, 2; ndrange=4); CUDA.synchronize()
         @test all(Array(dz) .== 5)
+
+        # @ndrange() → the launch size, folded to a compile-time constant tuple.
+        nr1 = MLIRArray(CUDA.zeros(Int, 7))
+        _g_ndr!(backend, 7)(nr1; ndrange=7); CUDA.synchronize()
+        @test all(Array(nr1) .== 7)                            # 1-D @ndrange()[1]
+        nr2 = MLIRArray(CUDA.zeros(Int, 3, 5))
+        _g_ndr2!(backend, (3, 3))(nr2; ndrange=(3, 5)); CUDA.synchronize()
+        @test all(Array(nr2) .== 305)                          # 2-D @ndrange() = (3,5)
 
         # LoopOp: `while true … break` → scf.while + done sentinel.
         bn = MLIRArray(CUDA.CuArray(Int64[3, 5, 10, 1])); bo = MLIRArray(CUDA.zeros(Int64, 4))

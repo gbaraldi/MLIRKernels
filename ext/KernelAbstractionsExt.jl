@@ -68,6 +68,15 @@ struct MLIRBackend <: KA.GPU end
         ctx::KA.CompilerMetadata{A, B, C, D, <:NDI.NDRange{N, BL, WGS}}) where {A, B, C, D, N, BL, WGS} =
     NDI.get(WGS)
 
+# `@ndrange()` → `size(ndrange(__ctx__))`, the launch iteration size as an NTuple.
+# The full ndrange is the FIRST CompilerMetadata type param (a `StaticSize`, baked
+# in by `_ctx_type`), so return `CartesianIndices(get(NDR))` — `size(…)` of it folds
+# to the COMPILE-TIME CONSTANT tuple, exactly like `@groupsize()` (and so it can feed
+# a grid-stride bound / `Val`). Mirrors KA's own `__ndrange` for the StaticSize case.
+@overlay FE.METHOD_TABLE KA.ndrange(
+        ctx::KA.CompilerMetadata{NDR}) where {NDR <: NDI.StaticSize} =
+    CartesianIndices(NDI.get(NDR))
+
 # `@index(Global/Local/Group, NTuple)` → unary `__index_*_NTuple(ctx)` returning
 # an `NTuple{N,Int}` of 1-based per-dim coords. We read the grid dimensionality
 # `N` straight off the ctx type (`CompilerMetadata{…, NDRange{N,…}}`) and pass it
