@@ -27,6 +27,7 @@ import CUDA_Compiler_jll
 import GPUArrays
 import AcceleratedKernels as AK
 using GPUArraysCore: GPUArraysCore, AbstractGPUArray, AbstractGPUArrayStyle, @allowscalar
+using PrecompileTools: @setup_workload, @compile_workload
 
 struct MLIRCUDABackend <: KA.GPU end
 
@@ -704,5 +705,46 @@ function MK.code_gpu(io::IO, obj::KA.Kernel{MLIRCUDABackend}, args...; level::Sy
 end
 MK.code_gpu(obj::KA.Kernel{MLIRCUDABackend}, args...; kwargs...) =
     MK.code_gpu(stdout, obj, args...; kwargs...)
+
+# ----------------------------------------------------------------------------
+# Precompilation — warm the GPU compile pipeline so the first launch in a fresh
+# session pays only the (fast) PTX/link step, not the ~30s+ of cold Julia method
+# inference + MLIR lowering. We drive `_codegen_stages` up to `:lowered` (the full
+# gpu→nvvm + scf/arith/memref pipeline, minus binary serialisation): that path is
+# device-free and NVPTX-free, so it runs at build time with no CUDA context — only
+# the final PTX emit + `CuModule` need the GPU, and those are cheap. Inference uses
+# HOST array types (as the launcher does). Mirrors cuTile.jl's PrecompileTools
+# workload. Guarded so a build-time hiccup degrades to "no warming", never a
+# precompile failure.
+# ----------------------------------------------------------------------------
+@kernel function _pc_vadd!(c, @Const(a), @Const(b))
+    i = @index(Global, Linear)
+    @inbounds c[i] = a[i] + b[i]
+end
+@kernel function _pc_copy2d!(c, @Const(a))
+    i, j = @index(Global, NTuple)
+    @inbounds c[i, j] = a[i, j]
+end
+
+@setup_workload begin
+    @compile_workload begin
+        try
+            bk = MLIRCUDABackend()
+            # 1-D elementwise: the common case (Global Linear index + memref load/store).
+            let f = _pc_vadd!(bk, 256).f,
+                at = Tuple{_ctx_type((1024,), (256,)),
+                           Array{Float32,1}, Array{Float32,1}, Array{Float32,1}}
+                _codegen_stages(f, at; sm="sm_90", feat="+ptx80", upto=:lowered, nd_dims=Int[1024])
+            end
+            # 2-D NTuple index: warms the column-major multi-dim index + 2-D memref path.
+            let f = _pc_copy2d!(bk, (16, 16)).f,
+                at = Tuple{_ctx_type((64, 64), (16, 16)), Array{Float32,2}, Array{Float32,2}}
+                _codegen_stages(f, at; sm="sm_90", feat="+ptx80", upto=:lowered, nd_dims=Int[64, 64])
+            end
+        catch e
+            @debug "MLIRKernels: GPU precompile workload skipped" exception=(e, catch_backtrace())
+        end
+    end
+end
 
 end # module MLIRCUDAExt
