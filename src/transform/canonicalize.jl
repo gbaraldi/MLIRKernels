@@ -10,14 +10,12 @@
 # whose SCI is raw Julia IR lowered directly by `src/lower.jl`'s walker — there
 # is no `Tile` type and no `Intrinsics` module.
 #
-# So what is vendored here is the GENERIC SKELETON only: a (currently empty)
-# canonicalization rule set plus a pass that runs it through the vendored
-# `rewrite_patterns!` driver. This is the extension point for backend-agnostic
-# algebraic identities that operate on raw Julia ops (e.g. `add_int(x, 0) → x`,
-# `mul_int(x, 1) → x`) — left empty by default because such rewrites are most
-# safely expressed with a constant analysis (not vendored) to recognise
-# literal-vs-SSA constants, and because MLIRKernels currently relies on Julia
-# inference + the MLIR lowering for these.
+# So what is vendored here is the GENERIC SKELETON: a backend-agnostic
+# canonicalization rule set over raw Julia integer ops, run through the vendored
+# `rewrite_patterns!` driver. `CANONICALIZE_RULES` below holds the integer-op
+# identities (`add_int(x,0)→x`, `mul_int(x,1)→x`, …) plus the `x*2ⁿ→x<<n` power-of-
+# two strength reduction. There is no vendored constant analysis, so the `_lit_*`
+# guards stand in for it — they fire only on LITERAL-bound operands.
 
 # Guards inspect operands bound by `~name`: a *literal* operand binds to its
 # value (so `c isa Number` holds), while an SSA operand binds to an `SSAValue`
@@ -63,7 +61,7 @@ const CANONICALIZE_RULES = RewriteRule[
     canonicalize_pass!(sci::StructuredIRCode)
 
 Run the generic canonicalization rule set to fixpoint via the pattern-rewrite
-driver. A no-op while `CANONICALIZE_RULES` is empty.
+driver. Returns `sci` unchanged only if `CANONICALIZE_RULES` is ever emptied.
 """
 function canonicalize_pass!(sci::StructuredIRCode)
     isempty(CANONICALIZE_RULES) && return sci

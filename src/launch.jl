@@ -200,8 +200,8 @@ end
 # SPMD ("ISPC-style" scalar-typed kernels)
 # ============================================================================
 #
-# `spmd_function(f, argtypes; lane_width=16)` is the SPMD analogue of
-# `cpu_function`. The kernel writes plain Julia (no `Tile`/`ct.*` types):
+# `spmd_function(f, argtypes; lane_width=16)` compiles a plain-Julia scalar kernel
+# in SPMD (ISPC-style) mode. The kernel writes plain Julia (no `Tile`/`ct.*` types):
 #
 #     function vadd_spmd(a, b, c, i::Int)
 #         @inbounds c[i] = a[i] + b[i]
@@ -347,9 +347,9 @@ function ka_function(@nospecialize(f), argtypes::Type;
     # path drops a trailing Integer arg from the user-facing call. KA
     # kernels don't have that trailing arg (the lane is synthesized in
     # MLIR), so the user-call signature is `(args...; blocks)` with no
-    # placeholder — but cpu_function's launcher loops over args and skips
-    # the trailing Integer ONLY for SPMD. We set kind = :ka and add the
-    # corresponding branch in the launcher.
+    # placeholder — but the CPUKernel launcher loops over args and skips the
+    # trailing Integer ONLY for SPMD (gated on `is_spmd`). We set kind = :ka so the
+    # launcher takes the matching branch.
     k = CPUKernel{typeof(f), argtypes}(f, so_path, h, fn,
                                        param_julia_types, param_kinds,
                                        1, alignments, :ka)

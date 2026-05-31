@@ -3,12 +3,11 @@
 # Pipeline:
 #   Julia kernel + argtypes
 #     → optimized StructuredIRCode
-#         runs canonicalize → constprop → FMA fusion → CSE → alias
-#         → token order → RNG lowering → LICM → divisibility/bounds
-#         → no-wrap → DCE; we receive the optimized SCI.
+#         runs canonicalize → CSE → LICM → DCE to fixpoint; we receive the
+#         optimized SCI.
 #     → lower_to_mlir(sci, argtypes)                    [this file]
-#         emits scf/arith/memref/vector/func dialect MLIR with alignment +
-#         strided-layout info from ArraySpec.
+#         emits scf/arith/memref/vector/func dialect MLIR; the memref
+#         strided-layout/eltype info comes from each arg's Julia type.
 #
 # Argument model:
 #   Each array arg becomes ONE `memref<?x...xT, strided<[…]>>` arg.
@@ -147,16 +146,17 @@ mutable struct LowerCtx
     # SSA → an Argument/SSAValue it transparently aliases (e.g. the array a
     # `getfield(Const, :a)` yields). Resolved at the top of getfield/resolve.
     aliases::Dict{Int, Any}
-    # SSA → homogeneous-struct Julia type, for values represented as a
-    # `vector<Nfields×T>` (loaded from a struct array / yielded from an scf.if).
-    # `getfield(v, field)` on these extracts the lane; tagged by SCI type in the
-    # walk. (Heterogeneous structs are a future, separate representation.)
+    # SSA → struct Julia type for a value-represented struct: homogeneous →
+    # `vector<Nfields×T>`, heterogeneous → a flat `!llvm.struct` of scalar leaves
+    # (loaded from a struct array / yielded from an scf.if). `getfield(v, field)`
+    # extracts the field's lane / leaf span; tagged by SCI type in the walk.
     struct_vals::Dict{Int, Type}
-    # Kernel arg slot → homogeneous-struct Julia type, for a `vector<N×T>`-able
-    # struct ARG (e.g. an `(typemax,typemin)` reduction init `Tuple{T,T}`).
-    # The arg is flattened to scalar params (so `getfield(arg, k)` resolves via
-    # `captured`); using the WHOLE arg as a value reconstructs the vector from
-    # those scalar slots (see `resolve_value_or_const`).
+    # Kernel arg slot → struct Julia type for a value-represented struct ARG —
+    # homogeneous (`vector<N×T>`, e.g. a `(typemax,typemin)` reduction init
+    # `Tuple{T,T}`) or heterogeneous (flat `!llvm.struct`, e.g. findmax's
+    # `Tuple{Float32,Int64}`). The arg is flattened to scalar params (so
+    # `getfield(arg, k)` resolves via `captured`); using the WHOLE arg as a value
+    # rebuilds it from those leaves (see `_reconstruct_struct_arg!`).
     struct_arg_types::Dict{Int, Type}
     # Outlined-call worklist (shared across kernel + outlined funcs). Also carries
     # the `@__mlirkernels_exc`-emitted flag (`outline.exc_global`), shared so the
@@ -207,7 +207,8 @@ LowerCtx(ctx, mod) = LowerCtx(
 # 2×Float32) maps to `vector<Nfields × fieldtype>`, which matches its
 # array-of-structs memory layout. Returns (nfields, fieldtype) or `nothing`.
 # Excludes structs whose field isn't a scalar (e.g. `CartesianIndex`, whose single
-# field is an NTuple — kept on the transient `new_structs` path).
+# field is an NTuple) — those fall through to the heterogeneous flat-`!llvm.struct`
+# path (`_hetero_struct_info`).
 #
 # CRITICAL: only when the `vector<N×ft>` ABI size equals Julia's `sizeof(T)` — i.e.
 # `N·sizeof(ft)` is a power of 2. LLVM rounds a vector's alloc size (which becomes
@@ -455,7 +456,6 @@ function lower_to_mlir_spmd(sci::StructuredIRCode, argtypes::Type;
     n_grid_dims = 1
 
     @with_context ctx begin
-        IR.load_all_available_dialects()
         mod = IR.Module(IR.Location())
         mod_ref[] = mod
 
@@ -667,7 +667,6 @@ function lower_to_mlir_ka(sci::StructuredIRCode, argtypes::Type;
     param_kinds = Symbol[]
 
     @with_context ctx begin
-        IR.load_all_available_dialects()
         mod = IR.Module(IR.Location())
         mod_ref[] = mod
 
@@ -1053,7 +1052,6 @@ function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
     param_kinds = Symbol[]
 
     @with_context ctx begin
-        IR.load_all_available_dialects()
         mod = IR.Module(IR.Location())
         mod_ref[] = mod
         # `gpu.container_module` marks the top-level module as holding
@@ -1517,9 +1515,10 @@ function walk_expr!(lc::LowerCtx, idx::Int, e::Expr, @nospecialize(typ))
         return nothing
     elseif e.head === :throw_undef_if_not
         # `throw_undef_if_not(:name, cond)`: throw `UndefVarError` unless `cond`.
-        # Tail-block masking leaves values computed under `if __validindex` undef
-        # on the masked path, but a masked thread never reaches the use (its work
-        # is guarded) and a GPU throw is just a trap. Elide, like bounds checks.
+        # Tail-block masking leaves values computed under `if __validindex` undef on
+        # the masked path, but a masked thread never reaches the use (its work is
+        # guarded by the same mask), so the UndefVarError can never actually fire
+        # here. Elide it, like the bounds checks under that mask.
         return nothing
     end
     error("MLIRKernels.walk_expr!: unhandled Expr head :$(e.head) at %$idx ($e)")
@@ -2346,7 +2345,8 @@ end
 # promoted if-result), and constants may materialise at a different width. The
 # statement's inferred Julia type is authoritative, so coerce both operands to it
 # (vector-aware, via `_coerce_numeric!`); with no result type, widen the narrower
-# operand to the wider. Signed integers assumed (MLIR int types are signless).
+# operand to the wider. MLIR ints are signless, so each operand widens by its OWN
+# source Julia signedness (`a_T`/`b_T`): unsigned → `extui`, signed → `extsi`.
 # Collapse a numeric union (`Union{Int32,Int64}`) to its promoted concrete type;
 # pass a concrete numeric type through; `nothing` for anything else. Shared by the
 # scf.if yield promotion and the binop/select width harmonisation.
@@ -2414,9 +2414,10 @@ const _RAW_CORE_INTRINSICS = Set{Symbol}([
     :sext_int, :zext_int, :trunc_int, :bitcast,
     :sitofp, :uitofp, :fptosi, :fptoui, :fpext, :fptrunc,
     :ifelse, Symbol("==="),
-    # Unary float math intrinsics (raw Julia names; the named-intrinsic path
-    # uses :absf/:sqrt/etc, but the Frontend path hands them raw). One operand,
-    # operand-typed result — vector-aware via emit_unary_math!.
+    # Unary float math intrinsics. The named-intrinsic path matches the Julia
+    # names (:sqrt, :exp, …) via `_MATH_UNARY`; the Frontend hands `abs`/`sqrt` raw
+    # as the Core intrinsics :abs_float/:sqrt_llvm. One operand, operand-typed
+    # result — vector-aware via emit_unary_math!.
     :abs_float, :sqrt_llvm, :sqrt_llvm_fast,
     # Rounding + fused-multiply-add float intrinsics → math dialect.
     :floor_llvm, :ceil_llvm, :trunc_llvm, :rint_llvm,
@@ -2480,10 +2481,6 @@ function _float_width(t)
     return 0
 end
 
-# Coerce a numeric Value to `target_T`'s MLIR type (vector-aware). Used when an
-# scf.if yields a numeric *union* across branches (e.g. `init=0::Int64` mixed
-# with an `Int32` array): the branches are promoted to a common type, so each
-# branch's yield must be widened/converted to it.
 # A codegen value paired with its SOURCE Julia type — MLIRKernels' analogue of
 # cuTile's `CGVal` and Julia codegen's `jl_cgval_t`. MLIR integers/floats are
 # SIGNLESS, so `jltype` is the only record of signedness; every sign-dependent
@@ -2522,6 +2519,11 @@ end
 _ext_unsigned(@nospecialize(src_T), @nospecialize(target_T)) =
     src_T isa Type ? (src_T <: Unsigned) : (target_T isa Type && target_T <: Unsigned)
 
+# Coerce a numeric Value to `target_T`'s MLIR type (vector-aware), widening /
+# converting by the SOURCE signedness in `src_T` (extui/sitofp/… vs extsi/uitofp).
+# Called at scf.if numeric-union yields, binop width harmonisation, and
+# array-element store coercion (the union case, e.g. `init=0::Int64` mixed with an
+# `Int32` array, promotes the branches to a common type each yield converts to).
 function _coerce_numeric!(v::IR.Value, target_T::Type; src_T::Union{Nothing,Type}=nothing)
     out_t = _conv_out_type(v, target_T)
     IR.type(v) == out_t && return v
@@ -2634,9 +2636,9 @@ function emit_raw_core_intrinsic!(lc::LowerCtx, name::Symbol, args, @nospecializ
         return IR.result(_arith.xori(v, _const_like(v, _allones_of_elem(IR.type(v)))))
     end
     # Unary float math. `Base.abs(::AbstractFloat)` → :abs_float (single op);
-    # `Base.sqrt(::Float32/64)` → :sqrt_llvm. The named-intrinsic path uses
-    # :absf/:sqrt; the Frontend hands them raw. Same op as the named-intrinsic
-    # dispatch, vector-aware via emit_unary_math!.
+    # `Base.sqrt(::Float32/64)` → :sqrt_llvm. The named-intrinsic path matches :sqrt
+    # etc. by Julia name (`_MATH_UNARY`); the Frontend hands abs/sqrt raw as these
+    # Core intrinsics. Same MLIR op either way, vector-aware via emit_unary_math!.
     name === :abs_float      && return emit_unary_math!(lc, args, _math.absf, typ)
     name === :sqrt_llvm      && return emit_unary_math!(lc, args, _math.sqrt, typ)
     name === :sqrt_llvm_fast && return emit_unary_math!(lc, args, _math.sqrt, typ)
@@ -2768,40 +2770,6 @@ function _broadcast_to_match(v::IR.Value, vec_t)
     return IR.result(_vector.broadcast(v; vector=vec_t))
 end
 
-# Intrinsics.mulhii(a, b) — high half of the unsigned-widened product.
-# Implemented as: widen both operands by `extui` to 2W bits, multiply with
-# nuw, shift right by W, then truncate back to W. On vector operands the
-# arith ops broadcast naturally.
-
-# Intrinsics.shri(a, b, signedness) — arithmetic / logical right shift.
-
-# Intrinsics.trunci(x, T) — narrow integer cast to type T.
-
-# Intrinsics.itof(x, F, signedness) — int → float convert.
-
-# Intrinsics.negf(x) → arith.negf. Result type matches operand.
-
-# Intrinsics.cat((lhs, rhs), axis::Int) — concatenate two tiles along
-# `axis` (0-indexed Julia col-major). For 1-D tiles, lowers to `vector.shuffle`
-# with the identity-then-shifted lane permutation. For N-D tiles, lowers via
-# two `vector.insert_strided_slice` ops into a zero-initialised result.
-
-# Intrinsics.extract(tile, index, shape) — extract a non-overlapping
-# subtile at slice (index) of size (shape). Both `index` and `shape` are in
-# Julia col-major order; `index` is 0-indexed (frontend already converted from
-# 1-based). Lowers to `vector.extract_strided_slice`, with axes reversed for
-# MLIR's row-major convention.
-
-# Build an `ArrayAttr` of i64 attributes — the format `vector.{insert,extract}_strided_slice`
-# expect for their offsets/sizes/strides attributes (a `DenseArrayAttr` is silently
-# dropped by the create-op state).
-
-# Intrinsics.get_num_tile_blocks(axis) — grid extent along the given
-# 0-indexed axis. For axes within the runtime grid, return `index_cast` of
-# the grid Value (held by the outer wrapper) cast to i32. For axes beyond
-# the grid (`rng_key` always reads axes 0..1 even on 1-D launches),
-# return constant Int32(1).
-
 # Unary math op (math.exp, math.log, …). Result type comes from the operand
 # (math ops are elementwise; the result type matches the operand type).
 function emit_unary_math!(lc::LowerCtx, args, op_fn, @nospecialize(typ))
@@ -2830,12 +2798,6 @@ function emit_ternary_math!(lc::LowerCtx, args, op_fn)
     a, b, c = _spmd_harmonise(lc, a, b, c)
     return IR.result(op_fn(a, b, c; result=IR.type(a)))
 end
-
-# Intrinsics.fma(x, y, z) → math.fma. Same vector shape across all
-# three operands.
-
-# Intrinsics.maxi(a, b, signedness)/mini(a, b, signedness) → arith
-# max{s,u}i / min{s,u}i. Signedness is the 3rd arg.
 
 # cmpi(lhs, rhs, predicate::ComparisonPredicate.T, sign::Signedness.T)
 # → arith.cmpi with the matching i64 predicate attribute.
@@ -2973,82 +2935,6 @@ function cmpf_predicate_code(pred::ComparisonPredicate.T, ord::ComparisonOrderin
     pred === ComparisonPredicate.NotEqual        && return is_ord ? 6  : 13
     error("cmpf: unsupported predicate $pred")
 end
-
-# exti(x, target_jl_type, sign) → arith.extsi / arith.extui
-
-# Intrinsics.cldi(lhs, rhs, sign) → arith.ceildivsi / arith.ceildivui.
-
-# Intrinsics.remi(lhs, rhs, sign) → arith.remsi / arith.remui.
-# Surfaces from `rem(::IntTile, ::Integer)` (and tile/tile variants); the
-# atomic histogram path uses this for bucket = v % n_buckets.
-
-# Intrinsics.fldi(lhs, rhs, sign) → arith.floordivsi / arith.divui.
-# `fldi` is signed floor-division (rounding toward -∞) for signed args; on
-# the unsigned side it coincides with truncated division (`arith.divui`).
-
-# Intrinsics.mma(lhs, rhs, acc) — matrix-multiply-accumulate in
-# TileIR-row-major form. The frontend's `muladd(a, b, acc)` for Julia 2-D
-# tiles becomes `Intrinsics.mma(b, a, acc)`; the batched (≥3-D × ≥3-D) path
-# flattens trailing batch dims to a single leading "batch" in TileIR
-# row-major and then calls `Intrinsics.mma(b, a, acc)` with operands of
-# TileIR shape (B, …).
-#
-# 2-D case. In TileIR / MLIR row-major coordinates:
-#   lhs (the "%50 = b_julia" operand) has shape (N_iter, K_iter)
-#   rhs (the "%40 = a_julia" operand) has shape (K_iter, M_iter)
-#   acc / result                       has shape (N_iter, M_iter)
-# Indexing maps using contraction iterators (m_iter, n_iter, k_iter):
-#   lhs: (m, n, k) -> (n, k)
-#   rhs: (m, n, k) -> (k, m)
-#   acc: (m, n, k) -> (n, m)
-# Iterator types: [parallel(m), parallel(n), reduction(k)].
-#
-# 3-D batched case. The batched-mma `_muladd` reshapes
-# operands so that, in Julia col-major, lhs is `(K, N, B_flat)`, rhs is
-# `(M, K, B_flat)`, and acc is `(M, N, B_flat)`. After Julia→TileIR axis
-# reversal (`mlir_tile_type`), in MLIR row-major coordinates:
-#   lhs has shape (B, N_iter, K_iter)
-#   rhs has shape (B, K_iter, M_iter)
-#   acc has shape (B, N_iter, M_iter)
-# Iterators (b, m, n, k) with `b` parallel in all three operands:
-#   lhs: (b, m, n, k) -> (b, n, k)
-#   rhs: (b, m, n, k) -> (b, k, m)
-#   acc: (b, m, n, k) -> (b, n, m)
-# Iterator types: [parallel(b), parallel(m), parallel(n), reduction(k)].
-#
-# We dispatch on the rank of `acc` (which is also the rank of lhs/rhs in the
-# canonical batched form): 2 → plain matmul, 3 → batched matmul. Higher ranks
-# don't occur because batch dims are pre-flattened to a single axis.
-
-# Intrinsics.broadcast(src, target_shape_tuple) → vector.broadcast.
-# `src` can be a scalar literal, a Const-arg scalar, a 0-D / smaller tile.
-
-# Intrinsics.reshape(tile, target_shape_tuple) → vector.shape_cast.
-
-# Intrinsics.permute(tile, perm) → vector.transpose.
-#
-# `perm` is a 0-indexed Julia (col-major) permutation. The frontend already
-# lowered `permutedims(tile, (2, 1))` to `Intrinsics.permute(tile, (1, 0))`,
-# i.e. 1-indexed Julia → 0-indexed Julia. We need an MLIR (row-major) perm.
-#
-# Mapping: given Julia 0-indexed perm `julia_perm`, the row-major (MLIR)
-# permutation is
-#   mlir_perm[i] = n - 1 - julia_perm[n - 1 - i]   for i in 0:n-1.
-# The result MLIR vector type is the input MLIR vector type with its dims
-# reordered by `mlir_perm`.
-
-# Intrinsics.constant(shape::Tuple, value, T) → arith.constant of a
-# splat dense<value> : vector<...xT> when `value` is a compile-time literal.
-# When `value` is a runtime SSA (the `fill(scalar, dims)` overlay uses
-# this form to broadcast a scalar to a tile), we instead lower to
-# `vector.broadcast` of the scalar Value.
-
-# Intrinsics.reduce((tile,), axis::Int, combiner, (identities,)) →
-# Tuple{Tile{..., reduced_shape_with_1_in_axis}}. Lowers to
-# vector.multi_reduction + vector.shape_cast (to re-add the size-1 dim that
-# reduce semantics preserves).
-
-# Map a combiner function + element type to a vector.kind name.
 
 # Handle Base.getfield in both Argument-rooted (an array view's
 # ptr/sizes/strides fields) and SSA-rooted (extract from a multi-result
@@ -3723,17 +3609,11 @@ end
 # Gather/scatter (irregular index load/store)
 # ----------------------------------------------------------------------------
 
-# Intrinsics.iota((N,), T) → an `IntTile{(N,), T}` with values 0..N-1.
-# We materialise this as `vector.step` (which produces vector<Nxindex>),
-# then `arith.index_cast` to vector<NxiK>. Indices are Int32 by default;
-# the cast is mandatory because downstream cmpi/addi/bitcast all
-# expect the iK element type rather than `index`.
-
-# Intrinsics.bitcast(src, target_T) — a signless reinterpret. For tile
-# operands whose source MLIR type already matches the target MLIR element
-# type (typical for Int32↔UInt32 / Int64↔UInt64 — MLIR is signless), this is
-# a no-op. Otherwise we emit `arith.bitcast` (scalar) or `vector.bitcast`
-# (vector).
+# Core `bitcast(target_T, src)` (the raw `:bitcast` intrinsic, handed in as
+# `(value, type)`) — a signless reinterpret. When the source MLIR type already
+# matches the target element type (typical for Int32↔UInt32 / Int64↔UInt64 — MLIR
+# is signless), this is a no-op; otherwise emit `arith.bitcast` (scalar) or
+# `vector.bitcast` (an SPMD lane vector).
 function emit_bitcast!(lc::LowerCtx, args, @nospecialize(typ))
     v = resolve_value_or_const(lc, args[1])
     v === nothing && error("bitcast: cannot resolve operand $(args[1])")

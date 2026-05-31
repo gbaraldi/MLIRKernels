@@ -16,8 +16,8 @@ Run the generic SCI optimization pipeline in place and return `sci`.
 
 Pipeline (repeated to fixpoint):
 
-1. `canonicalize_pass!` — generic algebraic canonicalization (no-op skeleton by
-   default; see canonicalize.jl).
+1. `canonicalize_pass!` — generic algebraic canonicalization over raw Julia integer
+   ops (identities + power-of-two strength reduction; see canonicalize.jl).
 2. `cse_pass!`  — common-subexpression elimination (value numbering).
 3. `licm_pass!` — loop-invariant code motion.
 4. `dce_pass!`  — dead-code elimination (also cleans up anything the rewrite /
