@@ -6,6 +6,7 @@ authors = ["gbaraldi"]
 [deps]
 AcceleratedKernels = "6a4ca0a5-0e36-4168-a932-d9be78d558f1"
 BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
+CompilerCaching = "9db33cc3-5358-4881-8759-fa4194144afd"
 EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 LLVMOpenMP_jll = "1d63c593-3942-5779-bab2-d838dc0a180e"
@@ -36,6 +37,7 @@ MLIRCUDAExt = ["KernelAbstractions", "CUDA", "LLVM", "GPUArrays", "GPUArraysCore
 AcceleratedKernels = "0.4"
 Atomix = "0.1, 1"
 CUDA_Compiler_jll = "0.4"
+CompilerCaching = "0.2"
 GPUArrays = "11"
 GPUArraysCore = "0.2"
 IRStructurizer = "0.6.2"

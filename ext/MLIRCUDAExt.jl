@@ -28,6 +28,7 @@ import GPUArrays
 import AcceleratedKernels as AK
 using GPUArraysCore: GPUArraysCore, AbstractGPUArray, AbstractGPUArrayStyle, @allowscalar
 using PrecompileTools: @setup_workload, @compile_workload
+using CompilerCaching: match_method_instance
 
 struct MLIRCUDABackend <: KA.GPU end
 
@@ -371,7 +372,15 @@ end
 function _compile(f, full_argtypes; sm=nothing, feat=nothing, nd_dims=Int[], optimize::Bool=true)
     target = _resolve_target(sm, feat)
     sm, feat = _target_sm(target), _target_feat(target)   # honest, device-derived key
-    key = (f, full_argtypes, sm, feat, nd_dims, optimize)
+    # Key on the resolved MethodInstance, NOT the function object: redefining a
+    # kernel (`@kernel function f …` again) creates a NEW method, so
+    # `match_method_instance` resolves a fresh MI in the current world → cache miss
+    # → recompile. The old function-object key served stale PTX after redefinition
+    # (the binding is unchanged). The ctx type (carrying nd) is part of the MI, so
+    # nd_dims need not be in the key; `sm`/`feat`/`optimize` aren't, so they stay.
+    # (CompilerCaching's resolver; `nothing` ⇒ no unique match ⇒ fall back.)
+    mi = match_method_instance(f, full_argtypes)
+    key = (mi === nothing ? (f, full_argtypes, nd_dims) : mi, sm, feat, optimize)
     haskey(_gpu_cache, key) && return _gpu_cache[key]
     kname = _sym(f)
     _maybe_dump_kernel(f, full_argtypes, kname; sm, feat, nd_dims, optimize)

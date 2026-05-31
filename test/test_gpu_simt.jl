@@ -718,6 +718,33 @@ end
     end
 end
 
+# The kernel cache keys on the resolved MethodInstance (CompilerCaching), not the
+# function object, so REDEFINING a kernel recompiles instead of serving stale PTX.
+@testset "GPU: cache invalidates on kernel redefinition" begin
+    if !CUDA.functional()
+        @info "CUDA not functional — skipping cache-invalidation test"
+        @test true
+    else
+        bk = GPUB(); n = 16
+        a = MLIRArray(CUDA.ones(Float32, n)); c = MLIRArray(CUDA.zeros(Float32, n))
+        @eval @kernel function _g_redef!(c, @Const(a))
+            i = @index(Global, Linear); @inbounds c[i] = a[i] + 10.0f0
+        end
+        Base.invokelatest() do
+            _g_redef!(bk, n)(c, a; ndrange=n); CUDA.synchronize()
+        end
+        @test Array(c)[1] == 11.0f0
+        # Redefine with a different body — must recompile, not reuse the +10 PTX.
+        @eval @kernel function _g_redef!(c, @Const(a))
+            i = @index(Global, Linear); @inbounds c[i] = a[i] + 99.0f0
+        end
+        Base.invokelatest() do
+            _g_redef!(bk, n)(c, a; ndrange=n); CUDA.synchronize()
+        end
+        @test Array(c)[1] == 100.0f0
+    end
+end
+
 @testset "SCI optimization (DCE/CSE/LICM) affects KA codegen" begin
     if !CUDA.functional()
         @info "CUDA not functional — skipping SCI-optimization codegen test"
