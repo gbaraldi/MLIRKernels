@@ -368,6 +368,16 @@ end
     @inbounds out[i] = _GShadow.group_size() * 10 + _GShadow.local_index()   # 73
 end
 
+# A ComplexF32 (aggregate) flows out of an scf.if whose other branch throws — the
+# throwing branch must yield a POISON aggregate. Was an `undef_value: unsupported
+# type ComplexF32` compile crash (only real scalars had a poison value).
+@kernel function _g_cplx_throw!(out, @Const(a))
+    i = @index(Global, Linear)
+    x = @inbounds a[i]
+    z = abs2(x) < 1f9 ? x * (2f0 + 0f0im) : (throw(DomainError(0)); x)
+    @inbounds out[i] = z
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -674,6 +684,15 @@ end
             so = MLIRArray(CUDA.zeros(Int, N))
             _g_shadow!(backend, 32)(so; ndrange=N); CUDA.synchronize()   # block_dim 32 ≠ 7
             @test all(==(73), Array(so))
+        end
+
+        # Aggregate (ComplexF32) carried out of a throwing scf.if branch: compiles
+        # (typed poison yield) and is correct when the throw doesn't fire.
+        let N = 64
+            ca = MLIRArray(CUDA.CuArray([ComplexF32(i, 2i) for i in 1:N]))
+            co = MLIRArray(CUDA.CuArray(fill(0f0 + 0f0im, N)))
+            _g_cplx_throw!(backend, 64)(co, ca; ndrange=N); CUDA.synchronize()
+            @test Array(co) == [ComplexF32(i, 2i) * (2f0 + 0f0im) for i in 1:N]
         end
     end
 end

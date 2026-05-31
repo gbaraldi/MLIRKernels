@@ -1616,11 +1616,23 @@ function resolve_value_or_const(lc::LowerCtx, @nospecialize(op))
 end
 
 function undef_value(lc::LowerCtx, @nospecialize(T))
-    # Collapse a numeric Union (e.g. a loop-carried `Union{Int32,Int64}`) to its
-    # promoted scalar — matching how `if_result_types` promotes carried types, so
-    # the materialised undef's type lines up with the carried block-arg type.
+    # Real scalar (or a numeric Union promoted to one, e.g. a loop-carried
+    # `Union{Int32,Int64}`): a zero constant of the promoted type is a valid poison
+    # for a dead branch and lines up with how `if_result_types` promotes the carried
+    # type. (`_promote_numeric_type` also accepts Complex via `<: Number`, but
+    # `materialise_zero_scalar` only does real scalars — so gate on that explicitly.)
     pt = _promote_numeric_type(T)
-    pt !== nothing && return materialise_zero_scalar(pt)
+    if pt isa Type && (pt <: Bool || pt <: Integer || pt <: AbstractFloat)
+        return materialise_zero_scalar(pt)
+    end
+    # Aggregate carried/returned through a throwing or early-return branch: a
+    # homogeneous struct/Complex (`vector<N×T>`) or heterogeneous struct/Tuple
+    # (`!llvm.struct`) has no zero-constant, so emit a typed poison of its element
+    # MLIR type — exactly as `_emit_loop_region!` does for a dead loop carry. Was an
+    # `undef_value: unsupported type` compile error for any aggregate yield/return.
+    if T isa Type && (_struct_vec_info(T) !== nothing || _hetero_struct_info(T) !== nothing)
+        return IR.result(_llvm.mlir_undef(; res=mlir_elem_type(T)))
+    end
     error("undef_value: unsupported type $T")
 end
 
