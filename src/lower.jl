@@ -250,6 +250,26 @@ function _struct_leaf_types(@nospecialize(T))
     return out
 end
 
+# Number of flat scalar leaves a field type contributes to `_struct_leaf_types`
+# (1 for a scalar; the recursive leaf count for a nested struct/tuple).
+function _leaf_count(@nospecialize(FT))
+    (FT isa Type && (FT <: Number || FT === Bool) && isbitstype(FT)) && return 1
+    ls = _struct_leaf_types(FT)
+    return ls === nothing ? 0 : length(ls)
+end
+
+# (offset, count) of field `fi`'s leaves within `T`'s flat `_struct_leaf_types`
+# list. A nested-struct/tuple field occupies several CONSECUTIVE leaves, so a
+# field's flat position is the SUM of preceding fields' leaf counts — not `fi-1`
+# (which only coincides when every field is a single scalar leaf).
+function _field_leaf_span(@nospecialize(T), fi::Int)
+    off = 0
+    for i in 1:(fi - 1)
+        off += _leaf_count(fieldtype(T, i))
+    end
+    return off, _leaf_count(fieldtype(T, fi))
+end
+
 # A heterogeneous bits-struct (not all-one-scalar, e.g. `Tuple{Float32,Int64}` from
 # findmax's (value,index) pair, or `CartesianIndex{2}` = a struct wrapping a
 # tuple) can't be a `vector<N×T>`. Its VALUE is a FLAT `!llvm.struct<(leaf…)>`
@@ -977,26 +997,48 @@ function _flatten_struct_arg!(lc::LowerCtx, @nospecialize(T), arg_slot::Int,
     return syn
 end
 
-# Rebuild a struct arg (flattened to scalar params at synthetic slots) into a
-# whole value: homogeneous → `vector<N×T>` (`vector.from_elements`); heterogeneous
-# → `!llvm.struct` (`_llvm_struct_assemble!`). Each field `fn` of `T` was
-# registered in `captured[(slot, (fn,))]` as a scalar param; gather in field
-# order. Returns `nothing` if any field isn't a resolved scalar param.
+# Rebuild a struct arg (flattened to scalar params at synthetic slots) into a whole
+# value: homogeneous → `vector<N×T>`; heterogeneous → a FLAT `!llvm.struct` of all
+# scalar leaves. Gathers the leaves by RECURSING through nested struct/tuple fields
+# exactly as `_flatten_struct_arg!` registered them (at extended capture paths
+# `(fn, subfn, …)`) — a single-level lookup would miss a nested field's leaves and
+# fail to reconstruct (e.g. a struct arg with a `Tuple`/`Complex`/`CartesianIndex`
+# field). Returns `nothing` on any miss.
 function _reconstruct_struct_arg!(lc::LowerCtx, slot::Int, @nospecialize(T))
     homo = _struct_vec_info(T) !== nothing
     (homo || _hetero_struct_info(T) !== nothing) || return nothing
-    elems = IR.Value[]
+    leaves = IR.Value[]
+    _gather_arg_leaves!(lc, slot, T, (), leaves) || return nothing
+    isempty(leaves) && return nothing
+    return homo ? IR.result(_vector.from_elements(leaves; result=mlir_elem_type(T))) :
+                  _llvm_struct_assemble!(leaves)
+end
+
+# Append `T`'s flat scalar-leaf Values (rooted at capture-path `path` of arg `slot`)
+# to `leaves`, recursing into nested struct/tuple fields — the inverse of
+# `_flatten_struct_arg!`, sharing its field walk so the two cannot diverge. Returns
+# false on any unresolved leaf or unsupported (e.g. array) field.
+function _gather_arg_leaves!(lc::LowerCtx, slot::Int, @nospecialize(T), path::Tuple,
+                             leaves::Vector{IR.Value})
     for fn in fieldnames(T)
-        ck = get(lc.captured, (slot, (fn,)), nothing)
-        ck === nothing && return nothing
-        (syn, knd) = ck
-        knd === :scalar || return nothing
-        v = get(lc.arg_vals, syn, nothing)
-        v === nothing && return nothing
-        push!(elems, v)
+        FT = fieldtype(T, fn)
+        Base.issingletontype(FT) && continue
+        leaf = (path..., fn)
+        if FT isa Type && (FT <: Number || FT === Bool)
+            ck = get(lc.captured, (slot, leaf), nothing)
+            ck === nothing && return false
+            (syn, knd) = ck
+            knd === :scalar || return false
+            v = get(lc.arg_vals, syn, nothing)
+            v === nothing && return false
+            push!(leaves, v)
+        elseif FT isa DataType && isstructtype(FT) && !isempty(fieldnames(FT))
+            _gather_arg_leaves!(lc, slot, FT, leaf, leaves) || return false
+        else
+            return false
+        end
     end
-    return homo ? IR.result(_vector.from_elements(elems; result=mlir_elem_type(T))) :
-                  _llvm_struct_assemble!(elems)
+    return true
 end
 
 function lower_to_mlir_gpu(sci::StructuredIRCode, argtypes::Type;
@@ -3083,18 +3125,27 @@ function emit_getfield!(lc::LowerCtx, idx::Int, args, @nospecialize(typ))
                       value=IR.Attribute(fi - 1, IR.IndexType()), result=IR.IndexType()))
             return IR.result(_vector.extractelement(vec, pos; result=eltype(IR.type(vec))))
         else
-            # heterogeneous → `llvm.extractvalue` at the field's struct position.
-            # Only flat structs (one scalar leaf per field) are readable this way;
-            # a nested struct's field index ≠ its leaf position (the flat
-            # `!llvm.struct` has no sub-struct to extract). Construction/store of
-            # nested structs works (leaf-flattened); reading a nested field doesn't.
+            # heterogeneous (a FLAT `!llvm.struct` of scalar leaves). Read the
+            # field's LEAF SPAN — a nested struct/tuple field occupies several
+            # consecutive leaves — by its computed flat offset (not the field index,
+            # which only coincides for one-leaf-per-field structs). A scalar field is
+            # a single `extractvalue`; a nested field's leaves are pulled and
+            # re-assembled into the field's own representation (vector / flat struct),
+            # the inverse of how construction flattens it.
             FT = fieldtype(svT, fi)
-            (length(_hetero_struct_info(svT)) == fieldcount(svT) &&
-             (FT <: Number || FT === Bool)) ||
-                error("getfield: reading a field of a NESTED heterogeneous struct " *
-                      "($svT.$fld) is unsupported (only flat structs are readable)")
-            return IR.result(_llvm.extractvalue(vec;
-                res=mlir_elem_type(FT), position=IR.Attribute(Int64[fi - 1])))
+            off, n = _field_leaf_span(svT, fi)
+            n >= 1 || error("getfield: $svT.$fld has no representable leaves")
+            if n == 1
+                return IR.result(_llvm.extractvalue(vec;
+                    res=mlir_elem_type(FT), position=IR.Attribute(Int64[off])))
+            end
+            lts = _struct_leaf_types(FT)
+            leaves = IR.Value[IR.result(_llvm.extractvalue(vec;
+                        res=mlir_elem_type(lts[k]), position=IR.Attribute(Int64[off + k - 1])))
+                      for k in 1:n]
+            return _struct_vec_info(FT) !== nothing ?
+                IR.result(_vector.from_elements(leaves; result=mlir_elem_type(FT))) :
+                _llvm_struct_assemble!(leaves)
         end
     end
     if obj isa Argument

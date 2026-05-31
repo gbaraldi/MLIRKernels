@@ -413,6 +413,21 @@ end
     @inbounds out[i] = z
 end
 
+# Heterogeneous struct with a NESTED field: flat leaves [f32,i32,i32], so #leaves(3)
+# ≠ #fields(2). Reading the nested `Tuple` field of a LOADED struct (`w.ij`) and
+# reconstructing the WHOLE struct ARG (storing `w`) both need the field→leaf-offset
+# map / recursive leaf gather — previously errored ("nested heterogeneous struct").
+struct _WSNest; v::Float32; ij::Tuple{Int32,Int32}; end
+@kernel function _g_ws_read!(out, @Const(a))
+    i = @index(Global, Linear)
+    w = @inbounds a[i]
+    @inbounds out[i] = w.ij[1] + w.ij[2]          # read nested field of a loaded struct
+end
+@kernel function _g_ws_recon!(out, w::_WSNest)
+    i = @index(Global, Linear)
+    @inbounds out[i] = w                          # reconstruct the whole arg struct
+end
+
 # A type-unstable scf.for carry: `acc` is Int32 but `acc + 1` transiently widens it
 # to Int64, so the yielded value's width differs from the iter-arg. The :for body
 # must coerce the yield to the iter-arg type (like :while) — was an scf.for verifier
@@ -804,6 +819,24 @@ end
 # Concurrent launches must not corrupt the (now lock-guarded) compile + workgroup
 # caches. `@spawn` interleaves the cache access even on one thread, and runs truly
 # parallel under `-t>1`.
+# Heterogeneous struct with a nested field — read a nested field of a loaded value,
+# and reconstruct the whole struct arg.
+@testset "GPU: nested heterogeneous struct fields" begin
+    if !CUDA.functional()
+        @test true
+    else
+        bk = GPUB(); n = 4
+        ha = [_WSNest(Float32(k), (Int32(10k), Int32(100k))) for k in 1:n]
+        a = MLIRArray(CUDA.CuArray(ha)); o = MLIRArray(CUDA.zeros(Int32, n))
+        _g_ws_read!(bk, n)(o, a; ndrange=n); CUDA.synchronize()
+        @test Array(o) == Int32[10k + 100k for k in 1:n]          # nested-field read
+        w = _WSNest(5.0f0, (Int32(11), Int32(22)))
+        wo = MLIRArray(CUDA.CuArray(fill(_WSNest(0f0, (Int32(0), Int32(0))), n)))
+        _g_ws_recon!(bk, n)(wo, w; ndrange=n); CUDA.synchronize()
+        @test all(==(w), Array(wo))                                # whole-arg reconstruct
+    end
+end
+
 @testset "GPU: concurrent launches are cache-safe" begin
     if !CUDA.functional()
         @test true
