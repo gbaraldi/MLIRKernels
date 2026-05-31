@@ -1737,9 +1737,34 @@ function _emit_gpu_linear_index!(coord, extent, ndims::Int, lane_t::IR.Type)
     return IR.result(_arith.index_cast(IR.result(_arith.addi(lin, one; result=idx_t)); out=lane_t))
 end
 
+# Names dispatched in `walk_call!` purely by symbol that belong EXCLUSIVELY to our
+# Intrinsics module (unlike `:tuple`/`:getfield`/`:memoryrefnew`/… which are Base
+# builtins matched by name on purpose). A user function sharing one of these names
+# would otherwise be silently lowered to the intrinsic.
+const _INTRINSIC_MARKERS = Set{Symbol}((
+    :global_index, :block_index, :block_dim, :local_index, :group_index,
+    :group_size, :barrier, :valid_index, :atomic_index!,
+    :global_ntuple, :local_ntuple, :group_ntuple, :shared_alloc, :private_alloc,
+))
+
+# Whether a matched marker name is the REAL intrinsic — i.e. the callee actually
+# resolves into `Frontend.Intrinsics` (a GlobalRef into it, or the function itself
+# via the dead-until-now `isintrinsic`) — rather than a same-named user function.
+_callee_is_intrinsic(@nospecialize(callee)) =
+    (callee isa GlobalRef && callee.mod === Frontend.Intrinsics) ||
+    Frontend.isintrinsic(callee)
+
 function walk_call!(lc::LowerCtx, idx::Int, @nospecialize(callee),
                     args::Vector{Any}, @nospecialize(typ); mi=nothing)
     fname = callee_name(callee)
+
+    # A user function that merely shares an Intrinsics marker's name must not be
+    # lowered to the intrinsic. When the name matches a marker but the callee isn't
+    # actually from Intrinsics, rename it so the marker branches below fall through
+    # to the generic outlined-call path (and it still reads clearly in any error).
+    if fname in _INTRINSIC_MARKERS && !_callee_is_intrinsic(callee)
+        fname = Symbol("#nonintrinsic#", fname)
+    end
 
     if fname === :tuple
         lc.tuples[idx] = collect(args)

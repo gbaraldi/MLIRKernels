@@ -356,6 +356,18 @@ end
     Atomix.@atomic H[r, c] += Int32(1)
 end
 
+# A user module whose functions share names with our Intrinsics markers; calling
+# them in a kernel must invoke the USER function, not silently lower to the
+# intrinsic (matched by bare name before the parentmodule guard).
+module _GShadow
+    @noinline group_size() = 7
+    @noinline local_index() = 3
+end
+@kernel function _g_shadow!(out)
+    i = @index(Global, Linear)
+    @inbounds out[i] = _GShadow.group_size() * 10 + _GShadow.local_index()   # 73
+end
+
 @testset "GPU: KA @kernel on MLIRCUDABackend (SIMT)" begin
     if !CUDA.functional()
         @info "CUDA not functional in this env — skipping GPU backend test"
@@ -654,6 +666,14 @@ end
             @test Array(vc) ≈ Array(va) .+ Array(vb)
             tuned = [v for (k, v) in MEXT._dyn_wg_cache if k[2] == (n,)]
             @test !isempty(tuned) && all(t -> prod(t) > 1, tuned)          # occupancy-tuned, not (1,)
+        end
+
+        # A user function sharing an intrinsic marker's name must NOT be lowered to
+        # the intrinsic: the result reflects the user fns (7*10+3), not block_dim.
+        let N = 64
+            so = MLIRArray(CUDA.zeros(Int, N))
+            _g_shadow!(backend, 32)(so; ndrange=N); CUDA.synchronize()   # block_dim 32 ≠ 7
+            @test all(==(73), Array(so))
         end
     end
 end
